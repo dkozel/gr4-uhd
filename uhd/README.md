@@ -21,6 +21,25 @@ The device list asks libuhd with an empty hint. Where `CAPTURE_UHD_USE_DPDK`
 is set in the environment to anything but `0`, the hint carries `use_dpdk=1`,
 and a radio reached only through DPDK is listed as well.
 
+## Channels
+
+The source's `channels` setting lists the device channels it streams, `[0]`
+by default. `out` carries the first and `out2` the second. `out2` may stay
+unconnected, and a graph that names `out` alone streams the first channel.
+`[1]` puts the second channel of the subdevice spec in force on `out`; on a
+B210 that is side B. The source refuses a list of three channels, a channel listed twice,
+a connected `out2` with one channel listed, and a channel the device does not
+offer. Two channels start together at one device time. Both ports carry the
+same count and the same tags at the same samples.
+
+The rate, the frequency, the gain and the gain mode apply to every listed
+channel alike. `rx_antennae` names one connector per listed channel, in the
+same order, or one connector for all. With two channels the rate list shares
+the link between them, and a B2xx tops out at 30.72 MS/s per channel.
+
+The sink's `channels` setting names the one device channel `in` feeds, `[0]`
+by default. A list of two fails the start.
+
 ## Controls that wait for a start
 
 Four source controls take effect at the next start, and their descriptors

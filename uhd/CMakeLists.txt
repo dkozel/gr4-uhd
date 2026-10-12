@@ -78,6 +78,9 @@ if(CAPTURE_UHD_FOUND)
           controls.uhd-a-refused-read-costs-its-own-field controls.uhd-bounds-every-control-value
           controls.uhd-a-settings-pass-never-waits-on-a-tune
           controls.uhd-states-its-rate-and-frequency-from-the-truth
+          controls.uhd-a-channel-list-is-checked-before-the-open controls.uhd-two-channels-share-the-ladder
+          controls.uhd-a-two-channel-start-is-timed controls.uhd-each-channel-takes-its-own-antenna
+          controls.uhd-the-truth-is-read-on-the-channel-named controls.uhd-two-channels-reach-both-ports
           controls.uhd-a-radio-stating-clocks-above-the-converter-picks
           controls.uhd-a-product-table-offers-the-clocks-of-a-fixed-clock-radio
           controls.uhd-a-table-clock-applies-at-the-next-open
@@ -158,6 +161,7 @@ if(CAPTURE_UHD_FOUND)
           sink.uhd-a-burst-ends-at-its-tagged-sample
           sink.uhd-two-bursts-in-one-buffer-end-at-their-own-samples
           sink.uhd-a-timed-burst-starts-at-its-time
+          sink.uhd-transmits-on-the-one-channel-listed
           sink.uhd-a-mistyped-burst-tag-is-reported-once
           sink.uhd-a-stream-end-tag-ends-the-burst-at-the-last-sample
           sink.uhd-a-stream-end-tag-after-the-last-send-ends-the-burst-alone
@@ -196,7 +200,8 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
       uhd.rate-change-midstream uhd.a-drain-at-the-top-rate-ends-by-duration uhd.accessors-after-a-stop uhd.stop-latency
       uhd.coverage-past-the-stated-range uhd.vendor-agc-claim
       uhd.wire-format uhd.transport-sizing uhd.master-clock uhd.tx-burst uhd.tx-loopback
-      uhd.tx-underrun uhd.tx-tagged-bursts uhd.transmit-side)
+      uhd.tx-underrun uhd.tx-tagged-bursts uhd.transmit-side uhd.two-channels-align
+      uhd.two-channels-follow-their-antennas uhd.one-channel-on-side-b uhd.two-channel-clean-rate)
   capture_test(
     hw_uhd
     DIR test
@@ -209,5 +214,7 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
   set_tests_properties(${CAPTURE_HW_UHD_CASES} PROPERTIES TIMEOUT 180 LABELS hardware SKIP_RETURN_CODE 77)
   # The GPS case first waits up to 900 s for the GPSDO's warm-up, which restarts at every boot.
   set_tests_properties(uhd.device-time-from-gps PROPERTIES TIMEOUT 1080)
+  # The clean-rate case runs two channels for 20 s at up to five rates.
+  set_tests_properties(uhd.two-channel-clean-rate PROPERTIES TIMEOUT 420)
   message(STATUS "capture: the USRP hardware cases are ENABLED (label hardware)")
 endif()

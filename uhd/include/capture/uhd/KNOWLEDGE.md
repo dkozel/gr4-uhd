@@ -52,13 +52,29 @@ leaves the setting holding the refused name; a unit that states no list has the 
 firmware and FPGA version pair is guarded alone, so a model that refuses one still states the
 rest: the range of the master clock and the clock in force, a filter range and the width in
 force, a list of sources and the source in force, and each gain element apart from the others.
-Both records state the subdevice spec of channel 0, as "A:B", and the name UHD gives that
-frontend, and the line naming the unit names both. Either block's `subdev` setting is written
+Both records state the subdevice spec of the first channel the block streams, as "A:B", and the
+name UHD gives that frontend, and the line naming the unit names both. Either block's `subdev` setting is written
 by the start after the reference and timing writes and before the surface is read and the
 streamer is built, so every control call and the streamer reach the frontend it names; an
 empty setting leaves the device's own spec, and a spec the device refuses fails the start.
 On a B210, which opens on "A:A A:B", "A:A" is the frontend UHD names "FE-RX2" on receive and
 "FE-TX2" on transmit, and "A:B" is "FE-RX1" and "FE-TX1".
+The source's `channels` setting lists one or two device channels of the spec in force. One
+streamer carries them: the first on `out` and the second on `out2`, an optional port that may
+stay unconnected. Both writers take every receive, so the two ports carry equal counts, and every
+tag the source places goes on both at the same sample. One channel starts at once; two start at
+one device time 0.1 s ahead, or 0.1 s past the whole second a pending pulse latch sets, because
+the device clock jumps to that second at the edge. The rate, the tune, the gain, the automatic
+gain mode, the filter and the two corrections go to every listed channel alike, since a B210's
+two receive chains share one local oscillator and one converter clock; `rx_antennae` names a
+connector per listed channel, and one name applies to all. The first channel answers every
+read-back, the truth record, the coverage and the sensors. A start refuses before the open a list
+of none or of three, a channel listed twice, and a connected `out2` with one channel listed, and
+after the open a channel the spec does not offer. The ladder for two channels shares the link
+between them and, on a radio with one continuous clock range, halves the top of that range:
+UHD's `b200_impl.cpp` refuses a master clock above 30.72 MHz with two channels in use. The sink's
+`channels` setting names the one channel `in` feeds, and every transmit control call names it; a
+list of other than one channel fails the start before the open.
 Both records state the link rate UHD gives, one link carrying both directions; the
 receive record carries three fields more, the three optional frontend corrections, which the
 receive frontend alone states. The link rate is the double UHD keeps at

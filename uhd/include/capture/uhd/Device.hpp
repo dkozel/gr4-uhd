@@ -20,6 +20,7 @@
 #include <uhd/usrp/subdev_spec.hpp>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -233,6 +234,7 @@ struct SurfaceValues {
     double      filterHz   = 0.0;
     double      clockHz    = 0.0; // the master clock in force, zero where UHD chooses
     std::string wireFormat = "sc16";
+    std::size_t channelCount = 1UZ; // the channels one streamer carries
 };
 
 /*| contract: a value may be put into a device string only where it carries neither the
@@ -508,7 +510,8 @@ constexpr std::size_t wireBytesPerSample(std::string_view wireFormat) { return w
     why: UHD compares the same two figures. Where a motherboard's property tree holds
         link_max_rate as a double, _check_link_rate in UHD 4.9.0.1's host/lib/usrp/multi_usrp.cpp
         warns when a streamer is made whose channels' summed rate passes link_max_rate over the
-        wire bytes per sample. Each block streams one channel, so the sum is its own rate.
+        wire bytes per sample. A stream of several channels shares the link among them, as
+        channelTruthFor states.
     verified-by: controls.uhd-the-link-ceiling-is-the-rate-uhd-states
 */
 inline double linkCeilingHz(std::string_view wireFormat, double linkBytesPerS) { return linkBytesPerS / static_cast<double>(wireBytesPerSample(wireFormat)); }
@@ -683,6 +686,60 @@ inline double snapToLadder(double requestHz, std::span<const double> ladder) {
 */
 inline bool offersOneClockRate(const DeviceTruth& t) { return t.mclkMinHz > 0.0 && t.mclkMaxHz <= t.mclkMinHz; }
 
+// The channel list of a block that streams one channel, device channel 0.
+inline constexpr std::array<std::size_t, 1> kFirstChannel{0UZ};
+
+/*| contract: the most channels one block streams, each on a port of its own.
+*/
+inline constexpr std::size_t kMaxChannels = 2UZ;
+
+/*| contract: why a block refuses the device channels it was given, or nothing where it takes
+        them: one or two channels, no channel listed twice, each below deviceChannels, and a
+        second channel wherever the block's second port, named secondPort, has a reader. The
+        list is checked against the device where deviceChannels is given, and before any open
+        otherwise.
+    verified-by: controls.uhd-a-channel-list-is-checked-before-the-open
+*/
+inline std::optional<std::string> channelsRefusal(std::span<const std::uint32_t> channels, bool secondPortConnected, std::string_view secondPort, std::size_t deviceChannels = std::numeric_limits<std::size_t>::max()) {
+    if (channels.empty() || channels.size() > kMaxChannels) {
+        return std::format("channels lists {} device channels; a block streams one or two", channels.size());
+    }
+    if (channels.size() == 2UZ && channels[0] == channels[1]) {
+        return std::format("channels lists device channel {} twice", channels[0]);
+    }
+    for (const std::uint32_t ch : channels) {
+        if (ch >= deviceChannels) {
+            return std::format("channels lists device channel {}, and the device offers {} in this direction", ch, deviceChannels);
+        }
+    }
+    if (secondPortConnected && channels.size() < 2UZ) {
+        return std::format("{} is connected, and channels lists one device channel", secondPort);
+    }
+    return std::nullopt;
+}
+
+/*| contract: the truth the rate decisions read for a stream of the given number of channels:
+        the link's bytes per second shared among them, and on a radio with one continuous clock
+        range the top of that range over the channel count. One channel leaves the truth as it
+        stands.
+    why: UHD checks a streamer's summed rate against the link, so each of two channels carries
+        half of it. An AD936x carries every channel over one data port: UHD's b200_impl.cpp
+        refuses a master clock above 30.72 MHz, half the converter's 61.44 MHz, with two
+        channels in use, and its ad936x_manager picks the clock under the same limit.
+    verified-by: controls.uhd-two-channels-share-the-ladder
+*/
+inline DeviceTruth channelTruthFor(DeviceTruth truth, std::size_t channels) {
+    if (channels <= 1UZ) {
+        return truth;
+    }
+    const double count = static_cast<double>(channels);
+    truth.linkBytesPerS /= count;
+    if (truth.mclkContinuous && truth.mclkMaxHz > truth.mclkMinHz) {
+        truth.mclkMaxHz = std::max(truth.mclkMinHz, truth.mclkMaxHz / count);
+    }
+    return truth;
+}
+
 /*| contract: every rate a fixed-clock radio reaches in the wire format named: the single points
         of its stated set whose decimation of the clock is even, cut at what the link carries
         where a link rate is known. Ascending, and empty for a radio whose clock is programmable
@@ -701,7 +758,8 @@ inline bool offersOneClockRate(const DeviceTruth& t) { return t.mclkMinHz > 0.0 
         which sc16 carries to 25 MS/s and sc8 to 50 MS/s.
     verified-by: controls.uhd-rate-ladder-from-the-device
 */
-inline std::vector<double> reachableRatesFor(const DeviceTruth& t, std::string_view wireFormat = "sc16") {
+inline std::vector<double> reachableRatesFor(const DeviceTruth& truth, std::string_view wireFormat = "sc16", std::size_t channels = 1UZ) {
+    const DeviceTruth   t = channelTruthFor(truth, channels);
     std::vector<double> out;
     if (!offersOneClockRate(t)) {
         return out;
@@ -767,7 +825,8 @@ inline DeviceTruth ladderTruthFor(DeviceTruth truth, double clockInForceHz) {
         happened to catch.
     verified-by: controls.uhd-rate-ladder-from-the-device
 */
-inline std::vector<double> sampleRatesFor(const DeviceTruth& t, std::string_view wireFormat = "sc16") {
+inline std::vector<double> sampleRatesFor(const DeviceTruth& truth, std::string_view wireFormat = "sc16", std::size_t channels = 1UZ) {
+    const DeviceTruth   t = channelTruthFor(truth, channels);
     std::vector<double> out;
     if (t.mclkMaxHz > t.mclkMinHz) {
         const double bottom = t.mclkMinHz / static_cast<double>(kMaxDecimation);
@@ -826,8 +885,8 @@ inline std::vector<double> sampleRatesFor(const DeviceTruth& t, std::string_view
         coverage is the tuner's in force. A truth that states no coverage adds no FREQUENCY.
     verified-by: controls.uhd-states-its-rate-and-frequency-from-the-truth
 */
-inline void appendLadderAndCoverage(std::vector<ControlDesc>& out, const DeviceTruth& truth, double clockInForceHz, std::string_view wireFormat, double defaultRateHz, double defaultFrequencyHz) {
-    const DeviceTruth                         t      = ladderTruthFor(truth, clockInForceHz);
+inline void appendLadderAndCoverage(std::vector<ControlDesc>& out, const DeviceTruth& truth, double clockInForceHz, std::string_view wireFormat, double defaultRateHz, double defaultFrequencyHz, std::size_t channels = 1UZ) {
+    const DeviceTruth                         t      = channelTruthFor(ladderTruthFor(truth, clockInForceHz), channels);
     const std::string_view                    format = wireFormat.empty() ? std::string_view("sc16") : wireFormat;
     std::optional<std::pair<double, double>> span;
     if (t.mclkMaxHz > t.mclkMinHz) {
@@ -876,10 +935,14 @@ inline double clockInForceAtOpen(const ::uhd::device_addr_t& openAddress, const 
         30.72 MS/s request on 33.33 MS/s, decimation 3, which the link cannot carry.
     verified-by: controls.uhd-rate-ladder-from-the-device
 */
-inline double rateToWrite(double requestHz, const DeviceTruth& truth, double clockInForceHz, std::string_view wireFormat, Direction dir, std::string_view blockTag) {
-    const DeviceTruth t = ladderTruthFor(truth, clockInForceHz);
+inline double rateToWrite(double requestHz, const DeviceTruth& truth, double clockInForceHz, std::string_view wireFormat, Direction dir, std::string_view blockTag, std::size_t channels = 1UZ) {
+    const DeviceTruth t = channelTruthFor(ladderTruthFor(truth, clockInForceHz), channels);
     if (!offersOneClockRate(t) || t.rates.empty()) {
-        const double ceiling = t.linkBytesPerS > 0.0 ? linkCeilingHz(wireFormat, t.linkBytesPerS) : 0.0;
+        double ceiling = t.linkBytesPerS > 0.0 ? linkCeilingHz(wireFormat, t.linkBytesPerS) : 0.0;
+        if (channels > 1UZ && t.mclkContinuous && t.mclkMaxHz > 0.0) {
+            // The clock top channelTruthFor lowered, which UHD refuses to pass.
+            ceiling = ceiling > 0.0 ? std::min(ceiling, t.mclkMaxHz) : t.mclkMaxHz;
+        }
         if (ceiling > 0.0 && requestHz > ceiling) {
             std::fprintf(stderr, "[%s] rate %.0f snapped to %.0f, the link ceiling UHD states for %.0f bytes per second in %s\n", std::string(blockTag).c_str(), requestHz, ceiling, t.linkBytesPerS,
                          std::string(wireFormat).c_str());
@@ -950,19 +1013,24 @@ constexpr bool rateWriteSettled(const RateWrite& written) { return written.lande
 */
 constexpr bool filterFollowsRate(const RateWrite& written, double bwMinHz, double bwMaxHz) { return rateWriteSettled(written) && bwMaxHz > bwMinHz; }
 
-// The same write on one open device, the direction choosing the receive or the transmit call.
+/*| contract: the same write on one open device, the direction choosing the receive or the
+        transmit call. The rate goes to every channel listed, and the first of them answers the
+        read-back.
+*/
 template <typename Usrp>
-RateWrite writeRate(Usrp& usrp, Direction dir, double hz, std::string_view blockTag) {
+RateWrite writeRate(Usrp& usrp, Direction dir, double hz, std::string_view blockTag, std::span<const std::size_t> channels = kFirstChannel) {
     return writeRateWith(
         hz,
-        [&usrp, dir](double r) {
-            if (dir == Direction::Receive) {
-                usrp.set_rx_rate(r, 0);
-            } else {
-                usrp.set_tx_rate(r, 0);
+        [&usrp, dir, channels](double r) {
+            for (const std::size_t ch : channels) {
+                if (dir == Direction::Receive) {
+                    usrp.set_rx_rate(r, ch);
+                } else {
+                    usrp.set_tx_rate(r, ch);
+                }
             }
         },
-        [&usrp, dir] { return dir == Direction::Receive ? usrp.get_rx_rate(0) : usrp.get_tx_rate(0); }, dir, blockTag);
+        [&usrp, dir, channels] { return dir == Direction::Receive ? usrp.get_rx_rate(channels.front()) : usrp.get_tx_rate(channels.front()); }, dir, blockTag);
 }
 
 /*| contract: the entry an enum control's value selects out of a list of count options, and
@@ -1154,15 +1222,15 @@ void readOptional(Read&& read) {
     verified-by: controls.uhd-a-refused-read-costs-its-own-field
 */
 template <typename Usrp>
-void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir) {
+void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir, std::size_t channel = 0UZ) {
     const bool rx       = dir == Direction::Receive;
     truth               = {};
     truth.linkBytesPerS = statedLinkBytesPerS(usrp);
     readOptional([&] {
-        const auto info   = rx ? usrp.get_usrp_rx_info(0) : usrp.get_usrp_tx_info(0);
+        const auto info   = rx ? usrp.get_usrp_rx_info(channel) : usrp.get_usrp_tx_info(channel);
         truth.product     = info.get("mboard_id", "USRP");
-        /*| trap: channel 0's frontend alone. A TwinRX in the other slot of an X3xx whose
-                channel 0 is another board is not seen, and a 184.32 MHz pick there fails one
+        /*| trap: the named channel's frontend alone. A TwinRX in the other slot of an X3xx whose
+                channel is another board is not seen, and a 184.32 MHz pick there fails one
                 start, which then clears the pick. */
         truth.frontend    = info.get(rx ? "rx_subdev_name" : "tx_subdev_name", "");
         truth.serial      = info.get("mboard_serial", "");
@@ -1171,7 +1239,7 @@ void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir) {
     });
     readOptional([&] {
         const auto spec = rx ? usrp.get_rx_subdev_spec(0) : usrp.get_tx_subdev_spec(0);
-        truth.subdev    = spec.empty() ? std::string{} : spec.at(0).db_name + ":" + spec.at(0).sd_name;
+        truth.subdev    = spec.size() <= channel ? std::string{} : spec.at(channel).db_name + ":" + spec.at(channel).sd_name;
     });
     readOptional([&] { truth.model = usrp.get_mboard_name(0); });
     /*| frame: the versions the information map leaves out. An N-series carries them on the
@@ -1186,33 +1254,33 @@ void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir) {
         }
     });
     std::vector<std::string> gainNames;
-    readOptional([&] { gainNames = rx ? usrp.get_rx_gain_names(0) : usrp.get_tx_gain_names(0); });
+    readOptional([&] { gainNames = rx ? usrp.get_rx_gain_names(channel) : usrp.get_tx_gain_names(channel); });
     for (const std::string& g : gainNames) {
         readOptional([&] {
-            const auto   r       = rx ? usrp.get_rx_gain_range(g, 0) : usrp.get_tx_gain_range(g, 0);
-            const double current = rx ? usrp.get_rx_gain(g, 0) : usrp.get_tx_gain(g, 0);
+            const auto   r       = rx ? usrp.get_rx_gain_range(g, channel) : usrp.get_tx_gain_range(g, channel);
+            const double current = rx ? usrp.get_rx_gain(g, channel) : usrp.get_tx_gain(g, channel);
             truth.gains.push_back({g, r.start(), r.stop(), r.step() > 0.0 ? r.step() : 1.0, current});
         });
     }
     readOptional([&] {
-        const auto overall = rx ? usrp.get_rx_gain_range(0) : usrp.get_tx_gain_range(0);
+        const auto overall = rx ? usrp.get_rx_gain_range(channel) : usrp.get_tx_gain_range(channel);
         truth.gainMinDb    = overall.start();
         truth.gainMaxDb    = overall.stop();
         truth.gainStepDb   = overall.step() > 0.0 ? overall.step() : 1.0;
     });
-    readOptional([&] { truth.antennas = rx ? usrp.get_rx_antennas(0) : usrp.get_tx_antennas(0); });
-    readOptional([&] { truth.antenna = rx ? usrp.get_rx_antenna(0) : usrp.get_tx_antenna(0); });
+    readOptional([&] { truth.antennas = rx ? usrp.get_rx_antennas(channel) : usrp.get_tx_antennas(channel); });
+    readOptional([&] { truth.antenna = rx ? usrp.get_rx_antenna(channel) : usrp.get_tx_antenna(channel); });
     readOptional([&] {
-        for (const auto& r : rx ? usrp.get_rx_freq_range(0) : usrp.get_tx_freq_range(0)) {
+        for (const auto& r : rx ? usrp.get_rx_freq_range(channel) : usrp.get_tx_freq_range(channel)) {
             truth.freqRanges.emplace_back(r.start(), r.stop());
         }
     });
     readOptional([&] {
-        const auto bw = rx ? usrp.get_rx_bandwidth_range(0) : usrp.get_tx_bandwidth_range(0);
+        const auto bw = rx ? usrp.get_rx_bandwidth_range(channel) : usrp.get_tx_bandwidth_range(channel);
         truth.bwMinHz = bw.start();
         truth.bwMaxHz = bw.stop();
     });
-    readOptional([&] { truth.bwCurHz = rx ? usrp.get_rx_bandwidth(0) : usrp.get_tx_bandwidth(0); });
+    readOptional([&] { truth.bwCurHz = rx ? usrp.get_rx_bandwidth(channel) : usrp.get_tx_bandwidth(channel); });
     std::optional<std::pair<double, double>> mclkRange;
     std::optional<double>                    mclkHz;
     readOptional([&] {
@@ -1244,7 +1312,7 @@ void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir) {
         }
     });
     readOptional([&] {
-        for (const auto& r : rx ? usrp.get_rx_rates(0) : usrp.get_tx_rates(0)) {
+        for (const auto& r : rx ? usrp.get_rx_rates(channel) : usrp.get_tx_rates(channel)) {
             truth.rates.emplace_back(r.start(), r.stop());
         }
     });
@@ -1714,19 +1782,21 @@ void applyBandwidthWith(double hz, std::optional<double>& written, double& heldH
     }
 }
 
-// The same write on one open device, the direction choosing the receive or the transmit call.
+// The same write on one open device as writeRate makes it, to every channel listed.
 template <typename Usrp>
-void applyBandwidth(Usrp& usrp, Direction dir, double hz, std::optional<double>& written, double& heldHz, std::string_view blockTag) {
+void applyBandwidth(Usrp& usrp, Direction dir, double hz, std::optional<double>& written, double& heldHz, std::string_view blockTag, std::span<const std::size_t> channels = kFirstChannel) {
     applyBandwidthWith(
         hz, written, heldHz,
-        [&usrp, dir](double w) {
-            if (dir == Direction::Receive) {
-                usrp.set_rx_bandwidth(w, 0);
-            } else {
-                usrp.set_tx_bandwidth(w, 0);
+        [&usrp, dir, channels](double w) {
+            for (const std::size_t ch : channels) {
+                if (dir == Direction::Receive) {
+                    usrp.set_rx_bandwidth(w, ch);
+                } else {
+                    usrp.set_tx_bandwidth(w, ch);
+                }
             }
         },
-        [&usrp, dir] { return dir == Direction::Receive ? usrp.get_rx_bandwidth(0) : usrp.get_tx_bandwidth(0); }, dir, blockTag);
+        [&usrp, dir, channels] { return dir == Direction::Receive ? usrp.get_rx_bandwidth(channels.front()) : usrp.get_tx_bandwidth(channels.front()); }, dir, blockTag);
 }
 
 /*| contract: replace ranges with the coverage the device states now for one direction, and keep
@@ -1735,10 +1805,10 @@ void applyBandwidth(Usrp& usrp, Direction dir, double hz, std::optional<double>&
         request legal at one rate is outside the radio at another.
 */
 template <typename Usrp>
-void refreshFreqRanges(Usrp& usrp, Direction dir, std::vector<std::pair<double, double>>& ranges, std::string_view blockTag) {
+void refreshFreqRanges(Usrp& usrp, Direction dir, std::vector<std::pair<double, double>>& ranges, std::string_view blockTag, std::size_t channel = 0UZ) {
     try {
         std::vector<std::pair<double, double>> stated;
-        for (const auto& r : dir == Direction::Receive ? usrp.get_rx_freq_range(0) : usrp.get_tx_freq_range(0)) {
+        for (const auto& r : dir == Direction::Receive ? usrp.get_rx_freq_range(channel) : usrp.get_tx_freq_range(channel)) {
             stated.emplace_back(r.start(), r.stop());
         }
         if (!stated.empty()) {
@@ -2009,6 +2079,7 @@ struct SensorNames {
     std::vector<std::string> frontend;
     std::vector<std::string> brief;
     bool                     gpsdoUndetected = false;
+    std::size_t              channel         = 0UZ; // the channel the frontend sensors are read on
 };
 
 /*| contract: whether the unit's EEPROM names a GPSDO, "internal" or "onboard", while the open
@@ -2048,10 +2119,10 @@ std::string eepromGpsdo(Usrp& usrp) {
     return {};
 }
 
-// One frontend sensor of the direction named.
+// One frontend sensor of the direction and the channel named.
 template <typename Usrp>
-::uhd::sensor_value_t frontendSensor(Usrp& usrp, Direction dir, const std::string& name) {
-    return dir == Direction::Receive ? usrp.get_rx_sensor(name, 0) : usrp.get_tx_sensor(name, 0);
+::uhd::sensor_value_t frontendSensor(Usrp& usrp, Direction dir, const std::string& name, std::size_t channel = 0UZ) {
+    return dir == Direction::Receive ? usrp.get_rx_sensor(name, channel) : usrp.get_tx_sensor(name, channel);
 }
 
 /*| contract: the sensor names the open device publishes for one direction, with the ids one read
@@ -2071,11 +2142,12 @@ template <typename Usrp>
         one 0.8 ms. On a B205mini the whole sweep is 4 ms.
 */
 template <typename Usrp, typename Live = AlwaysLive>
-SensorNames sensorNamesOf(Usrp& usrp, Direction dir, std::string_view blockTag, double limitMs = kBriefSensorLimitMs, Live&& live = Live{}) {
+SensorNames sensorNamesOf(Usrp& usrp, Direction dir, std::string_view blockTag, double limitMs = kBriefSensorLimitMs, Live&& live = Live{}, std::size_t channel = 0UZ) {
     SensorNames names;
+    names.channel = channel;
     try {
         names.mboard   = usrp.get_mboard_sensor_names(0);
-        names.frontend = dir == Direction::Receive ? usrp.get_rx_sensor_names(0) : usrp.get_tx_sensor_names(0);
+        names.frontend = dir == Direction::Receive ? usrp.get_rx_sensor_names(channel) : usrp.get_tx_sensor_names(channel);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[%s] sensor enumeration: %s (no sensors reported)\n", std::string(blockTag).c_str(), e.what());
         return names;
@@ -2092,7 +2164,7 @@ SensorNames sensorNamesOf(Usrp& usrp, Direction dir, std::string_view blockTag, 
             }
             const auto t0 = std::chrono::steady_clock::now();
             try {
-                std::ignore = mboard ? usrp.get_mboard_sensor(n, 0) : frontendSensor(usrp, dir, n);
+                std::ignore = mboard ? usrp.get_mboard_sensor(n, 0) : frontendSensor(usrp, dir, n, channel);
             } catch (const std::exception&) {
                 continue; // unreadable now, and so not one a poll can rely on
             }
@@ -2151,8 +2223,8 @@ bool readDeviceSensors(std::vector<SensorReading>& out, Usrp& usrp, const Sensor
         std::ranges::copy_if(list, std::back_inserter(cheap), [&names](const std::string& n) { return std::ranges::find(names.brief, n) != names.brief.end(); });
         return cheap;
     };
-    const auto read = [&usrp, dir](const std::string& n, bool mboard) {
-        SensorReading r = toReading(n, mboard ? usrp.get_mboard_sensor(n, 0) : frontendSensor(usrp, dir, n));
+    const auto read = [&usrp, dir, channel = names.channel](const std::string& n, bool mboard) {
+        SensorReading r = toReading(n, mboard ? usrp.get_mboard_sensor(n, 0) : frontendSensor(usrp, dir, n, channel));
         if (!mboard && dir == Direction::Transmit) {
             r.id    = "tx_" + n;
             r.label = "TX " + r.label;

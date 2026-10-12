@@ -25,6 +25,7 @@
 #include "support/ScheduledGraph.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -41,6 +42,7 @@
 #include <mutex>
 #include <numbers>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -543,6 +545,141 @@ bool withGraph(gr::property_map settings, Body&& body) {
         }
     }
     return true;
+}
+
+/*| role: what one port of a source took, kept apart from the other port's: the samples, their
+        power since the last reset, the gap markers, and the stream index of each rate tag and
+        the index and time of each timing tag.
+*/
+struct PortRecord {
+    std::mutex                                         lock;
+    std::uint64_t                                      samples = 0;
+    std::uint64_t                                      markers = 0;
+    double                                             power   = 0.0;
+    std::uint64_t                                      powerN  = 0;
+    std::vector<std::size_t>                           rateAt;
+    std::vector<std::pair<std::size_t, std::uint64_t>> timing;
+
+    void reset() {
+        std::lock_guard g(lock);
+        samples = 0;
+        markers = 0;
+        power   = 0.0;
+        powerN  = 0;
+        rateAt.clear();
+        timing.clear();
+    }
+    void resetPower() {
+        std::lock_guard g(lock);
+        power  = 0.0;
+        powerN = 0;
+    }
+    double dbfs() {
+        std::lock_guard g(lock);
+        return powerN == 0UL ? -300.0 : 10.0 * std::log10(power / static_cast<double>(powerN) + 1e-30);
+    }
+};
+std::array<PortRecord, 2> g_ports;
+
+/*| role: the host of one source port, as a block: it takes everything and keeps what it took in
+        the record its port setting names.
+*/
+struct [[maybe_unused]] hw_port_sink : gr::Block<hw_port_sink> {
+    gr::PortIn<CF32>                                                     in;
+    gr::Annotated<gr::Size_t, "port", gr::Doc<"index of the record kept">> port = 0U;
+    GR_MAKE_REFLECTABLE(hw_port_sink, in, port);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        PortRecord&     r = g_ports[port.value % g_ports.size()];
+        std::lock_guard g(r.lock);
+        for (const gr::Tag& tag : inSpan.rawTags) {
+            for (const auto& [key, value] : tag.map) {
+                const std::string_view k(key.data(), key.size());
+                if (k == "rx_overflow" || k == "gr:rx_overflow") {
+                    ++r.markers;
+                } else if (k == "sample_rate" || k == "gr:sample_rate") {
+                    r.rateAt.push_back(tag.index);
+                } else if (const std::uint64_t* t = value.get_if<std::uint64_t>(); t != nullptr && (k == "trigger_time" || k == "gr:trigger_time")) {
+                    r.timing.emplace_back(tag.index, *t);
+                }
+            }
+        }
+        for (const CF32& s : std::span<const CF32>(inSpan.data(), inSpan.size())) {
+            r.power += static_cast<double>(std::norm(s));
+        }
+        r.powerN += inSpan.size();
+        r.samples += inSpan.size();
+        return gr::work::Status::OK;
+    }
+};
+
+/*| contract: run body(source) against a started graph whose source feeds one port host from out
+        and, where second is true, another from out2, then stop it and release the device. Each
+        host keeps its port's record in g_ports.
+*/
+template <typename Body>
+bool withPorts(gr::property_map settings, bool second, Body&& body) {
+    for (auto& r : g_ports) {
+        r.reset();
+    }
+    gr::Graph flow;
+    auto&     src   = flow.emplaceBlock<capture::uhd::Source>(std::move(settings));
+    auto&     first = flow.emplaceBlock<hw_port_sink>({{"name", std::string("host0")}, {"port", gr::Size_t{0U}}});
+    if (!flow.connect<"out", "in">(src, first).has_value()) {
+        std::fprintf(stderr, "out does not wire to the first host\n");
+        return false;
+    }
+    if (second) {
+        auto& other = flow.emplaceBlock<hw_port_sink>({{"name", std::string("host1")}, {"port", gr::Size_t{1U}}});
+        if (!flow.connect<"out2", "in">(src, other).has_value()) {
+            std::fprintf(stderr, "out2 does not wire to the second host\n");
+            return false;
+        }
+    }
+    Scheduled scheduled;
+    if (const auto adopted = scheduled.adopt(std::move(flow)); !adopted.has_value()) {
+        std::fprintf(stderr, "the graph did not build: %s\n", adopted.error().message.c_str());
+        return false;
+    }
+    if (const auto started = scheduled.start(); !started.has_value()) {
+        std::fprintf(stderr, "the scheduler did not start: %s\n", started.error().message.c_str());
+        return false;
+    }
+    body(src);
+    scheduled.stop();
+    return true;
+}
+
+// True once the first port's host has taken a sample, false when the limit passes first.
+bool waitForPortSamples(std::chrono::milliseconds limit) {
+    const auto deadline = Clock::now() + limit;
+    while (Clock::now() < deadline) {
+        {
+            std::lock_guard g(g_ports[0].lock);
+            if (g_ports[0].samples > 0UL) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+}
+
+// The receive channels the radio offers under its default subdevice spec, through a direct open.
+std::size_t receiveChannels() {
+    try {
+        return uhd::usrp::multi_usrp::make(uhd::device_addr_t(deviceArgs()))->get_rx_num_channels();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "open failed: %s\n", e.what());
+        return 0UZ;
+    }
+}
+
+gr::property_map twoChannelSettings(double rateHz, double freqHz, double gainDb, std::vector<std::string> antennas) {
+    gr::property_map settings = sourceSettings(rateHz, freqHz, gainDb, std::string{});
+    settings.insert_or_assign("channels", std::vector<gr::Size_t>{0U, 1U});
+    settings.insert_or_assign("rx_antennae", std::move(antennas));
+    return settings;
 }
 
 // True when the device can be opened, which after a stop means the block released it.
@@ -1321,6 +1458,180 @@ int main(int argc, char** argv) {
                 expect(seen[at].dbfs > seen[i].dbfs) << "the side with the antenna hears the band louder than " << sides[i].spec;
             }
         }
+    });
+
+    cases("uhd.two-channels-align", [] {
+        /*| frame: one streamer over device channels 0 and 1, started at one device time. Both
+                ports take every receive, so their counts and the samples their tags sit on are
+                the same, and each tag names the same device time on both.
+        */
+        if (const std::size_t offered = receiveChannels(); offered < 2UZ) {
+            skipCase(std::format("the radio offers {} receive channels", offered));
+            return;
+        }
+        const auto&  truth = benchTruth();
+        const double gain  = truth.gainMinDb + 0.6 * (truth.gainMaxDb - truth.gainMinDb);
+        gr::property_map settings = twoChannelSettings(4.0e6, insideOrElse(103.0e6), gain, {"RX2"});
+        settings.insert_or_assign("tag_interval", 0.25f);
+        bool       streamed = false;
+        std::string spec0;
+        std::string spec1;
+        const bool ran = withPorts(std::move(settings), true, [&](capture::uhd::Source& src) {
+            streamed = waitForPortSamples(std::chrono::milliseconds(6000));
+            settle(3000);
+            spec0 = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_subdev_name(0); });
+            spec1 = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_subdev_name(1); });
+        });
+        expect(fatal(ran)) << "the graph ran";
+        expect(streamed) << "the stream starts";
+        auto& a = g_ports[0];
+        auto& b = g_ports[1];
+        std::printf("two channels: channel 0 is \"%s\", channel 1 is \"%s\"; out took %llu samples and out2 %llu; timing tags %zu and %zu; markers %llu and %llu\n", spec0.c_str(), spec1.c_str(),
+                    static_cast<unsigned long long>(a.samples), static_cast<unsigned long long>(b.samples), a.timing.size(), b.timing.size(), static_cast<unsigned long long>(a.markers),
+                    static_cast<unsigned long long>(b.markers));
+        if (!a.timing.empty() && !b.timing.empty()) {
+            std::printf("two channels: first timing tag at sample %zu, %llu ns on out; at sample %zu, %llu ns on out2\n", a.timing.front().first, static_cast<unsigned long long>(a.timing.front().second),
+                        b.timing.front().first, static_cast<unsigned long long>(b.timing.front().second));
+        }
+        expect(spec0 != spec1) << "the two channels are two frontends";
+        expect(a.samples > 0UL && a.samples == b.samples) << "both ports carry the same count";
+        expect(a.timing.size() >= 4UZ) << "the run carries timing tags";
+        expect(std::ranges::equal(a.timing, b.timing)) << "at the same samples and the same device times on both ports";
+        expect(!a.rateAt.empty() && a.rateAt.front() == 0UZ && a.rateAt == b.rateAt) << "and the rate on the first sample of each";
+        expect(a.markers == b.markers) << "and the same gap markers";
+    });
+
+    cases("uhd.two-channels-follow-their-antennas", [] {
+        /*| frame: channel 0 on one connector and channel 1 on the other, then the two swapped.
+                A connector with an antenna hears the FM band, and one terminated or open does
+                not, so the louder port moves with the antenna. CAPTURE_HW_UHD_ANTENNA names the
+                connector that carries an antenna on both sides; unnamed, the levels are printed
+                and not compared.
+            frame: 103 MHz at 4 MS/s spans 101 to 105 MHz, inside the FM broadcast band.
+        */
+        if (const std::size_t offered = receiveChannels(); offered < 2UZ) {
+            skipCase(std::format("the radio offers {} receive channels", offered));
+            return;
+        }
+        const auto&  truth = benchTruth();
+        const double gain  = truth.gainMinDb + 0.6 * (truth.gainMaxDb - truth.gainMinDb);
+        const double freq  = insideOrElse(103.0e6);
+        const std::string wired = benchAntenna().empty() ? std::string("RX2") : benchAntenna();
+        const auto        other = std::ranges::find_if(truth.antennas, [&wired](const std::string& a) { return a != wired; });
+        if (other == truth.antennas.end()) {
+            skipCase("the radio offers one receive connector");
+            return;
+        }
+        struct Run {
+            std::vector<std::string> asked;
+            std::string              held0;
+            std::string              held1;
+            double                   dbfs0 = -300.0;
+            double                   dbfs1 = -300.0;
+        };
+        std::vector<Run> runs(2UZ);
+        runs[0].asked = {*other, wired};
+        runs[1].asked = {wired, *other};
+        for (Run& run : runs) {
+            const bool ran = withPorts(twoChannelSettings(4.0e6, freq, gain, run.asked), true, [&](capture::uhd::Source& src) {
+                expect(waitForPortSamples(std::chrono::milliseconds(6000))) << "the stream starts";
+                settle(1500); // the DC offset loop settles, as in uhd.agc
+                g_ports[0].resetPower();
+                g_ports[1].resetPower();
+                settle(1000);
+                run.dbfs0 = g_ports[0].dbfs();
+                run.dbfs1 = g_ports[1].dbfs();
+                run.held0 = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_antenna(0); });
+                run.held1 = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_antenna(1); });
+            });
+            expect(ran) << "the graph ran";
+            std::printf("two channels: asked %s and %s, the device holds %s and %s; out %.2f dBFS, out2 %.2f dBFS at %.1f MHz and %.1f dB\n", run.asked[0].c_str(), run.asked[1].c_str(), run.held0.c_str(),
+                        run.held1.c_str(), run.dbfs0, run.dbfs1, freq / 1e6, gain);
+            expect(run.held0 == run.asked[0] && run.held1 == run.asked[1]) << "each channel holds the connector named at its place";
+        }
+        if (benchAntenna().empty()) {
+            std::printf("two channels: no connector is named as carrying an antenna (CAPTURE_HW_UHD_ANTENNA), so the levels are printed and not compared\n");
+            return;
+        }
+        expect(runs[0].dbfs1 > runs[0].dbfs0) << "with the antenna on channel 1, out2 hears the band louder";
+        expect(runs[1].dbfs0 > runs[1].dbfs1) << "and with the antenna on channel 0, out does";
+    });
+
+    cases("uhd.one-channel-on-side-b", [] {
+        /*| frame: channels {1} alone, which puts the second frontend of the default spec on
+                out. The block's record, the device_model reading and every control call name
+                that channel, and channel 0 keeps what it held.
+        */
+        if (const std::size_t offered = receiveChannels(); offered < 2UZ) {
+            skipCase(std::format("the radio offers {} receive channels", offered));
+            return;
+        }
+        const auto sides = frontendsOf(capture::uhd::Direction::Receive);
+        const auto&  truth = benchTruth();
+        const double gain  = truth.gainMinDb + 0.6 * (truth.gainMaxDb - truth.gainMinDb);
+        gr::property_map settings = sourceSettings(4.0e6, insideOrElse(103.0e6), gain, "TX/RX");
+        settings.insert_or_assign("channels", std::vector<gr::Size_t>{1U});
+        bool        streamed = false;
+        std::string name1;
+        std::string held0;
+        std::string held1;
+        capture::uhd::DeviceTruth block;
+        const bool  ran = withPorts(std::move(settings), false, [&](capture::uhd::Source& src) {
+            streamed = waitForPortSamples(std::chrono::milliseconds(6000));
+            name1    = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_subdev_name(1); });
+            held0    = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_antenna(0); });
+            held1    = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_antenna(1); });
+            block    = src.deviceTruth();
+        });
+        expect(fatal(ran)) << "the graph ran";
+        std::printf("side b: channel 1 is \"%s\"; the block states \"%s\" at %s; connectors %s on channel 0, %s on channel 1; out took %llu samples\n", name1.c_str(), block.frontend.c_str(),
+                    block.subdev.c_str(), held0.c_str(), held1.c_str(), static_cast<unsigned long long>(g_ports[0].samples));
+        expect(streamed) << "out carries samples";
+        expect(sides.size() >= 2UZ && block.frontend == name1 && block.subdev == sides[1].spec) << "the block's record is channel 1's frontend and its spec";
+        expect(held1 == "TX/RX") << "the connector setting reaches channel 1";
+        expect(held0 != held1) << "and channel 0 keeps its own";
+    });
+
+    cases("uhd.two-channel-clean-rate", [] {
+        /*| frame: two channels for 20 s at each rate in turn, from the top of the two-channel
+                ladder down, until a run counts no overflow, no lost packet and no shed sample.
+                The rate the host carries is a fact about the host and the link, so the runs
+                are printed and each asserts only that both ports took the same count.
+        */
+        if (const std::size_t offered = receiveChannels(); offered < 2UZ) {
+            skipCase(std::format("the radio offers {} receive channels", offered));
+            return;
+        }
+        const auto&  truth = benchTruth();
+        const double gain  = truth.gainMinDb + 0.6 * (truth.gainMaxDb - truth.gainMinDb);
+        const double top   = capture::uhd::sampleRatesFor(truth, "sc16", 2UZ).back();
+        for (const double rate : {top, 25.0e6, 20.0e6, 16.0e6, 10.0e6}) {
+            if (rate > top) {
+                continue;
+            }
+            std::uint64_t overflows = 0;
+            std::uint64_t dropped   = 0;
+            double        held      = 0.0;
+            const bool    ran       = withPorts(twoChannelSettings(rate, insideOrElse(103.0e6), gain, {"RX2"}), true, [&](capture::uhd::Source& src) {
+                expect(waitForPortSamples(std::chrono::milliseconds(6000))) << "the stream starts";
+                settle(20000);
+                overflows = src.overflowEvents() + src._seqErrors.load();
+                dropped   = src.droppedSamples();
+                held      = static_cast<double>(src.sample_rate.value);
+            });
+            expect(ran) << "the graph ran";
+            const auto a = g_ports[0].samples;
+            const auto b = g_ports[1].samples;
+            std::printf("two-channel rate: asked %.3f MS/s, ran %.3f MS/s for 20 s: %llu overflow events, %llu samples shed, markers %llu; out %llu and out2 %llu samples\n", rate / 1e6, held / 1e6,
+                        static_cast<unsigned long long>(overflows), static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(g_ports[0].markers), static_cast<unsigned long long>(a),
+                        static_cast<unsigned long long>(b));
+            expect(a == b) << "both ports take the same count at " << rate;
+            if (overflows == 0UL && dropped == 0UL && g_ports[0].markers == 0UL) {
+                std::printf("two-channel rate: %.3f MS/s is the highest clean rate tried\n", held / 1e6);
+                return;
+            }
+        }
+        std::printf("two-channel rate: no rate tried ran clean\n");
     });
 
     cases("uhd.analog-bandwidth", [] {

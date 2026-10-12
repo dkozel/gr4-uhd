@@ -2636,5 +2636,46 @@ int main(int argc, char** argv) {
         expect(!rig.sink._bursting.load()) << "and no burst is left open";
     });
 
+    cases("sink.uhd-transmits-on-the-one-channel-listed", [] {
+        using gr::lifecycle::State;
+        // Two channels are refused before the open: the address is one UHD refuses to parse,
+        // and the failure names the list rather than the open.
+        expect(fatal(capture::uhd::test::uhdRefusesAddress())) << "UHD's parser refuses the address, so no device is asked for";
+        capture::uhd::Sink two{};
+        two.channels = std::vector<gr::Size_t>{0U, 1U};
+        expect(two.takeChannelSetting().contains("channels lists 2 device channels")) << "a list of two is refused";
+        two.device_parameter = capture::uhd::test::kUnparsedAddress;
+        std::ignore          = two.changeStateTo(State::INITIALISED);
+        const auto started   = two.changeStateTo(State::RUNNING);
+        expect(fatal(!started.has_value())) << "the start fails";
+        expect(started.error().message.contains("the sink feeds one") && !started.error().message.contains("uhd make")) << started.error().message;
+        expect(!two.deviceUp() && two._stream == nullptr) << "with no streamer built";
+
+        // The second channel alone is the one the streamer is built on.
+        capture::uhd::Sink side{};
+        side.channels = std::vector<gr::Size_t>{1U};
+        expect(side.takeChannelSetting().empty()) << "one channel is taken";
+        const auto               stream = std::make_shared<StreamStandIn>();
+        std::vector<std::size_t> asked;
+        expect(side.armAfterReferenceWait([&](const ::uhd::stream_args_t& args) -> ::uhd::tx_streamer::sptr {
+            asked = args.channels;
+            return stream;
+        }).empty());
+        expect(asked == std::vector<std::size_t>{1UZ}) << "the streamer is built on device channel 1";
+        side.stop();
+        capture::uhd::awaitReleases();
+
+        capture::uhd::Sink plain{};
+        expect(plain.takeChannelSetting().empty());
+        asked.clear();
+        expect(plain.armAfterReferenceWait([&](const ::uhd::stream_args_t& args) -> ::uhd::tx_streamer::sptr {
+            asked = args.channels;
+            return stream;
+        }).empty());
+        expect(asked == std::vector<std::size_t>{0UZ}) << "and the default list builds it on channel 0";
+        plain.stop();
+        capture::uhd::awaitReleases();
+    });
+
     return cases.report();
 }

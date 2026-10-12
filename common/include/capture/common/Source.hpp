@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 /*| role: the publish side every device source block shares.
     frame: the device-neutral parts — the device-string reader, the coverage test, the
@@ -115,6 +116,20 @@ inline TagDecision tagDecision(std::uint64_t tWallNs, std::uint64_t lastTagNs, s
     return {false, lastTagNs};
 }
 
+/*| contract: publish one tag at offset from the writer's position on the block's output, and
+        on each further output the block streams where it declares publishFurtherOutputTag,
+        which takes the same map and offset. Every output of such a block advances in step, so
+        the offset names the same sample on each.
+*/
+template <typename Block, typename TagMap>
+void publishOutputTag(Block& blk, TagMap&& tagMap, std::size_t offset) {
+    if constexpr (requires { blk.publishFurtherOutputTag(tagMap, offset); }) {
+        blk.publishFurtherOutputTag(tagMap, offset);
+    }
+    blk.out.publishTag(std::forward<TagMap>(tagMap), offset);
+    noteDroppedTags(blk);
+}
+
 /*| contract: publish the gap marker at the head of the block the gap falls in front of, with
         the cause beside it where the caller names one. rx_overflow says a gap occurred and
         rx_overflow_cause names what caused it; a caller naming nothing publishes the key alone.
@@ -132,8 +147,7 @@ void emitOverflowTag(Block& blk, std::string_view cause = {}) {
     if (!cause.empty()) {
         gr::tag::put(tagMap, "rx_overflow_cause", std::string(cause));
     }
-    blk.out.publishTag(std::move(tagMap), 0UZ);
-    noteDroppedTags(blk);
+    publishOutputTag(blk, std::move(tagMap), 0UZ);
 }
 
 /*| contract: publish the tags the first sample of a block carries: sample_rate on the first
@@ -178,8 +192,7 @@ void publishBlockHeadTags(Block& blk, WallNs&& tWallNs) {
         gr::tag::put(tagMap, gr::tag::TRIGGER_TIME, tagNs);
         gr::tag::put(tagMap, gr::tag::TRIGGER_OFFSET, 0.f);
     }
-    blk.out.publishTag(std::move(tagMap), 0UZ);
-    noteDroppedTags(blk);
+    publishOutputTag(blk, std::move(tagMap), 0UZ);
 }
 
 /*| contract: how long a source waiting for room on its output edge waits when no block of the

@@ -118,8 +118,8 @@ struct TruthStandIn {
     ::uhd::gain_range_t                   get_tx_gain_range(std::size_t) const { return ::uhd::gain_range_t(0.0, 38.0, 0.5); }
     std::vector<std::string>              get_rx_antennas(std::size_t) const { return antennas(); }
     std::vector<std::string>              get_tx_antennas(std::size_t) const { return antennas(); }
-    std::string                           get_rx_antenna(std::size_t) const { return "TX/RX"; }
-    std::string                           get_tx_antenna(std::size_t) const { return "TX/RX"; }
+    std::string                           get_rx_antenna(std::size_t channel) const { return channel == 1UZ ? "RX2" : "TX/RX"; }
+    std::string                           get_tx_antenna(std::size_t channel) const { return channel == 1UZ ? "RX2" : "TX/RX"; }
     ::uhd::freq_range_t                   get_rx_freq_range(std::size_t) const { return ::uhd::freq_range_t(48.75e6, 2201.25e6, 0.0); }
     ::uhd::freq_range_t                   get_tx_freq_range(std::size_t) const { return ::uhd::freq_range_t(48.75e6, 2201.25e6, 0.0); }
     ::uhd::meta_range_t                   get_rx_bandwidth_range(std::size_t) const { return ::uhd::meta_range_t(0.2e6, 56.0e6, 0.0); }
@@ -281,6 +281,81 @@ StampedRun runStamped(double clockHz, double firstRateHz, std::vector<StampedStr
     }
     std::ignore = tags.consume(0UZ);
     return run;
+}
+
+/*| role: a stand-in for a receive streamer over two channels. Each receive fills the first
+        buffer with ones and the second with twos, up to one frame, and stamps the block at the
+        samples handed over so far. After the given number of receives it asks the loop to stop.
+        It counts the receives that handed it other than two buffers. No device is opened.
+*/
+struct TwoChannelStream : ::uhd::rx_streamer {
+    capture::uhd::Source& src;
+    std::size_t           receives;
+    double                rateHz;
+    std::size_t           taken       = 0UZ;
+    std::size_t           handedOver  = 0UZ;
+    std::size_t           notTwoBuffs = 0UZ;
+
+    TwoChannelStream(capture::uhd::Source& source, std::size_t count, double rate) : src(source), receives(count), rateHz(rate) {}
+
+    std::size_t get_num_channels() const override { return 2UZ; }
+    std::size_t get_max_num_samps() const override { return 1000UZ; }
+    std::size_t recv(const buffs_type& buffs, const std::size_t nsamps, ::uhd::rx_metadata_t& md, const double, const bool) override {
+        md.reset();
+        if (buffs.size() != 2UZ) {
+            ++notTwoBuffs;
+            return 0UZ;
+        }
+        if (taken == receives) {
+            src._consumer.requestStop();
+            md.error_code = ::uhd::rx_metadata_t::ERROR_CODE_TIMEOUT;
+            return 0UZ;
+        }
+        const std::size_t n = std::min(nsamps, get_max_num_samps());
+        std::fill_n(static_cast<std::complex<float>*>(buffs[0]), n, std::complex<float>{1.0f, 0.0f});
+        std::fill_n(static_cast<std::complex<float>*>(buffs[1]), n, std::complex<float>{2.0f, 0.0f});
+        md.has_time_spec = true;
+        md.time_spec     = ::uhd::time_spec_t::from_ticks(static_cast<long long>(handedOver), rateHz);
+        handedOver += n;
+        ++taken;
+        return n;
+    }
+    void issue_stream_cmd(const ::uhd::stream_cmd_t&) override {}
+    void post_input_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+};
+
+/*| role: the source with its lifecycle state set to RUNNING by hand, so its consumer loop
+        publishes without a start that opens a device.
+*/
+struct RunningSource : capture::uhd::Source {
+    void markState(gr::lifecycle::State state) { gr::atomic_ref(this->_state).store_release(state); }
+};
+
+/*| role: what one reader of a source port took: the samples, whether every one held the value
+        the port's channel was filled with, and the stream index and keys of every tag.
+*/
+struct PortTake {
+    std::size_t                                    samples = 0UZ;
+    bool                                           allEqual = true;
+    std::vector<std::pair<std::size_t, std::string>> tags;
+};
+
+PortTake takeFrom(gr::PortIn<std::complex<float>>& reader, std::complex<float> filled) {
+    PortTake    take;
+    auto        data = reader.streamReader().get(reader.streamReader().available());
+    take.samples     = data.size();
+    take.allEqual    = std::ranges::all_of(data, [filled](std::complex<float> s) { return s == filled; });
+    std::ignore      = data.consume(data.size());
+    auto tags        = reader.tagReader().get();
+    for (const gr::Tag& tag : tags) {
+        std::string keys;
+        for (const auto& [key, value] : tag.map) {
+            keys += std::string(key.data(), key.size()) + ";";
+        }
+        take.tags.emplace_back(tag.index, keys);
+    }
+    std::ignore = tags.consume(tags.size());
+    return take;
 }
 
 // What the calls print on standard error, the descriptor taken aside for the duration.
@@ -2867,6 +2942,176 @@ int main(int argc, char** argv) {
         reader.join();
         expect(moved) << "a consume on another thread ends the wait moved";
         expect(blk.progress->value() == held + 1UZ) << "the one consume moved the counter";
+    });
+
+    cases("controls.uhd-a-channel-list-is-checked-before-the-open", [] {
+        using capture::uhd::channelsRefusal;
+        using List = std::vector<std::uint32_t>;
+        expect(!channelsRefusal(List{0U}, false, "out2").has_value()) << "one channel is taken";
+        expect(!channelsRefusal(List{1U}, false, "out2").has_value()) << "and so is the second channel alone";
+        expect(!channelsRefusal(List{0U, 1U}, true, "out2").has_value()) << "two channels with both ports read are taken";
+        expect(!channelsRefusal(List{1U, 0U}, false, "out2").has_value()) << "in either order, and out2 may stay unconnected";
+        const auto third = channelsRefusal(List{0U, 1U, 2U}, true, "out2");
+        expect(fatal(third.has_value())) << "a third channel is refused";
+        expect(third->contains("lists 3 device channels")) << *third;
+        expect(channelsRefusal(List{}, false, "out2").has_value()) << "and so is a list of none";
+        const auto twice = channelsRefusal(List{1U, 1U}, true, "out2");
+        expect(fatal(twice.has_value()) && twice->contains("channel 1 twice")) << "a channel listed twice is refused";
+        const auto unfed = channelsRefusal(List{0U}, true, "out2");
+        expect(fatal(unfed.has_value()) && unfed->contains("out2 is connected")) << "a connected second port needs a second channel";
+        const auto beyond = channelsRefusal(List{0U, 1U}, true, "out2", 1UZ);
+        expect(fatal(beyond.has_value()) && beyond->contains("channel 1") && beyond->contains("offers 1")) << "a channel past the device's count is refused once the device is known";
+        expect(!channelsRefusal(List{0U, 1U}, true, "out2", 2UZ).has_value()) << "and a device of two channels takes both";
+
+        // The refusal ends the start before the open: the address is one UHD refuses to parse,
+        // and the failure names the list rather than the open.
+        expect(fatal(capture::uhd::test::uhdRefusesAddress())) << "UHD's parser refuses the address, so no device is asked for";
+        using gr::lifecycle::State;
+        capture::uhd::Source three{};
+        three.device_parameter = capture::uhd::test::kUnparsedAddress;
+        three.channels         = std::vector<gr::Size_t>{0U, 1U, 2U};
+        std::ignore            = three.changeStateTo(State::INITIALISED);
+        std::expected<void, gr::Error> threeStart;
+        std::ignore = stderrOf([&] { threeStart = three.changeStateTo(State::RUNNING); });
+        expect(fatal(!threeStart.has_value())) << "the start fails";
+        expect(threeStart.error().message.contains("channels lists 3 device channels") && !threeStart.error().message.contains("uhd make")) << threeStart.error().message;
+        capture::uhd::Source one{};
+        one.device_parameter = capture::uhd::test::kUnparsedAddress;
+        std::ignore          = one.changeStateTo(State::INITIALISED);
+        std::expected<void, gr::Error> oneStart;
+        std::ignore = stderrOf([&] { oneStart = one.changeStateTo(State::RUNNING); });
+        expect(fatal(!oneStart.has_value()) && oneStart.error().message.contains("uhd make")) << "the default list reaches the open, which the address fails";
+    });
+
+    cases("controls.uhd-two-channels-share-the-ladder", [] {
+        // A B210 on USB 3: one continuous clock range, the converter's 61.44 MHz at the top.
+        capture::uhd::DeviceTruth b210;
+        b210.mclkMinHz      = 220'000.0;
+        b210.mclkMaxHz      = 61'440'000.0;
+        b210.mclkContinuous = true;
+        const auto one      = capture::uhd::Source::sampleRatesFor(b210, "sc16", 1UZ);
+        const auto two      = capture::uhd::Source::sampleRatesFor(b210, "sc16", 2UZ);
+        expect(one.back() == 61.44e6) << "one channel reaches the converter's top clock";
+        expect(two.back() == 30.72e6) << "two channels reach half of it";
+        expect(two == std::vector<double>(one.begin(), one.end() - 2)) << "the two-channel ladder is the one-channel ladder up to that top";
+        expect(capture::uhd::rateToWrite(40.0e6, b210, 0.0, "sc16", capture::uhd::Direction::Receive, "test", 2UZ) == 30.72e6) << "a two-channel request above the top is snapped to it";
+        expect(capture::uhd::rateToWrite(40.0e6, b210, 0.0, "sc16", capture::uhd::Direction::Receive, "test", 1UZ) == 40.0e6) << "and one channel passes it as it stands";
+
+        // A link UHD states is shared between the channels.
+        capture::uhd::DeviceTruth usb2 = b210;
+        usb2.linkBytesPerS             = 53.248e6;
+        expect(capture::uhd::Source::sampleRatesFor(usb2, "sc16", 1UZ).back() == 13.312e6) << "one channel takes the whole link";
+        expect(capture::uhd::Source::sampleRatesFor(usb2, "sc16", 2UZ).back() == 6.656e6) << "two channels take half each";
+
+        // A fixed clock keeps its ladder, and the link alone is shared.
+        capture::uhd::DeviceTruth fixed;
+        fixed.mclkMinHz     = 100.0e6;
+        fixed.mclkMaxHz     = 100.0e6;
+        fixed.linkBytesPerS = 100.0e6;
+        for (int n = 1; n <= 512; ++n) {
+            const double r = 100.0e6 / static_cast<double>(n);
+            fixed.rates.emplace_back(r, r);
+        }
+        expect(capture::uhd::reachableRatesFor(fixed, "sc16", 1UZ).back() == 25.0e6) << "one channel of a 100 MB/s link carries 25 MS/s";
+        expect(capture::uhd::reachableRatesFor(fixed, "sc16", 2UZ).back() == 12.5e6) << "and two channels 12.5 MS/s each";
+        expect(capture::uhd::channelTruthFor(fixed, 2UZ).mclkMaxHz == 100.0e6) << "the fixed clock does not move";
+    });
+
+    cases("controls.uhd-a-two-channel-start-is-timed", [] {
+        using capture::uhd::Source;
+        const auto settled = Source::alignedStartTime(std::nullopt, ::uhd::time_spec_t(5.25));
+        expect(std::abs(settled.get_real_secs() - (5.25 + Source::kAlignedStartLeadS)) < 1e-9) << "a settled clock starts the lead past now";
+        const auto latched = Source::alignedStartTime(1'791'834'694LL, ::uhd::time_spec_t(12.0));
+        expect(latched.get_full_secs() == 1'791'834'694LL) << "a pending latch starts past the latched second, whatever the old count reads";
+        expect(std::abs(latched.get_frac_secs() - Source::kAlignedStartLeadS) < 1e-9) << "by the lead";
+    });
+
+    cases("controls.uhd-each-channel-takes-its-own-antenna", [] {
+        using capture::uhd::Source;
+        using Names = std::vector<std::string>;
+        expect(Source::antennaPerChannel(Names{"TX/RX", "RX2"}, 2UZ) == Names{"TX/RX", "RX2"}) << "each listed channel takes the name at its place";
+        expect(Source::antennaPerChannel(Names{"RX2"}, 2UZ) == Names{"RX2", "RX2"}) << "one name applies to both";
+        expect(Source::antennaPerChannel(Names{"TX/RX", "RX2"}, 1UZ) == Names{"TX/RX"}) << "a name past the channels is not used";
+        expect(Source::antennaPerChannel(Names{"", "RX2"}, 2UZ) == Names{"", "RX2"}) << "an empty name leaves its channel alone";
+
+        // The applier refuses a name the unit does not offer on any channel.
+        RunningSource src{};
+        src._channels          = {0UZ, 1UZ};
+        src._openTruth.antennas = Names{"TX/RX", "RX2"};
+        std::ignore = stderrOf([&src] { expect(!src.applyAntennasOf(Names{"RX2", "RX9"})) << "a second name outside the list is refused"; });
+        expect(src.applyAntennasOf(Names{"RX2", "TX/RX"})) << "two listed names are taken";
+    });
+
+    cases("controls.uhd-the-truth-is-read-on-the-channel-named", [] {
+        TruthStandIn usrp;
+        usrp.spec = "A:A A:B";
+        for (const auto dir : {capture::uhd::Direction::Receive, capture::uhd::Direction::Transmit}) {
+            capture::uhd::DeviceTruth first;
+            capture::uhd::DeviceTruth second;
+            capture::uhd::readTruthInto(usrp, first, dir);
+            capture::uhd::readTruthInto(usrp, second, dir, 1UZ);
+            expect(first.subdev == "A:A" && first.antenna == "TX/RX") << "channel 0 reads the first pair and its connector";
+            expect(second.subdev == "A:B" && second.antenna == "RX2") << "channel 1 reads the second pair and its own connector";
+            expect(second.describe().contains("A:B")) << "and the record names the second pair: " << second.describe();
+        }
+        TruthStandIn single;
+        single.spec = "A:A";
+        capture::uhd::DeviceTruth past;
+        capture::uhd::readTruthInto(single, past, capture::uhd::Direction::Receive, 1UZ);
+        expect(past.subdev.empty()) << "a channel past the spec names no pair";
+    });
+
+    cases("controls.uhd-two-channels-reach-both-ports", [] {
+        constexpr double      kRate     = 1.0e6;
+        constexpr std::size_t kReceives = 12UZ;
+        {
+            RunningSource                   src{};
+            gr::PortIn<std::complex<float>> first;
+            gr::PortIn<std::complex<float>> second;
+            expect(fatal(src.out.connect(first).has_value() && src.out2.connect(second).has_value())) << "both ports reach a reader";
+            src.sample_rate = kRate;
+            src.tag_interval = 0.0f;
+            src._channels    = {0UZ, 1UZ};
+            src._outputState.rateTagOwed.store(true);
+            // As many receives as half the smaller edge holds, so neither reader has to take any.
+            const std::size_t edge   = std::min(src.out.streamWriter().buffer().size(), src.out2.streamWriter().buffer().size());
+            const std::size_t count  = std::min(kReceives, edge / 2UZ / 1000UZ);
+            expect(fatal(count >= 2UZ)) << "the edges hold two receives";
+            const auto        stream = std::make_shared<TwoChannelStream>(src, count, kRate);
+            src._stream       = stream;
+            src.markState(gr::lifecycle::State::RUNNING);
+            src._consumer.clearStop();
+            src.consumerLoop();
+            src.markState(gr::lifecycle::State::STOPPED);
+            src._stream.reset();
+            expect(stream->notTwoBuffs == 0UZ) << "every receive handed the stream two buffers";
+            const PortTake a = takeFrom(first, {1.0f, 0.0f});
+            const PortTake b = takeFrom(second, {2.0f, 0.0f});
+            expect(a.samples == stream->handedOver && b.samples == stream->handedOver) << "both ports carry every sample received: " << a.samples << " and " << b.samples << " of " << stream->handedOver;
+            expect(a.allEqual && b.allEqual) << "out carries the first channel and out2 the second";
+            expect(fatal(!a.tags.empty())) << "the ports carry tags";
+            expect(std::ranges::equal(a.tags, b.tags)) << "at the same samples, with the same keys";
+            expect(a.tags.front().first == 0UZ && a.tags.front().second.contains("sample_rate")) << "the rate on the first sample of each";
+            expect(std::ranges::count_if(a.tags, [](const auto& t) { return t.second.contains("trigger_time"); }) == static_cast<std::ptrdiff_t>(count)) << "and a timing tag on every block";
+        }
+        {
+            // With out2 unconnected the second channel is received and dropped.
+            RunningSource                   src{};
+            gr::PortIn<std::complex<float>> first;
+            expect(fatal(src.out.connect(first).has_value()));
+            src.sample_rate   = kRate;
+            src._channels     = {0UZ, 1UZ};
+            const auto stream = std::make_shared<TwoChannelStream>(src, std::min(kReceives, src.out.streamWriter().buffer().size() / 2UZ / 1000UZ), kRate);
+            src._stream       = stream;
+            src.markState(gr::lifecycle::State::RUNNING);
+            src._consumer.clearStop();
+            src.consumerLoop();
+            src.markState(gr::lifecycle::State::STOPPED);
+            src._stream.reset();
+            expect(stream->notTwoBuffs == 0UZ) << "the stream still receives two channels";
+            const PortTake a = takeFrom(first, {1.0f, 0.0f});
+            expect(a.samples == stream->handedOver && a.allEqual) << "and out carries the first in full";
+        }
     });
 
     return cases.report();

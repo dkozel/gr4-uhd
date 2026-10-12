@@ -120,6 +120,13 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         verified-by: uhd.transmit-side
     */
     gr::Annotated<std::string, "subdev", gr::Doc<"transmit frontend as a subdevice spec, 'A:A'; empty keeps the device's">> subdev;
+    /*| contract: read by start() alone. in feeds the one device channel listed, and every
+            control call and read-back names that channel. A start refuses a list of other than
+            one channel before it opens the device, and a channel the device does not offer
+            under the subdevice spec in force after the open, before any stream is built.
+        verified-by: sink.uhd-transmits-on-the-one-channel-listed
+    */
+    gr::Annotated<std::vector<gr::Size_t>, "channels", gr::Doc<"device channel fed from in">> channels = std::vector<gr::Size_t>{0U};
     // The seven settings below are read by start() alone; withDeviceArgs states why.
     gr::Annotated<std::string, "wire_format", gr::Doc<"'sc16' or 'sc8'">>                                             wire_format  = std::string("sc16");
     gr::Annotated<std::string, "clock_source", gr::Doc<"reference the device is disciplined by">>                     clock_source;
@@ -139,7 +146,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     gr::Annotated<double, "thread_priority", gr::Doc<"transmit thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
     gr::Annotated<double, "cpu", gr::Doc<"transmit thread's processor; -1 keeps the system's choice">>                cpu             = -1.0;
 
-    GR_MAKE_REFLECTABLE(Sink, in, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, tx_antennae, subdev, wire_format, clock_source, time_source, master_clock_rate,
+    GR_MAKE_REFLECTABLE(Sink, in, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, tx_antennae, subdev, channels, wire_format, clock_source, time_source, master_clock_rate,
                         send_frame_size, num_send_frames, send_buff_size, queue_duration, queue_max_bytes, thread_priority, cpu);
 
     // The longest one send may block. It is longer than any chunk the drain hands over, so a
@@ -219,6 +226,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     RingStorage<std::complex<float>>       _queueSpare;
     mutable SensorNames                    _sensorNames;              // timed at the first sweep of a run
     mutable bool                           _sensorNamesTaken = false; // whether that sweep has kept them
+    std::size_t                            _channel          = 0UZ; // the device channel in feeds, written by start() before the device opens
     std::atomic<double>                    _refLockWaitMs{0.0};
     std::optional<double>                  _freqWrittenHz, _rateWrittenHz, _gainWrittenDb, _bwWrittenHz;
     std::optional<std::string>             _antennaWritten;
@@ -301,7 +309,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             return std::nullopt;
         }
         try {
-            return _usrp->get_tx_gain(id, 0);
+            return _usrp->get_tx_gain(id, _channel);
         } catch (const std::exception&) {
             return std::nullopt;
         }
@@ -328,7 +336,20 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     static bool probeTruth(const std::string& kwargs, double sampleRateHz, DeviceTruth& truth) { return capture::uhd::probeTruth(kwargs, sampleRateHz, truth, Direction::Transmit, "uhd::Sink"); }
 
     // Read one open device's transmit surface into truth, replacing it.
-    static void readTruthInto(::uhd::usrp::multi_usrp& usrp, DeviceTruth& truth) { capture::uhd::readTruthInto(usrp, truth, Direction::Transmit); }
+    /*| contract: take the device channel the channels setting names as the one in feeds, or
+            answer why the list is refused and keep the channel in force. Called by start()
+            before the open.
+        verified-by: sink.uhd-transmits-on-the-one-channel-listed
+    */
+    std::string takeChannelSetting() {
+        if (channels->size() != 1UZ) {
+            return std::format("channels lists {} device channels; the sink feeds one", channels->size());
+        }
+        _channel = channels->front();
+        return {};
+    }
+
+    static void readTruthInto(::uhd::usrp::multi_usrp& usrp, DeviceTruth& truth, std::size_t channel = 0UZ) { capture::uhd::readTruthInto(usrp, truth, Direction::Transmit, channel); }
 
     /*| contract: the transmit control surface from probed truth — the gain elements, the
             connector and the analog filter. Gain elements, ranges and bandwidth differ per USRP
@@ -760,7 +781,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             named = _sensorNamesTaken;
         }
         if (!named) {
-            names = sensorNamesOf(usrp, Direction::Transmit, "uhd::Sink", kFirstSweepSensorLimitMs, live);
+            names = sensorNamesOf(usrp, Direction::Transmit, "uhd::Sink", kFirstSweepSensorLimitMs, live, _channel);
             CtrlGuard guard(_ctrlMutex, _deviceUp, kStatusWait);
             if (!guard) {
                 return false;
@@ -827,6 +848,9 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (const std::string why = startRefusal(sample_rate); !why.empty()) {
             throwStartFailure("uhd::Sink", why);
         }
+        if (const std::string why = takeChannelSetting(); !why.empty()) {
+            throwStartFailure("uhd::Sink", why);
+        }
 
         awaitReleases();
         try {
@@ -856,7 +880,10 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             failure = applySubdevSpec(*_usrp, Direction::Transmit, subdev.value);
             try {
                 if (failure.empty()) {
-                    readTruthInto(*_usrp, _openTruth);
+                    failure = channelsRefusal(channels.value, false, "", _usrp->get_tx_num_channels()).value_or(std::string{});
+                }
+                if (failure.empty()) {
+                    readTruthInto(*_usrp, _openTruth, _channel);
                 }
             } catch (const std::exception& e) {
                 /*| invariant: caught here rather than left to escape, so the device is released
@@ -868,7 +895,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             }
             publishSurfaceLocked();
             if (failure.empty()) {
-                failure = configureOpenDeviceLocked([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink"); });
+                failure = configureOpenDeviceLocked([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", std::span<const std::size_t>(&_channel, 1UZ)); });
             }
         }
         if (!failure.empty()) {
@@ -932,7 +959,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         try {
             std::lock_guard      lock(_ctrlMutex);
             ::uhd::stream_args_t args("fc32", _wireFormat);
-            args.channels = {0};
+            args.channels = {_channel};
             _stream       = makeStream(args);
             if (_stream == nullptr) {
                 return {};
@@ -1381,7 +1408,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (_usrp == nullptr) {
             return true;
         }
-        return applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink"); });
+        return applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", std::span<const std::size_t>(&_channel, 1UZ)); });
     }
 
     /*| contract: write the rate rateToWrite chooses for the request through write, which answers
@@ -1653,7 +1680,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     // The shared filter write on this block's device. The caller holds _ctrlMutex.
     void applyBandwidthLocked(double hz) {
         if (_usrp != nullptr) {
-            applyBandwidth(*_usrp, Direction::Transmit, hz, _bwWrittenHz, _bwCurHz, "uhd::Sink");
+            applyBandwidth(*_usrp, Direction::Transmit, hz, _bwWrittenHz, _bwCurHz, "uhd::Sink", std::span<const std::size_t>(&_channel, 1UZ));
             publishSurfaceLocked();
         }
     }
@@ -1661,7 +1688,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     // The shared coverage re-read on this block's device. The caller holds _ctrlMutex.
     void refreshFreqRangesLocked() {
         if (_usrp != nullptr) {
-            refreshFreqRanges(*_usrp, Direction::Transmit, _freqRanges, "uhd::Sink");
+            refreshFreqRanges(*_usrp, Direction::Transmit, _freqRanges, "uhd::Sink", _channel);
         }
     }
 
@@ -1694,10 +1721,10 @@ reports the first such tag of a run on its message port. Other tags are ignored.
                 return false;
             }
             try {
-                _usrp->set_tx_freq(::uhd::tune_request_t(*f), 0);
+                _usrp->set_tx_freq(::uhd::tune_request_t(*f), _channel);
                 _freqWrittenHz = *f;
                 // The read-back carried back into the frame the caller asks in.
-                _appliedFreqHz    = _usrp->get_tx_freq(0);
+                _appliedFreqHz    = _usrp->get_tx_freq(_channel);
                 _appliedRequestHz = tunedFrequencyFrom(_appliedFreqHz, frequency_correction);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[uhd::Sink] set_tx_freq(%.0f) failed: %s (continuing)\n", *f, e.what());
@@ -1747,9 +1774,9 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             return;
         }
         try {
-            _usrp->set_tx_gain(want, 0); // overall gain, UHD distributes it across the elements
+            _usrp->set_tx_gain(want, _channel); // overall gain, UHD distributes it across the elements
             _gainWrittenDb = want;
-            _actualGainDb  = _usrp->get_tx_gain(0);
+            _actualGainDb  = _usrp->get_tx_gain(_channel);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Sink] set_tx_gain(%.1f) failed: %s (continuing)\n", want, e.what());
         }
@@ -1762,16 +1789,16 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         const std::string wanted = tx_antennae->empty() ? std::string{} : tx_antennae->front();
         std::string       pick;
         try {
-            pick = chooseAntenna(_usrp->get_tx_antennas(0), wanted);
+            pick = chooseAntenna(_usrp->get_tx_antennas(_channel), wanted);
         } catch (const std::exception&) { // a frontend with one connector and no list
         }
         if (pick.empty() || !writeNeeded(_antennaWritten, pick)) {
             return;
         }
         try {
-            _usrp->set_tx_antenna(pick, 0);
+            _usrp->set_tx_antenna(pick, _channel);
             _antennaWritten = pick;
-            _actualAntenna  = _usrp->get_tx_antenna(0);
+            _actualAntenna  = _usrp->get_tx_antenna(_channel);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Sink] set_tx_antenna(%s): %s (continuing)\n", pick.c_str(), e.what());
         }
@@ -1900,12 +1927,12 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         const double bounded = boundedGainFor(_openTruth, element, dB, "uhd::Sink");
         try {
             if (element.empty()) {
-                _usrp->set_tx_gain(bounded, 0);
+                _usrp->set_tx_gain(bounded, _channel);
                 _gainWrittenDb = bounded;
             } else {
-                _usrp->set_tx_gain(bounded, element, 0);
+                _usrp->set_tx_gain(bounded, element, _channel);
             }
-            _actualGainDb = _usrp->get_tx_gain(0);
+            _actualGainDb = _usrp->get_tx_gain(_channel);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Sink] set_tx_gain(%s, %.1f): %s (continuing)\n", element.c_str(), dB, e.what());
             return false;

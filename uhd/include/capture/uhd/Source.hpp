@@ -183,10 +183,13 @@ private:
 */
 struct Source : gr::Block<Source> {
     using Description = gr::Doc<R"(USRP source via libuhd.
-fc32 host samples over the sc16 or sc8 wire format. The device list asks libuhd with
-use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
+fc32 host samples over the sc16 or sc8 wire format. out carries the first device channel the
+channels setting lists, and out2 the second where it lists two; out2 may stay unconnected.
+The device list asks libuhd with use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the
+environment.)">;
 
-    gr::PortOut<std::complex<float>> out;
+    gr::PortOut<std::complex<float>>               out;
+    gr::PortOut<std::complex<float>, gr::Optional> out2;
 
     static constexpr const char* kDevice = "uhd"; // the family name a device listing and a probe carry
     static constexpr bool        kListingOpens = false; // the listing asks libuhd, which opens no unit
@@ -207,7 +210,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     gr::Annotated<std::vector<double>, "rx_gains", gr::Unit<"dB">, gr::Visible, gr::Doc<"overall RX gain">>       rx_gains  = std::vector<double>{35.0};
     gr::Annotated<bool, "gain_mode", gr::Doc<"hardware AGC on/off">>                             gain_mode = false;
     gr::Annotated<double, "frequency_correction", gr::Unit<"ppm">, gr::Doc<"applied as a scaled tune">>           frequency_correction = 0.0;
-    gr::Annotated<std::vector<std::string>, "rx_antennae", gr::Doc<"receive connector name">>                     rx_antennae;
+    gr::Annotated<std::vector<std::string>, "rx_antennae", gr::Doc<"receive connector per listed channel, or one for all">> rx_antennae;
     gr::Annotated<bool, "emit_timing_tags", gr::Doc<"emit wall-clock timing tags">>                               emit_timing_tags = true;
     gr::Annotated<float, "tag_interval", gr::Unit<"s">, gr::Doc<"minimum interval between timing tags">>          tag_interval     = 1.0f;
     gr::Annotated<std::string, "trigger_name", gr::Doc<"tag trigger_name">>                                       trigger_name     = std::string("SDR_WALLCLOCK");
@@ -216,6 +219,22 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         verified-by: uhd.receive-side
     */
     gr::Annotated<std::string, "subdev", gr::Doc<"receive frontend as a subdevice spec, 'A:B'; empty keeps the device's">> subdev;
+    /*| contract: read by start() alone. One streamer carries the device channels listed, the
+            first on out and the second on out2, and both start at one device time. A start
+            refuses, before it opens the device, a list of no channel or of three, a channel
+            listed twice, and a connected out2 with one channel listed. It refuses after the
+            open a channel the device does not offer under the subdevice spec in force.
+        contract: the sample rate, the frequency, the gain, the automatic gain mode, the
+            filter and the two corrections apply to every listed channel alike, and the first
+            channel answers every read-back and the surface. rx_antennae names a connector per
+            listed channel in the same order, and a single name applies to all of them.
+        why: a B210's two receive chains share one local oscillator and one converter clock,
+            so a tune or a rate on one channel moves the other. The gain and the connector are
+            each chain's own.
+        verified-by: uhd.two-channels-align
+        verified-by: controls.uhd-a-channel-list-is-checked-before-the-open
+    */
+    gr::Annotated<std::vector<gr::Size_t>, "channels", gr::Doc<"device channels streamed on out and out2">> channels = std::vector<gr::Size_t>{0U};
     // The nine settings below are read by start() alone; withDeviceArgs states why.
     gr::Annotated<std::string, "wire_format", gr::Doc<"'sc16' or 'sc8'">>                                         wire_format       = std::string("sc16");
     gr::Annotated<std::string, "clock_source", gr::Doc<"reference to discipline the device by; empty keeps its own">> clock_source;
@@ -240,7 +259,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     gr::Annotated<double, "thread_priority", gr::Doc<"receive thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
     gr::Annotated<double, "cpu", gr::Doc<"receive thread's processor; -1 keeps the system's choice">>             cpu               = -1.0;
 
-    GR_MAKE_REFLECTABLE(Source, out, device, device_parameter, sample_rate, frequency, rx_gains, gain_mode, frequency_correction, rx_antennae, emit_timing_tags, tag_interval, trigger_name, subdev, wire_format, clock_source, time_source, master_clock_rate, recv_frame_size, num_recv_frames, recv_buff_size, thread_priority, cpu);
+    GR_MAKE_REFLECTABLE(Source, out, out2, device, device_parameter, sample_rate, frequency, rx_gains, gain_mode, frequency_correction, rx_antennae, emit_timing_tags, tag_interval, trigger_name, subdev, channels, wire_format, clock_source, time_source, master_clock_rate, recv_frame_size, num_recv_frames, recv_buff_size, thread_priority, cpu);
 
     ::uhd::usrp::multi_usrp::sptr _usrp;
     ::uhd::rx_streamer::sptr      _stream;
@@ -402,7 +421,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     */
     std::optional<double>       _freqWrittenHz, _loOffsetWrittenHz, _rateWrittenHz, _gainWrittenDb, _bwWrittenHz;
     std::optional<bool>         _agcWritten;
-    std::optional<std::string>  _antennaWritten;
+    std::optional<std::vector<std::string>> _antennaWritten; // per streaming channel
     /*| frame: the wire format and the master clock in force, and what a control pinned them
             to. Both are read at open — the format when the streamer is built, the clock as a
             device-address key — so a control write outlives the stream it was made during and
@@ -433,6 +452,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     std::vector<std::pair<std::string, double>> _heldGains; // element gains asked for, guarded by _ctrlMutex
     std::uint64_t               _lastTagTimeNs = 0;
     std::vector<std::complex<float>> _recvBuf; // the drain's buffer, on the consumer thread
+    std::vector<std::complex<float>> _recvBuf2; // the second channel's, where out2 takes nothing
+    std::vector<std::size_t>         _channels{0UZ}; // the device channels streaming, written by start() before any thread runs
+    bool                             _secondPublished = false; // out2 has a reader and a channel, on the consumer thread
     OutputState                   _outputState;
     ControlProperties     _controlProperties{this};
     Snapshot<SurfaceValues>       _surfaceValues; // what controlSurface() reads, published by publishSurfaceLocked()
@@ -447,12 +469,12 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             reads it without _ctrlMutex. */
     std::vector<ControlDesc> controlSurface() {
         const SurfaceValues v = _surfaceValues.read();
-        return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0, .gainMode = _surfaceAgc.load(std::memory_order_acquire)}, v.filterHz, v.clockHz, v.wireFormat);
+        return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0, .gainMode = _surfaceAgc.load(std::memory_order_acquire)}, v.filterHz, v.clockHz, v.wireFormat, v.channelCount);
     }
 
     // Hand the values controlSurface() reads to the snapshot. Called with _ctrlMutex held, or
     // by start() before the device is up.
-    void publishSurfaceLocked() { _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz.value_or(0.0), .wireFormat = _wireFormat}); }
+    void publishSurfaceLocked() { _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz.value_or(0.0), .wireFormat = _wireFormat, .channelCount = _channels.size()}); }
 
     /*| contract: the value one non-gain control holds, in the unit its descriptor states: the
             filter the device settled on, the LO offset tuned with, the device-clock tagging,
@@ -512,7 +534,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         return capture::uhd::probeTruth(kwargs, sampleRateHz, truth, Direction::Receive, "uhd::Source", [](::uhd::usrp::multi_usrp& usrp, DeviceTruth& into) { readReceiveExtrasInto(usrp, into); });
     }
 
-    /*| contract: the two property-tree roots the receive chain of channel 0 hangs off: the
+    /*| contract: the two property-tree roots the receive chain of one channel hangs off: the
             daughterboard's own frontend first, then the motherboard's receive frontend core.
             Both empty where the device names no subdevice.
         why: the daughterboard slot and the frontend name differ per model — a B2xx answers
@@ -523,13 +545,14 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             corrections belong to the converter core on the motherboard, and which of the two
             carries a given facility is a property of the model.
     */
-    static std::pair<std::string, std::string> rxFrontendRoots(::uhd::usrp::multi_usrp& usrp) {
+    static std::pair<std::string, std::string> rxFrontendRoots(::uhd::usrp::multi_usrp& usrp, std::size_t channel = 0UZ) {
         try {
             const auto spec = usrp.get_rx_subdev_spec(0);
-            if (spec.empty()) {
+            if (spec.size() <= channel) {
                 return {};
             }
-            return {std::format("/mboards/0/dboards/{}/rx_frontends/{}", spec.at(0).db_name, spec.at(0).sd_name), std::format("/mboards/0/rx_frontends/{}", spec.at(0).db_name)};
+            const auto& pair = spec.at(channel);
+            return {std::format("/mboards/0/dboards/{}/rx_frontends/{}", pair.db_name, pair.sd_name), std::format("/mboards/0/rx_frontends/{}", pair.db_name)};
         } catch (const std::exception&) {
             return {};
         }
@@ -542,8 +565,8 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             the write for a facility that is not there, warns and changes nothing.
         verified-by: uhd.correction-defaults
     */
-    static std::string rxFacilityPath(::uhd::usrp::multi_usrp& usrp, std::string_view leaf) {
-        const auto [dboard, converter] = rxFrontendRoots(usrp);
+    static std::string rxFacilityPath(::uhd::usrp::multi_usrp& usrp, std::string_view leaf, std::size_t channel = 0UZ) {
+        const auto [dboard, converter] = rxFrontendRoots(usrp, channel);
         try {
             auto tree = usrp.get_device()->get_tree();
             for (const std::string& root : {dboard, converter}) {
@@ -565,9 +588,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         frame: the one place that says what the receive truth is, so a probe of a stopped device
             and a running block's own record of the device it opened are the same record.
     */
-    static void readTruthInto(::uhd::usrp::multi_usrp& usrp, DeviceTruth& truth) {
-        capture::uhd::readTruthInto(usrp, truth, Direction::Receive);
-        readReceiveExtrasInto(usrp, truth);
+    static void readTruthInto(::uhd::usrp::multi_usrp& usrp, DeviceTruth& truth, std::size_t channel = 0UZ) {
+        capture::uhd::readTruthInto(usrp, truth, Direction::Receive, channel);
+        readReceiveExtrasInto(usrp, truth, channel);
     }
 
     /*| contract: which of the three optional corrections this unit's receive frontend carries,
@@ -575,10 +598,10 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         frame: the three facilities hang off the receive frontend's own property-tree roots, so
             they belong to the receive record alone.
     */
-    static void readReceiveExtrasInto(::uhd::usrp::multi_usrp& usrp, DeviceTruth& truth) {
-        truth.hasAgc           = !rxFacilityPath(usrp, "gain/agc/enable").empty();
-        truth.hasDcOffsetCorr  = !rxFacilityPath(usrp, "dc_offset/enable").empty();
-        truth.hasIqBalanceCorr = !rxFacilityPath(usrp, "iq_balance/enable").empty();
+    static void readReceiveExtrasInto(::uhd::usrp::multi_usrp& usrp, DeviceTruth& truth, std::size_t channel = 0UZ) {
+        truth.hasAgc           = !rxFacilityPath(usrp, "gain/agc/enable", channel).empty();
+        truth.hasDcOffsetCorr  = !rxFacilityPath(usrp, "dc_offset/enable", channel).empty();
+        truth.hasIqBalanceCorr = !rxFacilityPath(usrp, "iq_balance/enable", channel).empty();
     }
 
     // The same probe at whatever rate the device came up at, for a caller with no rate to
@@ -762,7 +785,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     }
 
     // The rates to offer a caller for the radio a probe described, ascending.
-    static std::vector<double> sampleRatesFor(const DeviceTruth& t, std::string_view wireFormat = "sc16") { return capture::uhd::sampleRatesFor(t, wireFormat); }
+    static std::vector<double> sampleRatesFor(const DeviceTruth& t, std::string_view wireFormat = "sc16", std::size_t channelCount = 1UZ) { return capture::uhd::sampleRatesFor(t, wireFormat, channelCount); }
 
     /*| contract: the LO offset to apply, in Hz, bounded by half the rate in force at each
             end, which is the bound the descriptor states. A rate of zero or a value that is
@@ -959,7 +982,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             unstarted block holds staged or set, and a format the family does not name is sc16.
     */
     static std::vector<ControlDesc> describeControls(const DeviceTruth& t, const TruthContext& ctx, double heldBandwidthHz = 0.0, std::optional<double> clockInForceHz = std::nullopt,
-                                                     std::string_view wireFormat = {}) {
+                                                     std::string_view wireFormat = {}, std::size_t channelCount = 1UZ) {
         const std::string        format = validWireFormat(std::string(wireFormat.empty() ? std::string_view(ctx.wireFormat) : wireFormat));
         std::vector<ControlDesc> out    = gainElementControls(t);
         /*| frame: the receive connector, as an index into the unit's own list, defaulting to
@@ -1144,7 +1167,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                 out.push_back(std::move(clock));
             }
         }
-        appendLadderAndCoverage(out, t, clockInForceHz.value_or(clockInForceAtOpen(::uhd::device_addr_t(ctx.deviceParams), t)), format, kDefaultRateHz, kDefaultFrequencyHz);
+        appendLadderAndCoverage(out, t, clockInForceHz.value_or(clockInForceAtOpen(::uhd::device_addr_t(ctx.deviceParams), t)), format, kDefaultRateHz, kDefaultFrequencyHz, channelCount);
         return out;
     }
 
@@ -1207,7 +1230,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                     return true; // the loop owns the gain path; the held value is written when it lets go
                 }
                 try {
-                    _usrp->set_rx_gain(bounded, element, 0);
+                    for (const std::size_t ch : _channels) {
+                        _usrp->set_rx_gain(bounded, element, ch);
+                    }
                     return true;
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[uhd::Source] set_rx_gain(%s, %.1f): %s\n", element.c_str(), dB, e.what());
@@ -1234,7 +1259,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             return 0.0;
         }
         try {
-            return element.empty() ? _usrp->get_rx_gain(0) : _usrp->get_rx_gain(element, 0);
+            return element.empty() ? _usrp->get_rx_gain(_channels.front()) : _usrp->get_rx_gain(element, _channels.front());
         } catch (const std::exception&) {
             return 0.0;
         }
@@ -1347,14 +1372,18 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                 if (!_openTruth.hasDcOffsetCorr) {
                     return false;
                 }
-                _usrp->set_rx_dc_offset(want >= 0.5, 0);
+                for (const std::size_t ch : _channels) {
+                    _usrp->set_rx_dc_offset(want >= 0.5, ch);
+                }
                 return true;
             }
             if (id == "IQ_CORR") {
                 if (!_openTruth.hasIqBalanceCorr) {
                     return false;
                 }
-                _usrp->set_rx_iq_balance(want >= 0.5, 0);
+                for (const std::size_t ch : _channels) {
+                    _usrp->set_rx_iq_balance(want >= 0.5, ch);
+                }
                 return true;
             }
             if (id == "WIRE_FORMAT") {
@@ -1603,6 +1632,10 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     }
 
     void start() {
+        if (const auto refusal = channelsRefusal(channels.value, out2.isConnected(), "out2"); refusal.has_value()) {
+            throwStartFailure("uhd::Source", *refusal);
+        }
+        _channels.assign(channels->begin(), channels->end());
         noteOutputAtStart(*this);
         _lastTagTimeNs = 0;
         _streamDead.store(false, std::memory_order_release);
@@ -1678,6 +1711,13 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             std::lock_guard lock(_ctrlMutex);
             applyReferenceSourcesLocked();
             subdevFailure = applySubdevSpec(*_usrp, Direction::Receive, subdev.value);
+            if (subdevFailure.empty()) {
+                try {
+                    subdevFailure = channelsRefusal(channels.value, out2.isConnected(), "out2", _usrp->get_rx_num_channels()).value_or(std::string{});
+                } catch (const std::exception& e) {
+                    subdevFailure = std::format("uhd get_rx_num_channels: {}", e.what());
+                }
+            }
         }
         if (!subdevFailure.empty()) {
             failStartOnOpenDevice(subdevFailure);
@@ -1693,7 +1733,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         {
             std::lock_guard lock(_ctrlMutex);
             try {
-                readTruthInto(*_usrp, _openTruth);
+                readTruthInto(*_usrp, _openTruth, _channels.front());
             } catch (const std::exception& e) {
                 /*| invariant: caught here rather than left to escape, so the device is
                         handed off and the record cleared before the start throws. A block
@@ -1722,14 +1762,14 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         // sits until a request is accepted, and what a refused request forwards.
         _freqRanges.clear();
         try {
-            _appliedFreqHz = _usrp->get_rx_freq(0);
+            _appliedFreqHz = _usrp->get_rx_freq(_channels.front());
         } catch (const std::exception&) {
             _appliedFreqHz = 0.0;
         }
 
         // The set of sensors stays fixed while the device is open. The names are
         // enumerated once, and each tick reads the values alone.
-        _sensorNames = sensorNamesOf(*_usrp, Direction::Receive, "uhd::Source");
+        _sensorNames = sensorNamesOf(*_usrp, Direction::Receive, "uhd::Source", kBriefSensorLimitMs, AlwaysLive{}, _channels.front());
 
         applySampleRate();
         applyAntenna();
@@ -1744,7 +1784,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
 
         try {
             ::uhd::stream_args_t streamArgs("fc32", _wireFormat);
-            streamArgs.channels = {0};
+            streamArgs.channels = _channels;
             _stream             = _usrp->get_rx_stream(streamArgs);
             {
                 std::lock_guard lock(_ctrlMutex);
@@ -1752,10 +1792,8 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                 // The two clocks read beside each other, which carries every device
                 // timestamp into the host's epoch for as long as this stream runs.
                 measureClockOffsetLocked();
+                startStreamLocked();
             }
-            ::uhd::stream_cmd_t cmd(::uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
-            cmd.stream_now = true;
-            _stream->issue_stream_cmd(cmd);
         } catch (const std::exception& e) {
             failStartOnOpenDevice(std::format("uhd rx stream: {}", e.what()));
         }
@@ -1944,9 +1982,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                 }
             });
         }
-        if (newSettings.contains("rx_antennae") && !rx_antennae->empty() && !rx_antennae->front().empty()) {
-            _control.post(kControlAntenna, [this, want = rx_antennae->front()] {
-                std::ignore = applyAntennaOf(want);
+        if (newSettings.contains("rx_antennae") && !rx_antennae->empty()) {
+            _control.post(kControlAntenna, [this, names = rx_antennae.value] {
+                std::ignore = applyAntennasOf(names);
                 publishControlSurface(*this); // a landed write moves the surface's default
             });
         }
@@ -2049,11 +2087,18 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         bool moved = false;
         if (writeNeeded(_freqWrittenHz, *f) || writeNeeded(_loOffsetWrittenHz, _loOffsetHz)) {
             try {
-                const auto result  = _loOffsetHz == 0.0 ? _usrp->set_rx_freq(::uhd::tune_request_t(*f), 0) : _usrp->set_rx_freq(::uhd::tune_request_t(*f, _loOffsetHz), 0);
+                const auto request = _loOffsetHz == 0.0 ? ::uhd::tune_request_t(*f) : ::uhd::tune_request_t(*f, _loOffsetHz);
+                ::uhd::tune_result_t result;
+                for (const std::size_t ch : _channels) {
+                    const auto tuned = _usrp->set_rx_freq(request, ch);
+                    if (ch == _channels.front()) {
+                        result = tuned;
+                    }
+                }
                 _tunedRfHz         = result.actual_rf_freq;
                 _freqWrittenHz     = *f;
                 _loOffsetWrittenHz = _loOffsetHz;
-                _appliedFreqHz     = tunedFrequencyFrom(_usrp->get_rx_freq(0), ppm);
+                _appliedFreqHz     = tunedFrequencyFrom(_usrp->get_rx_freq(_channels.front()), ppm);
                 moved              = true;
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[uhd::Source] set_rx_freq(%.0f) failed: %s (continuing)\n", *f, e.what());
@@ -2105,7 +2150,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     // The shared filter write on this block's device. Called with _ctrlMutex held and a live
     // device.
     void applyBandwidthLocked(double hz) {
-        applyBandwidth(*_usrp, Direction::Receive, hz, _bwWrittenHz, _bwCurHz, "uhd::Source");
+        applyBandwidth(*_usrp, Direction::Receive, hz, _bwWrittenHz, _bwCurHz, "uhd::Source", _channels);
         publishSurfaceLocked();
     }
 
@@ -2180,7 +2225,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             _openTruth.mclkHz    = _usrp->get_master_clock_rate(0);
             _clockInForceHz      = _openTruth.mclkHz;
             _openTruth.rates.clear();
-            for (const auto& r : _usrp->get_rx_rates(0)) {
+            for (const auto& r : _usrp->get_rx_rates(_channels.front())) {
                 _openTruth.rates.emplace_back(r.start(), r.stop());
             }
             publishSurfaceLocked();
@@ -2363,7 +2408,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     // The shared coverage re-read on this block's device. Called with _ctrlMutex held.
     void refreshFreqRanges() {
         if (_usrp != nullptr) {
-            capture::uhd::refreshFreqRanges(*_usrp, Direction::Receive, _freqRanges, "uhd::Source");
+            capture::uhd::refreshFreqRanges(*_usrp, Direction::Receive, _freqRanges, "uhd::Source", _channels.front());
         }
     }
 
@@ -2388,7 +2433,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
 
     // The rate to hand this block's device for a request, from the shared ladder. Called with
     // _ctrlMutex held.
-    double rateToWrite(double requestHz) const { return capture::uhd::rateToWrite(requestHz, _openTruth, _clockInForceHz.value_or(0.0), _wireFormat, Direction::Receive, "uhd::Source"); }
+    double rateToWrite(double requestHz) const { return capture::uhd::rateToWrite(requestHz, _openTruth, _clockInForceHz.value_or(0.0), _wireFormat, Direction::Receive, "uhd::Source", _channels.size()); }
 
     /*| contract: the bounds on a drain of a stopped stream, both durations: the whole drain
             takes at most kDrainLimitS, and one receive waits at most kDrainRecvS for a packet.
@@ -2485,7 +2530,10 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             if (_recvBuf.empty()) {
                 _recvBuf.resize(kDrainSamples);
             }
-            out = drainStopped([this](::uhd::rx_metadata_t& md) { return _stream->recv(_recvBuf.data(), _recvBuf.size(), md, kDrainRecvS); }, [] { return std::chrono::steady_clock::now(); }, kDrainLimitS);
+            if (_recvBuf2.size() < _recvBuf.size()) {
+                _recvBuf2.resize(_recvBuf.size());
+            }
+            out = drainStopped([this](::uhd::rx_metadata_t& md) { return recvInto(_recvBuf.data(), _recvBuf2.data(), _recvBuf.size(), md, kDrainRecvS); }, [] { return std::chrono::steady_clock::now(); }, kDrainLimitS);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Source] draining the transport: %s (continuing)\n", e.what());
             out.end = DrainEnd::Failed;
@@ -2495,16 +2543,58 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
         return out;
     }
 
-    // Ask the device to stream continuously from now. Called with _ctrlMutex held.
+    /*| contract: receive up to nSamples of every streaming channel, the first channel's into
+            first and the second's into second, and answer the samples each received. second
+            is read only where two channels stream.
+    */
+    std::size_t recvInto(std::complex<float>* first, std::complex<float>* second, std::size_t nSamples, ::uhd::rx_metadata_t& md, double timeoutS) {
+        std::array<void*, kMaxChannels> buffs{first, second};
+        return _stream->recv(::uhd::rx_streamer::buffs_type(buffs.data(), std::min(_channels.size(), kMaxChannels)), nSamples, md, timeoutS);
+    }
+
+    /*| contract: the lead from the device time a two-channel start is asked at to the time
+            both channels begin.
+        why: the command has to reach the device before its time comes, and a late one ends
+            the stream with a late-command error rather than starting it.
+    */
+    static constexpr double kAlignedStartLeadS = 0.1;
+
+
+    /*| contract: the device time a two-channel start names: kAlignedStartLeadS past the whole
+            second a pulse latch sets where one is pending, and past the device time now
+            otherwise.
+        frame: before a pending latch the device counts from its own power-up, and the edge
+            moves the clock to the latched second. A start named after that second waits for
+            the edge, and one named on the old count would fall behind it.
+        trap: a time source that names a pulse the device never receives leaves the clock on
+            its own count, and the start never comes. The receives then time out, and work()
+            ends the block on a dead stream.
+        verified-by: controls.uhd-a-two-channel-start-is-timed
+    */
+    static ::uhd::time_spec_t alignedStartTime(std::optional<std::int64_t> latchPendingSec, ::uhd::time_spec_t deviceNow) {
+        return (latchPendingSec.has_value() ? ::uhd::time_spec_t(static_cast<time_t>(*latchPendingSec), 0.0) : deviceNow) + ::uhd::time_spec_t(kAlignedStartLeadS);
+    }
+
+    /*| contract: ask the device to stream continuously. One channel starts at once. Two
+            channels start at the time alignedStartTime names, so the first sample of each
+            carries the same stamp. Called with _ctrlMutex held.
+        why: a start that names no time reaches each channel's chain at a tick of its own, and
+            the two streams then begin on different samples.
+        verified-by: uhd.two-channels-align
+    */
     void startStreamLocked() {
         ::uhd::stream_cmd_t cmd(::uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
-        cmd.stream_now = true;
+        cmd.stream_now = _channels.size() < 2UZ;
+        if (!cmd.stream_now) {
+            const bool latchPending = _clockSetPending.load(std::memory_order_acquire) && timeSourceHasPps(_usrp->get_time_source(0));
+            cmd.time_spec           = alignedStartTime(latchPending ? std::optional<std::int64_t>(_clockTargetSec.load(std::memory_order_relaxed)) : std::nullopt, _usrp->get_time_now(0));
+        }
         _stream->issue_stream_cmd(cmd);
     }
 
     // The rate applier's body, with _ctrlMutex already held and the device live.
     void applyRateLocked() {
-        applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Receive, hz, "uhd::Source"); });
+        applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Receive, hz, "uhd::Source", _channels); });
     }
 
     /*| contract: the rate applier with the device's rate write passed in as write, which answers
@@ -2613,7 +2703,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             return;
         }
         try {
-            _usrp->set_rx_gain(want, 0); // overall gain, UHD distributes
+            for (const std::size_t ch : _channels) {
+                _usrp->set_rx_gain(want, ch); // overall gain, UHD distributes
+            }
             _gainWrittenDb = want;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Source] set_rx_gain(%.1f) failed: %s (continuing)\n", want, e.what());
@@ -2644,11 +2736,15 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                 continue;
             }
             try {
+                for (const std::size_t ch : _channels) {
+                    if (element.empty()) {
+                        _usrp->set_rx_gain(dB, ch);
+                    } else {
+                        _usrp->set_rx_gain(dB, element, ch);
+                    }
+                }
                 if (element.empty()) {
-                    _usrp->set_rx_gain(dB, 0);
                     _gainWrittenDb = dB;
-                } else {
-                    _usrp->set_rx_gain(dB, element, 0);
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[uhd::Source] set_rx_gain(%s, %.1f) failed: %s (continuing)\n", element.c_str(), dB, e.what());
@@ -2692,7 +2788,9 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             return;
         }
         try {
-            _usrp->set_rx_agc(on, 0);
+            for (const std::size_t ch : _channels) {
+                _usrp->set_rx_agc(on, ch);
+            }
             _agcOn      = on;
             _agcWritten = on;
             if (on) {
@@ -2710,44 +2808,74 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     }
 
     void applyAntenna() {
-        if (!rx_antennae->empty() && !rx_antennae->front().empty()) {
-            std::ignore = applyAntennaOf(rx_antennae->front());
+        if (!rx_antennae->empty()) {
+            std::ignore = applyAntennasOf(rx_antennae.value);
         }
     }
 
-    /*| contract: the antenna applier, from the name the settings drain copied out. A name
-            outside the list the unit states is refused before any device call, in the words
-            antennaRefusal gives. A connector the device takes becomes the one in force on the
+    /*| contract: the connector each of channelCount streaming channels takes from names: the
+            name at the channel's place in the channels setting, and the first name for a place
+            the names do not reach. An empty name leaves that channel's connector unwritten.
+        verified-by: controls.uhd-each-channel-takes-its-own-antenna
+    */
+    static std::vector<std::string> antennaPerChannel(std::span<const std::string> names, std::size_t channelCount) {
+        std::vector<std::string> out;
+        for (std::size_t i = 0UZ; i < channelCount; ++i) {
+            out.push_back(i < names.size() ? names[i] : (names.empty() ? std::string{} : names.front()));
+        }
+        return out;
+    }
+
+    // The antenna applier for one name, which every streaming channel takes.
+    bool applyAntennaOf(const std::string& want) { return applyAntennasOf(std::vector<std::string>{want}); }
+
+    /*| contract: the antenna applier, from the names the settings drain copied out, placed on
+            the streaming channels by antennaPerChannel. A name outside the list the unit states
+            is refused before any device call, in the words antennaRefusal gives. The first
+            channel's connector, once the device takes it, becomes the one in force on the
             surface; the caller sends the moved surface to the controls subscribers once this
             returns.
-        contract: false where the name is refused, by the list or by the device, and true
-            otherwise: the name written, the name already in force, or a block holding no
+        contract: false where a name is refused, by the list or by the device, and true
+            otherwise: the names written, the names already in force, or a block holding no
             device, which writes nothing. The answer follows setControl's, true for a write
             the block carries out.
         contract: a refused name stays in rx_antennae, and the device and the surface keep the
-            connector they held.
+            connectors they held.
         verified-by: controls.uhd-refuses-an-antenna-the-unit-does-not-offer
         verified-by: uhd.antenna, for the surface's default following a landed write
+        verified-by: uhd.two-channels-follow-their-antennas
     */
-    bool applyAntennaOf(const std::string& want) {
+    bool applyAntennasOf(const std::vector<std::string>& names) {
         std::lock_guard lock(_ctrlMutex);
-        if (const auto refusal = antennaRefusal(_openTruth.antennas, want); refusal.has_value()) {
-            std::fprintf(stderr, "%s\n", refusal->c_str());
-            return false;
+        const auto      wants = antennaPerChannel(names, _channels.size());
+        for (const std::string& want : wants) {
+            if (want.empty()) {
+                continue;
+            }
+            if (const auto refusal = antennaRefusal(_openTruth.antennas, want); refusal.has_value()) {
+                std::fprintf(stderr, "%s\n", refusal->c_str());
+                return false;
+            }
         }
         if (_usrp == nullptr) {
             return true; // teardown resets the handle under this mutex
         }
-        if (!writeNeeded(_antennaWritten, want)) {
+        if (!writeNeeded(_antennaWritten, wants)) {
             return true;
         }
         try {
-            _usrp->set_rx_antenna(want, 0);
-            _antennaWritten    = want;
-            _openTruth.antenna = want;
+            for (std::size_t i = 0UZ; i < wants.size(); ++i) {
+                if (!wants[i].empty()) {
+                    _usrp->set_rx_antenna(wants[i], _channels[i]);
+                }
+            }
+            _antennaWritten = wants;
+            if (!wants.front().empty()) {
+                _openTruth.antenna = wants.front();
+            }
             publishSurfaceLocked();
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "[uhd::Source] set_rx_antenna(%s): %s (continuing)\n", want.c_str(), e.what());
+            std::fprintf(stderr, "[uhd::Source] set_rx_antenna(%s): %s (continuing)\n", names.front().c_str(), e.what());
             return false;
         }
         return true;
@@ -2786,24 +2914,42 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             needs it. The edge takes the samples when the span is released, and the caller
             moves the graph's progress counter after that.
     */
-    template <typename Reservation, typename FirstNs>
-    void publishReceived(Reservation& span, std::size_t nSamples, FirstNs&& firstNs, std::span<const std::pair<std::size_t, double>> tags) {
+    template <typename Reservation, typename Second, typename FirstNs>
+    void publishReceived(Reservation& span, Second& second, std::size_t nSamples, FirstNs&& firstNs, std::span<const std::pair<std::size_t, double>> tags) {
         publishBlockHeadTags(*this, firstNs);
         std::size_t at = 0UZ;
         for (const auto& [offset, hz] : tags) {
             at          = std::max(at, offset);
             auto tagMap = out.makeTagMap();
             gr::tag::put(tagMap, "frequency", hz);
-            out.publishTag(std::move(tagMap), at);
-            noteDroppedTags(*this);
+            publishOutputTag(*this, std::move(tagMap), at);
+        }
+        if (_secondPublished) {
+            second.publish(nSamples);
         }
         span.publish(nSamples);
+    }
+
+    /*| contract: publish on out2 each tag the shared helpers publish on out, at the same
+            offset, while a second channel streams to a reader there. Both writers advance by
+            the same count on every receive, so the offset names the same sample on each.
+    */
+    template <typename TagMap>
+    void publishFurtherOutputTag(const TagMap& tagMap, std::size_t offset) {
+        if (_secondPublished) {
+            out2.publishTag(TagMap(tagMap), offset);
+        }
     }
 
     void consumerLoop() {
         const std::size_t frame = _stream->get_max_num_samps();
         _recvBuf.resize(std::max(kDrainSamples, frame));
+        _recvBuf2.resize(_channels.size() > 1UZ ? _recvBuf.size() : 0UZ);
+        _secondPublished            = _channels.size() > 1UZ && out2.isConnected();
         auto&             writer    = out.streamWriter();
+        auto&             writer2   = out2.streamWriter();
+        // Both writers take every receive, so the room is the smaller of the two.
+        const auto        roomNow   = [&] { return _secondPublished ? std::min(writer.available(), writer2.available()) : writer.available(); };
         const auto        keepGoing = [this] { return gr::lifecycle::isActive(this->state()) && !_consumer.stopRequested(); };
         std::uint64_t    gapsSeen            = 0;
         int              consecutiveTimeouts = 0;
@@ -2845,18 +2991,19 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                     drained.
             */
             const bool        publishing = keepGoing();
-            const std::size_t room       = publishing ? writer.available() : _recvBuf.size();
+            const std::size_t room       = publishing ? roomNow() : _recvBuf.size();
             const std::size_t edge       = publishing ? writer.buffer().size() : 2UZ * room;
             const std::size_t request    = recvRequest(room, edge, frame, static_cast<double>(sample_rate.value));
             if (request == 0UZ) {
                 const std::size_t seen = this->progress->value();
-                if (!publishing || writer.available() < frame) {
+                if (!publishing || roomNow() < frame) {
                     awaitProgress(*this, seen, edge);
                 }
                 continue;
             }
-            auto span = writer.template tryReserve<gr::SpanReleasePolicy::ProcessNone>(publishing ? request : 0UZ);
-            if (publishing && span.empty()) {
+            auto span  = writer.template tryReserve<gr::SpanReleasePolicy::ProcessNone>(publishing ? request : 0UZ);
+            auto span2 = writer2.template tryReserve<gr::SpanReleasePolicy::ProcessNone>(publishing && _secondPublished ? request : 0UZ);
+            if (publishing && (span.empty() || (_secondPublished && span2.empty()))) {
                 awaitProgress(*this, this->progress->value(), edge);
                 continue;
             }
@@ -2864,7 +3011,10 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
             ::uhd::rx_metadata_t md;
             std::size_t        nSamples = 0;
             try {
-                nSamples = _stream->recv(publishing ? span.data() : _recvBuf.data(), request, md, kRecvTimeoutS);
+                if (_channels.size() > 1UZ && !_secondPublished && _recvBuf2.size() < request) {
+                    _recvBuf2.resize(request); // the second channel's samples, with no reader on out2
+                }
+                nSamples = recvInto(publishing ? span.data() : _recvBuf.data(), publishing && _secondPublished ? span2.data() : _recvBuf2.data(), request, md, kRecvTimeoutS);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[uhd::Source] recv: %s\n", e.what());
                 _streamDead.store(true, std::memory_order_release);
@@ -3011,7 +3161,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
                     }
                     return blockTagNs(stampNs, wallClockNs, nSamples, rateHz);
                 };
-                publishReceived(span, nSamples, firstNs, frequencyTags);
+                publishReceived(span, span2, nSamples, firstNs, frequencyTags);
                 published = true;
             }
         }
