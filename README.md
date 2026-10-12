@@ -16,9 +16,9 @@ their registration header, their cases and their `CMakeLists.txt`. `common/`
 holds the headers the blocks build on, the discovery library's source, the
 case support and `cmake/capture.cmake`, the build logic `uhd/CMakeLists.txt`
 calls. `extract/uhd.imported` lists every file the copy placed; a change to
-one of them is made in libcapture. This copy is of libcapture's master branch
-as of 2026-09-30, at "Bound the USRP sweep arms' delivery gaps by the gap
-watch's threshold", its last change to these files.
+one of them is made in libcapture. This copy is of libcapture as of
+2026-10-12, at "Show how far a USRP GPSDO's warm-up has got, and check its time
+latch", its last change to these files.
 
 ## Building
 

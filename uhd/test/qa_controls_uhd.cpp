@@ -62,6 +62,7 @@ namespace {
 */
 struct TruthStandIn {
     std::set<std::string> refuse; // the reads that throw, by the names below
+    std::string           spec;   // the subdevice spec both directions answer, none where empty
 
     void check(const std::string& what) const {
         if (refuse.contains(what)) {
@@ -100,6 +101,12 @@ struct TruthStandIn {
     ::uhd::dict<std::string, std::string> get_usrp_rx_info(std::size_t) const { return info(); }
     ::uhd::dict<std::string, std::string> get_usrp_tx_info(std::size_t) const { return info(); }
     std::string                           get_mboard_name(std::size_t) const { return "N210r4"; }
+    ::uhd::usrp::subdev_spec_t            subdevSpec() const {
+        check("subdev_spec");
+        return ::uhd::usrp::subdev_spec_t(spec);
+    }
+    ::uhd::usrp::subdev_spec_t            get_rx_subdev_spec(std::size_t) const { return subdevSpec(); }
+    ::uhd::usrp::subdev_spec_t            get_tx_subdev_spec(std::size_t) const { return subdevSpec(); }
     ::uhd::device::sptr                   get_device() const { throw std::runtime_error("no property tree"); }
     std::vector<std::string>              get_rx_gain_names(std::size_t) const { return gainNames(); }
     std::vector<std::string>              get_tx_gain_names(std::size_t) const { return gainNames(); }
@@ -891,6 +898,9 @@ int main(int argc, char** argv) {
 
             const auto noClock = read({"clock_source"}, dir);
             expect(noClock.clockSources.size() == 3UZ && noClock.timeSources.size() == 2UZ) << "a refused clock-source read keeps both lists";
+
+            const auto noSpec = read({"subdev_spec"}, dir);
+            expect(noSpec.subdev.empty() && noSpec.product == "N210r4" && noSpec.antennas.size() == 2UZ) << "a refused subdevice spec keeps the rest";
 
             const auto noPorts = read({"antennas"}, dir);
             expect(noPorts.antennas.empty() && noPorts.antenna == "TX/RX") << "a refused connector list keeps the connector in force";
@@ -1826,6 +1836,90 @@ int main(int argc, char** argv) {
         bare.product = "USRP";
         expect(bare.describe() == std::string("USRP, link rate unknown")) << "the identifier stands in for a missing name, and a link UHD states nothing for is unknown";
         expect(capture::uhd::DeviceTruth{}.describe().empty()) << "a record of nothing describes nothing";
+
+        // The frontend of the channel read, with the spec that chose it, after the versions.
+        capture::uhd::DeviceTruth b210 = b205;
+        b210.model    = "B210";
+        b210.frontend = "FE-RX1";
+        b210.subdev   = "A:B";
+        expect(b210.describe() == std::string("B210 30D3AB9, frontend FE-RX1 at A:B, link 500 MB/s as UHD states it")) << "the frontend and its subdevice spec";
+        b210.subdev.clear();
+        expect(b210.describe() == std::string("B210 30D3AB9, frontend FE-RX1, link 500 MB/s as UHD states it")) << "a frontend whose spec the device does not state";
+        b210.frontend.clear();
+        b210.subdev = "A:0";
+        expect(b210.describe() == std::string("B210 30D3AB9, frontend A:0, link 500 MB/s as UHD states it")) << "a spec whose frontend the device does not name";
+    });
+
+    cases("controls.uhd-parses-the-gps-servo-record", [] {
+        // The records a B210's GPSDO gave: disciplined, just booted, and beginning to track.
+        const auto locked = capture::uhd::gpsServoFrom("26-10-12 636 56399 -223.18 -3.35E-10 12 8 6 0x0");
+        expect(locked.has_value()) << "a disciplined record parses";
+        if (locked.has_value()) {
+            expect(locked->trackingS == 636 && locked->state == 6 && locked->health == 0U) << "its tracking seconds, state and health";
+            expect(std::abs(locked->phaseNs - -223.18) < 1e-9) << "and its phase in ns";
+            const auto rows = capture::uhd::gpsServoReadings(*locked);
+            expect(rows.size() == 3UZ && rows[0].id == "gps_servo_state" && rows[0].value == "6, health 0x0" && rows[0].good) << "the state row is good at health zero";
+            expect(rows[1].id == "gps_phase_offset" && rows[1].value == "-223.18 ns") << "the phase row is in ns";
+            expect(rows[2].id == "gps_servo_tracking" && rows[2].value == "636 s") << "the tracking row is in seconds";
+            expect(std::ranges::none_of(rows, [](const capture::SensorReading& r) { return r.brief; })) << "and none is brief";
+        }
+        const auto booted = capture::uhd::gpsServoFrom("06-01-01 0 56367 0.00 1.00E-08 0 0 0 0x28");
+        expect(booted.has_value() && booted->trackingS == 0 && booted->state == 0 && booted->health == 0x28U) << "a record from just after a boot";
+        if (booted.has_value()) {
+            expect(!capture::uhd::gpsServoReadings(*booted)[0].good) << "whose state row is not good";
+        }
+        const auto tracking = capture::uhd::gpsServoFrom("  26-10-12  16 58987 -14.20 -3.00E-10 9 6 2 0x8 ");
+        expect(tracking.has_value() && tracking->state == 2 && tracking->health == 0x8U && tracking->trackingS == 16) << "spaces around the fields are no field";
+
+        expect(!capture::uhd::gpsServoFrom("").has_value()) << "an empty record";
+        expect(!capture::uhd::gpsServoFrom("26-10-12 636 56399 -223.18 -3.35E-10 12 8 6").has_value()) << "eight fields";
+        expect(!capture::uhd::gpsServoFrom("26/10/12 636 56399 -223.18 -3.35E-10 12 8 6 0x0").has_value()) << "a first field that is no date";
+        expect(!capture::uhd::gpsServoFrom("26-10-12 6x6 56399 -223.18 -3.35E-10 12 8 6 0x0").has_value()) << "tracking seconds that do not parse whole";
+        expect(!capture::uhd::gpsServoFrom("26-10-12 636 56399 -223.1ns -3.35E-10 12 8 6 0x0").has_value()) << "a phase that does not parse whole";
+        expect(!capture::uhd::gpsServoFrom("26-10-12 636 56399 -223.18 -3.35E-10 12 8 six 0x0").has_value()) << "a state that is no integer";
+        expect(!capture::uhd::gpsServoFrom("26-10-12 636 56399 -223.18 -3.35E-10 12 8 6 0xzz").has_value()) << "a health word that is no hexadecimal";
+    });
+
+    cases("controls.uhd-a-subdevice-spec-is-written-before-the-surface", [] {
+        using capture::uhd::Direction;
+        /*| frame: a stand-in that records the specs written to each direction and refuses a
+                spec naming a frontend it lacks, as a B2xx refuses "A:C". */
+        struct SpecStandIn {
+            std::vector<std::string> rx;
+            std::vector<std::string> tx;
+            static void refuse(const ::uhd::usrp::subdev_spec_t& spec) {
+                for (const auto& pair : spec) {
+                    if (pair.db_name != "A" || (pair.sd_name != "A" && pair.sd_name != "B")) {
+                        throw ::uhd::value_error("no frontend " + pair.db_name + ":" + pair.sd_name);
+                    }
+                }
+            }
+            void set_rx_subdev_spec(const ::uhd::usrp::subdev_spec_t& spec, std::size_t) {
+                refuse(spec);
+                rx.push_back(spec.to_string());
+            }
+            void set_tx_subdev_spec(const ::uhd::usrp::subdev_spec_t& spec, std::size_t) {
+                refuse(spec);
+                tx.push_back(spec.to_string());
+            }
+        };
+        SpecStandIn device;
+        expect(capture::uhd::applySubdevSpec(device, Direction::Receive, "").empty()) << "an empty spec is no failure";
+        expect(device.rx.empty() && device.tx.empty()) << "and writes nothing";
+        expect(capture::uhd::applySubdevSpec(device, Direction::Receive, "A:B").empty()) << "a spec the device takes is no failure";
+        expect(device.rx == std::vector<std::string>{"A:B"} && device.tx.empty()) << "and reaches the receive direction alone";
+        expect(capture::uhd::applySubdevSpec(device, Direction::Transmit, "A:A").empty());
+        expect(device.tx == std::vector<std::string>{"A:A"} && device.rx.size() == 1UZ) << "and a transmit spec the transmit direction alone";
+        const std::string refused = capture::uhd::applySubdevSpec(device, Direction::Transmit, "A:C");
+        expect(refused.starts_with("uhd set_tx_subdev_spec(A:C): ") && refused.find("no frontend A:C") != std::string::npos) << refused;
+        expect(device.tx.size() == 1UZ) << "a refused spec is not recorded as written";
+
+        // The spec read back is channel 0's pair, which the surface and the description carry.
+        TruthStandIn b210;
+        b210.spec = "A:B A:A";
+        capture::uhd::DeviceTruth truth;
+        capture::uhd::readTruthInto(b210, truth, Direction::Receive);
+        expect(truth.subdev == "A:B") << "channel 0 of a two-channel spec";
     });
 
     cases("controls.uhd-skips-an-unchanged-write", [] {

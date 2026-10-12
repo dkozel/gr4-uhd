@@ -10,7 +10,7 @@ interface, its property tree and its metadata error codes. The two are peers.
 describes the device rather than one direction, each taking a `Direction` where the two
 halves differ: the truth record and the one reader that fills it, the probe that opens a unit
 to run that reader, the device listing and the device-string test, the address-key writer,
-the reference and timing writes, the unchanged-write test, the wire-format list, the
+the reference and timing writes, the subdevice-spec write, the unchanged-write test, the wire-format list, the
 read-back carrier and the tune test, the master-clock read taken as two calls, the clock a
 device fixed at the open, the rate ladder and the link-rate readers, the test whether a rate
 write settled the rate and whether the filter follows it, the gain-element and filter
@@ -52,6 +52,13 @@ leaves the setting holding the refused name; a unit that states no list has the 
 firmware and FPGA version pair is guarded alone, so a model that refuses one still states the
 rest: the range of the master clock and the clock in force, a filter range and the width in
 force, a list of sources and the source in force, and each gain element apart from the others.
+Both records state the subdevice spec of channel 0, as "A:B", and the name UHD gives that
+frontend, and the line naming the unit names both. Either block's `subdev` setting is written
+by the start after the reference and timing writes and before the surface is read and the
+streamer is built, so every control call and the streamer reach the frontend it names; an
+empty setting leaves the device's own spec, and a spec the device refuses fails the start.
+On a B210, which opens on "A:A A:B", "A:A" is the frontend UHD names "FE-RX2" on receive and
+"FE-TX2" on transmit, and "A:B" is "FE-RX1" and "FE-TX1".
 Both records state the link rate UHD gives, one link carrying both directions; the
 receive record carries three fields more, the three optional frontend corrections, which the
 receive frontend alone states. The link rate is the double UHD keeps at
@@ -176,6 +183,15 @@ reading then states the frame alone.
   5 ms, and the sink at its first sweep, outside its control mutex and beside a streaming
   drain, keeping a read of up to 50 ms. A transmit start costs the reference wait where one
   applies and nothing for the sensors.
+- A GPSDO that publishes a `gps_servo` record has three readings parsed from it beside the
+  record in a whole sweep: `gps_servo_state`, the servo state with the health word, good where
+  the health word is zero; `gps_phase_offset` in ns; and `gps_servo_tracking` in seconds. A
+  record that is not nine fields led by a date adds none. `gps_locked` reads true within
+  seconds of the oscillator's boot, so these say whether its warm-up is over: the B210's
+  LC_XO reads state 0 and health 0x28 for tens of seconds after a boot, state 2 and 0x8 as it
+  begins tracking, and state 6 and 0x0 once disciplined. With `time_source` `gpsdo` and a
+  disciplined servo, the device-time set latches the GPS second on the next pulse, and
+  `get_time_last_pps` reads the second `gps_time` names after each of three consecutive edges.
 - UHD looks for an N-series GPSDO at the open only while the unit's firmware does not hold its
   do-not-look mark, and UHD writes that mark itself after an open that found no GPSDO or could
   not identify the unit. The mark stays until the unit is power-cycled, and every open until

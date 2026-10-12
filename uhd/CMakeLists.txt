@@ -49,7 +49,9 @@ if(CAPTURE_UHD_FOUND)
           controls.uhd-offers-only-the-controls-the-device-has controls.uhd-master-clock-ladder
           controls.uhd-a-clock-span-takes-any-clock-in-it
           controls.uhd-transport-sizing controls.uhd-device-time-from-the-pps
-          controls.uhd-describes-the-unit controls.uhd-holds-the-tick-grid-across-a-clock-set
+          controls.uhd-describes-the-unit controls.uhd-a-subdevice-spec-is-written-before-the-surface
+          controls.uhd-parses-the-gps-servo-record
+          controls.uhd-holds-the-tick-grid-across-a-clock-set
           controls.uhd-reference-selection-comes-from-the-device-list
           controls.uhd-states-when-each-control-applies
           controls.uhd-reports-a-rate-the-host-cannot-carry controls.uhd-a-pinned-clock-is-a-fixed-clock
@@ -185,16 +187,16 @@ option(CAPTURE_HW_UHD "Build the USRP cases that open a radio" OFF)
 if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
   set(CAPTURE_HW_UHD_CASES
       uhd.open-stream-close uhd.rate-ladder uhd.tuning-and-range uhd.frequency-correction-sign
-      uhd.gain uhd.hardware-information uhd.agc uhd.antenna uhd.analog-bandwidth uhd.sensors
+      uhd.gain uhd.hardware-information uhd.agc uhd.antenna uhd.receive-side uhd.analog-bandwidth uhd.sensors
       uhd.sensor-sweep-beside-a-stream
       uhd.overflow-under-a-stalled-consumer uhd.teardown-and-restart uhd.corrections
       uhd.correction-defaults uhd.device-string-keys uhd.clock-and-time-source
-      uhd.reference-lock-wait uhd.lo-offset uhd.device-time uhd.device-time-source
+      uhd.reference-lock-wait uhd.lo-offset uhd.device-time uhd.device-time-source uhd.device-time-from-gps
       uhd.device-time-set-midstream uhd.tag-time-after-a-stall uhd.property-tree-link-rate
       uhd.rate-change-midstream uhd.a-drain-at-the-top-rate-ends-by-duration uhd.accessors-after-a-stop uhd.stop-latency
       uhd.coverage-past-the-stated-range uhd.vendor-agc-claim
       uhd.wire-format uhd.transport-sizing uhd.master-clock uhd.tx-burst uhd.tx-loopback
-      uhd.tx-underrun uhd.tx-tagged-bursts)
+      uhd.tx-underrun uhd.tx-tagged-bursts uhd.transmit-side)
   capture_test(
     hw_uhd
     DIR test
@@ -203,6 +205,9 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
     INCLUDES ${CAPTURE_UHD_INCLUDE})
   # Each of these runs a radio for seconds at a time, and the rate ladder restarts the
   # graph once per rate, so the ceiling is far above the arithmetic cases'.
-  set_tests_properties(${CAPTURE_HW_UHD_CASES} PROPERTIES TIMEOUT 180 LABELS hardware)
+  # A case whose precondition the bench does not meet exits 77, a skip and never a pass.
+  set_tests_properties(${CAPTURE_HW_UHD_CASES} PROPERTIES TIMEOUT 180 LABELS hardware SKIP_RETURN_CODE 77)
+  # The GPS case first waits up to 900 s for the GPSDO's warm-up, which restarts at every boot.
+  set_tests_properties(uhd.device-time-from-gps PROPERTIES TIMEOUT 1080)
   message(STATUS "capture: the USRP hardware cases are ENABLED (label hardware)")
 endif()

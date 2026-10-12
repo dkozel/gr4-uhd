@@ -260,6 +260,18 @@ struct [[maybe_unused]] hw_sink : gr::Block<hw_sink> {
 
 // ---- the rig -------------------------------------------------------------------------
 
+/*| contract: set by a case whose precondition the bench did not meet, after it has printed
+        why. The binary then exits with 77, which ctest reports as a skip, and a case that
+        failed an expectation exits 1 as before.
+    why: a case that returns early on an unmet precondition would otherwise read as a pass.
+*/
+std::atomic<bool> g_skipped{false};
+
+void skipCase(const std::string& why) {
+    std::printf("skipped: %s\n", why.c_str());
+    g_skipped.store(true);
+}
+
 const std::string& deviceArgs() {
     static const std::string args = [] {
         const char* v = std::getenv("CAPTURE_HW_UHD_ARGS");
@@ -280,6 +292,51 @@ const std::string& benchAntenna() {
         return v != nullptr ? std::string(v) : std::string();
     }();
     return port;
+}
+
+/*| contract: the receive subdevice spec whose default connector carries an antenna on this
+        bench, or empty where none is named. CAPTURE_HW_UHD_ANTENNA_SUBDEV names it, "A:B" for
+        frontend B in slot A.
+    why: no device call says which side of a radio with two frontends has an antenna on it.
+        Unnamed, the comparison between the sides is printed and not asserted.
+*/
+const std::string& benchAntennaSubdev() {
+    static const std::string spec = [] {
+        const char* v = std::getenv("CAPTURE_HW_UHD_ANTENNA_SUBDEV");
+        return v != nullptr ? std::string(v) : std::string();
+    }();
+    return spec;
+}
+
+// One frontend of one direction: its subdevice spec, "A:B", and the name UHD gives it.
+struct Frontend {
+    std::string spec;
+    std::string name;
+};
+
+/*| contract: every frontend of one direction the radio's property tree lists, each with its
+        spec and its name, read through a direct open while nothing holds the radio.
+*/
+std::vector<Frontend> frontendsOf(capture::uhd::Direction dir) {
+    std::vector<Frontend> out;
+    try {
+        auto              usrp = uhd::usrp::multi_usrp::make(uhd::device_addr_t(deviceArgs()));
+        auto              tree = usrp->get_device()->get_tree();
+        const std::string leaf = dir == capture::uhd::Direction::Receive ? "rx_frontends" : "tx_frontends";
+        for (const std::string& slot : tree->list("/mboards/0/dboards")) {
+            const std::string root = std::format("/mboards/0/dboards/{}/{}", slot, leaf);
+            if (!tree->exists(root)) {
+                continue;
+            }
+            for (const std::string& fe : tree->list(root)) {
+                const std::string namePath = std::format("{}/{}/name", root, fe);
+                out.push_back({.spec = slot + ":" + fe, .name = tree->exists(namePath) ? tree->access<std::string>(namePath).get() : std::string{}});
+            }
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "the frontends did not list: %s\n", e.what());
+    }
+    return out;
 }
 
 // The port a case receives on: the bench's antenna where it named one, and the device's own
@@ -464,7 +521,10 @@ bool withGraph(gr::property_map settings, Body&& body) {
         std::fprintf(stderr, "the graph did not build: %s\n", adopted.error().message.c_str());
         return false;
     }
-    scheduled.start();
+    if (const auto started = scheduled.start(); !started.has_value()) {
+        std::fprintf(stderr, "the scheduler did not start: %s\n", started.error().message.c_str());
+        return false;
+    }
     body(src, scheduled);
     scheduled.stop();
     /*| trap: a consumer never sees the end-of-stream marker through its input span. The
@@ -620,7 +680,10 @@ bool withTxGraph(gr::property_map settings, Body&& body) {
         std::fprintf(stderr, "the transmit graph did not build: %s\n", adopted.error().message.c_str());
         return false;
     }
-    scheduled.start();
+    if (const auto started = scheduled.start(); !started.has_value()) {
+        std::fprintf(stderr, "the transmit scheduler did not start: %s\n", started.error().message.c_str());
+        return false;
+    }
     body(sink, scheduled);
     scheduled.stop();
     return true;
@@ -1181,6 +1244,85 @@ int main(int argc, char** argv) {
         }
     });
 
+    cases("uhd.receive-side", [] {
+        /*| frame: every receive frontend the property tree lists, each opened in turn as
+                channel 0 through the subdev setting, at one frequency and one gain. Which
+                side has an antenna is a fact about the bench, so the levels are compared only
+                where CAPTURE_HW_UHD_ANTENNA_SUBDEV names a side.
+            frame: 103 MHz at 4 MS/s spans 101 to 105 MHz, inside the FM broadcast band and
+                clear of the multiples of 10 MHz a reference clock puts on a connector.
+        */
+        const auto sides = frontendsOf(capture::uhd::Direction::Receive);
+        for (const auto& side : sides) {
+            std::printf("receive side: the radio lists %s, \"%s\"\n", side.spec.c_str(), side.name.c_str());
+        }
+        expect(!sides.empty()) << "the radio lists a receive frontend";
+        if (sides.size() < 2UZ) {
+            std::printf("receive side: one receive frontend, so there is no side to choose\n");
+            return;
+        }
+        constexpr double kRate = 4.0e6;
+        const double     freq  = insideOrElse(103.0e6);
+        const auto&      truth = benchTruth();
+        const double     gain  = truth.gainMinDb + 0.6 * (truth.gainMaxDb - truth.gainMinDb);
+        struct Seen {
+            bool        streamed = false;
+            std::string name;      // get_rx_subdev_name(0) on the block's own handle
+            std::string frontend;  // the block's record of the device it opened
+            std::string subdev;
+            std::string described; // the device_model reading
+            double      dbfs = -300.0;
+        };
+        std::vector<Seen> seen;
+        for (const auto& side : sides) {
+            gr::property_map settings = sourceSettings(kRate, freq, gain, sourcePort());
+            settings.insert_or_assign("subdev", side.spec);
+            Seen       s;
+            const bool ran = withGraph(std::move(settings), [&](capture::uhd::Source& src, auto&) {
+                s.streamed = waitForSamples(std::chrono::milliseconds(6000));
+                settle(1500); // the DC offset loop settles, as in uhd.agc
+                s.name           = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_subdev_name(0); });
+                const auto block = src.deviceTruth();
+                s.frontend       = block.frontend;
+                s.subdev         = block.subdev;
+                s.dbfs           = dbfsOver(1.0);
+                std::vector<capture::SensorReading> readings;
+                if (src.readSensors(readings)) {
+                    const auto it = std::ranges::find_if(readings, [](const auto& r) { return r.id == "device_model"; });
+                    s.described   = it == readings.end() ? std::string{} : it->value;
+                }
+            });
+            expect(ran) << "the graph ran on " << side.spec;
+            std::printf("receive side: subdev %s reads \"%s\", the block states \"%s\" at %s, %.2f dBFS at %.1f MHz and %.1f dB; device_model \"%s\"\n", side.spec.c_str(), s.name.c_str(),
+                        s.frontend.c_str(), s.subdev.c_str(), s.dbfs, freq / 1e6, gain, s.described.c_str());
+            seen.push_back(std::move(s));
+        }
+
+        for (std::size_t i = 0; i < sides.size(); ++i) {
+            expect(seen[i].streamed) << "the stream starts on " << sides[i].spec;
+            expect(seen[i].name == sides[i].name) << "channel 0 reads the frontend the setting chose";
+            expect(seen[i].frontend == sides[i].name && seen[i].subdev == sides[i].spec) << "and the block's record states it and its spec";
+            expect(seen[i].described.find(std::format("frontend {} at {}", sides[i].name, sides[i].spec)) != std::string::npos) << "and the device_model reading names both";
+        }
+        expect(sides[0].name != sides[1].name && seen[0].name != seen[1].name) << "the two sides are two frontends";
+
+        if (benchAntennaSubdev().empty()) {
+            std::printf("receive side: no side is named as carrying an antenna (CAPTURE_HW_UHD_ANTENNA_SUBDEV), so the levels are printed and not compared\n");
+            return;
+        }
+        const auto wired = std::ranges::find(sides, benchAntennaSubdev(), &Frontend::spec);
+        expect(wired != sides.end()) << "the bench names a side this radio lists";
+        if (wired == sides.end()) {
+            return;
+        }
+        const std::size_t at = static_cast<std::size_t>(std::distance(sides.begin(), wired));
+        for (std::size_t i = 0; i < sides.size(); ++i) {
+            if (i != at) {
+                expect(seen[at].dbfs > seen[i].dbfs) << "the side with the antenna hears the band louder than " << sides[i].spec;
+            }
+        }
+    });
+
     cases("uhd.analog-bandwidth", [] {
         /*| frame: a frontend states its filter as a range. A range with room in it is a
                 filter the block programs from the rate; a range whose ends are equal is a
@@ -1384,6 +1526,18 @@ int main(int argc, char** argv) {
         const auto lo = find("lo_locked");
         if (lo != readings.end()) {
             expect(lo->good) << "the tuner is locked while it streams";
+        }
+        /*| frame: a GPSDO's servo record, where the radio has one, parsed into the three
+                readings beside it. */
+        if (const auto record = find("gps_servo"); record != readings.end()) {
+            const auto servo = capture::uhd::gpsServoFrom(record->value);
+            expect(servo.has_value()) << "the servo record parses";
+            if (servo.has_value()) {
+                std::printf("sensors: the GPSDO's servo is in state %d, health 0x%x, %lld s tracking, phase %.2f ns\n", servo->state, servo->health, static_cast<long long>(servo->trackingS), servo->phaseNs);
+                expect(find("gps_servo_state") != readings.end() && find("gps_servo_state")->value == std::format("{}, health 0x{:x}", servo->state, servo->health)) << "its state is a reading";
+                expect(find("gps_phase_offset") != readings.end() && find("gps_phase_offset")->value == std::format("{:.2f} ns", servo->phaseNs)) << "and its phase offset, in ns";
+                expect(find("gps_servo_tracking") != readings.end()) << "and its tracking time";
+            }
         }
         expect(find("time_last_pps") != readings.end() && !find("time_last_pps")->brief) << "the PPS time is a wide reading";
 
@@ -1784,7 +1938,7 @@ int main(int argc, char** argv) {
         expect(flow.connect<"out", "in">(src, sink).has_value()) << "the source wires to the sink";
         Scheduled scheduled;
         expect(scheduled.adopt(std::move(flow)).has_value()) << "the graph builds";
-        scheduled.start();
+        expect(scheduled.start().has_value()) << "the scheduler starts";
         settle(200);
         scheduled.stop();
         const bool        releasedAfterEarlyStop = deviceOpens();
@@ -2515,6 +2669,56 @@ int main(int argc, char** argv) {
         expect(deviceOpens()) << "and the device is released when the graph stops";
     });
 
+    cases("uhd.transmit-side", [] {
+        /*| invariant: this case writes one transmit spec, the one channel 0 has when the radio
+                opens, which is the frontend every other transmit case reaches. A spec naming
+                any other frontend is never written here: on a bench with two sides, only one
+                side's connector is terminated.
+            frame: the tone and the gain of uhd.tx-burst.
+        */
+        std::string openSpec;
+        try {
+            auto       usrp = uhd::usrp::multi_usrp::make(uhd::device_addr_t(deviceArgs()));
+            const auto spec = usrp->get_tx_subdev_spec(0);
+            openSpec        = spec.empty() ? std::string{} : spec.at(0).db_name + ":" + spec.at(0).sd_name;
+        } catch (const std::exception& e) {
+            std::printf("transmit side: the direct open failed: %s\n", e.what());
+        }
+        const auto sides = frontendsOf(capture::uhd::Direction::Transmit);
+        const auto side  = std::ranges::find(sides, openSpec, &Frontend::spec);
+        expect(!openSpec.empty() && side != sides.end()) << "channel 0 opens on a transmit frontend the radio lists";
+        if (openSpec.empty() || side == sides.end()) {
+            return;
+        }
+
+        bool        deviceWasUp = false;
+        std::string name;
+        std::string identity;
+        capture::uhd::DeviceTruth block;
+        gr::property_map          settings = sinkSettings(2.0e6, bandFreq(), {});
+        settings.insert_or_assign("subdev", openSpec);
+        const bool ran = withTxGraph(std::move(settings), [&](capture::uhd::Sink& sink, auto&) {
+            deviceWasUp = waitForDeviceUp(sink, std::chrono::seconds(10));
+            settle(200);
+            block    = sink.deviceTruth();
+            identity = sink.identity();
+            std::lock_guard lock(sink._ctrlMutex);
+            try {
+                name = sink._usrp == nullptr ? std::string{} : sink._usrp->get_tx_subdev_name(0);
+            } catch (const std::exception& e) {
+                std::printf("transmit side: the read failed: %s\n", e.what());
+            }
+        });
+        expect(ran) << "the transmit graph ran";
+        std::printf("transmit side: subdev %s reads \"%s\" (the tree names \"%s\"); the block states \"%s\"\n", openSpec.c_str(), name.c_str(), side->name.c_str(), identity.c_str());
+
+        expect(deviceWasUp) << "the device opens for transmit";
+        expect(name == side->name) << "channel 0 transmits on the frontend the setting chose";
+        expect(block.frontend == side->name && block.subdev == openSpec) << "and the block's record states it and its spec";
+        expect(identity.find(std::format("frontend {} at {}", side->name, openSpec)) != std::string::npos) << "and its description names both";
+        expect(deviceOpens()) << "and the device is released when the graph stops";
+    });
+
     cases("uhd.tx-tagged-bursts", [] {
         /*| frame: three bursts of 0.1 s of a -20 dBFS tone into the terminated transmit port at
                 0 dB gain, each opened by tx_sob and ended by tx_eob, the second timed by tx_time
@@ -2542,7 +2746,7 @@ int main(int argc, char** argv) {
         expect(fatal(flow.connect<"out", "in">(tone, sink).has_value())) << "the burst tone wires to the sink";
         Scheduled scheduled;
         expect(fatal(scheduled.adopt(std::move(flow)).has_value())) << "the transmit graph builds";
-        scheduled.start();
+        expect(fatal(scheduled.start().has_value())) << "the transmit scheduler starts";
         upFlag              = waitForDeviceUp(sink, std::chrono::seconds(10));
         const auto deadline = Clock::now() + std::chrono::seconds(5);
         while (sink.burstAcks() < 3U && Clock::now() < deadline) {
@@ -2747,6 +2951,91 @@ int main(int argc, char** argv) {
         }
     });
 
+    cases("uhd.device-time-from-gps", [] {
+        /*| frame: the GPS branch of the device-time set. The source runs with the GPSDO as its
+                clock and time source, and the device-time toggle latches the oscillator's own
+                second on the next pulse. The case first waits, with nothing streaming, for the
+                servo to finish its warm-up: gps_locked reads true within seconds of a boot,
+                so the wait reads the health word of the servo record where the radio states one.
+            frame: then three consecutive edges. After each, gps_time, which blocks until the
+                oscillator's next time sentence, names the second the edge began, and
+                get_time_last_pps reads that second exactly. A latch one second off shows as a
+                difference of one at every edge.
+        */
+        const auto& truth = benchTruth();
+        if (std::ranges::find(truth.timeSources, std::string("gpsdo")) == truth.timeSources.end()) {
+            skipCase("this radio lists no gpsdo time source");
+            return;
+        }
+        constexpr int kLockWaitS = 900;
+        bool          locked     = false;
+        std::string   servoBefore;
+        const auto    waitStart = Clock::now();
+        try {
+            auto usrp = uhd::usrp::multi_usrp::make(uhd::device_addr_t(deviceArgs()));
+            const auto names = usrp->get_mboard_sensor_names(0);
+            const bool hasServo = std::ranges::find(names, std::string("gps_servo")) != names.end();
+            while (Clock::now() - waitStart < std::chrono::seconds(kLockWaitS)) {
+                const bool fix = usrp->get_mboard_sensor("gps_locked", 0).to_bool();
+                servoBefore    = hasServo ? usrp->get_mboard_sensor("gps_servo", 0).value : std::string("none");
+                const auto servo = capture::uhd::gpsServoFrom(servoBefore);
+                if (fix && (!hasServo || (servo.has_value() && servo->health == 0U))) {
+                    locked = true;
+                    break;
+                }
+                settle(5000);
+            }
+        } catch (const std::exception& e) {
+            std::printf("device time from gps: the direct open failed: %s\n", e.what());
+        }
+        const double waitedS = std::chrono::duration<double>(Clock::now() - waitStart).count();
+        std::printf("device time from gps: waited %.0f s for the servo; it reads \"%s\"\n", waitedS, servoBefore.c_str());
+        if (!locked) {
+            skipCase(std::format("not locked: the GPSDO did not report a fix and a healthy servo within {} s", kLockWaitS));
+            return;
+        }
+
+        constexpr int        kEdges = 3;
+        std::vector<double>  gpsSeconds;
+        std::vector<double>  lastPps;
+        std::string          clockSource;
+        std::string          timeSource;
+        std::string          servoAfter;
+        gr::property_map     settings = sourceSettings(2.0e6, bandFreq(), truth.gainMinDb, sourcePort());
+        settings.insert_or_assign("clock_source", std::string("gpsdo"));
+        settings.insert_or_assign("time_source", std::string("gpsdo"));
+        const bool ran = withGraph(std::move(settings), [&](capture::uhd::Source& src, auto&) {
+            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts";
+            clockSource = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_clock_source(0); });
+            timeSource  = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_time_source(0); });
+            expect(src.setControl("DEVICE_TIME", 1.0)) << "the device-time toggle is accepted";
+            settle(2500); // the edge the set waits for, and then some
+            for (int i = 0; i < kEdges; ++i) {
+                gpsSeconds.push_back(deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) {
+                    const auto reading = u.get_mboard_sensor("gps_time", 0);
+                    return static_cast<double>(capture::uhd::Source::wholeSecondsFrom(reading.value).value_or(0));
+                }));
+                lastPps.push_back(deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_time_last_pps(0).get_real_secs(); }));
+            }
+            servoAfter = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_mboard_sensor("gps_servo", 0).value; });
+        });
+        expect(ran) << "the graph ran";
+        std::printf("device time from gps: clock source \"%s\", time source \"%s\"; the servo reads \"%s\" after the stream\n", clockSource.c_str(), timeSource.c_str(), servoAfter.c_str());
+        for (std::size_t i = 0; i < gpsSeconds.size(); ++i) {
+            std::printf("device time from gps: edge %zu, gps_time %.0f, get_time_last_pps %.6f\n", i, gpsSeconds[i], lastPps[i]);
+        }
+
+        expect(clockSource == "gpsdo" && timeSource == "gpsdo") << "the radio runs on the GPSDO's reference and its pulse";
+        expect(gpsSeconds.size() == static_cast<std::size_t>(kEdges) && lastPps.size() == static_cast<std::size_t>(kEdges)) << "every edge was read";
+        for (std::size_t i = 0; i < gpsSeconds.size() && i < lastPps.size(); ++i) {
+            expect(gpsSeconds[i] > 0.0) << "the GPS second reads";
+            expect(lastPps[i] == gpsSeconds[i]) << "the device clock at the last edge is the GPS second exactly, at edge " << i;
+            if (i > 0UZ) {
+                expect(gpsSeconds[i] == gpsSeconds[i - 1UZ] + 1.0) << "and the edges are consecutive";
+            }
+        }
+    });
+
     cases("uhd.wire-format", [] {
         /*| frame: the packing the samples take on the link. sc8 halves the bytes, which on a
                 link-bound radio doubles the rate that arrives, and costs the lower eight
@@ -2876,7 +3165,7 @@ int main(int argc, char** argv) {
             expect(flow.connect<"out", "in">(src, sink).has_value()) << "the source wires to the sink";
             Scheduled scheduled;
             expect(scheduled.adopt(std::move(flow)).has_value()) << "the graph builds";
-            scheduled.start();
+            expect(scheduled.start().has_value()) << "the scheduler starts";
             settle(afterMs);
             const auto t0 = Clock::now();
             scheduled.stop();
@@ -3542,5 +3831,5 @@ int main(int argc, char** argv) {
             system, because the framework's own global destructors run after the scheduler's
             threads are gone. The verdict is taken first so a failure still reaches ctest.
     */
-    std::_Exit(failed ? 1 : rc);
+    std::_Exit(failed ? 1 : (rc == 0 && g_skipped.load() ? 77 : rc));
 }

@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -56,8 +57,16 @@ public:
     // Run to the end on the calling thread, as a program's main() does.
     [[nodiscard]] std::expected<void, gr::Error> runAndWait() { return _scheduler.blockRef().runAndWait(); }
 
-    // Start on the scheduler's own thread and return.
-    void start() { _scheduler.start(); }
+    // Start on the scheduler's own thread and return. The error is the scheduler's refusal
+    // to start; a core whose start() returns nothing has no refusal to report.
+    [[nodiscard]] std::expected<void, gr::Error> start() {
+        if constexpr (std::is_void_v<decltype(_scheduler.start())>) {
+            _scheduler.start();
+            return {};
+        } else {
+            return _scheduler.start();
+        }
+    }
 
     // Request a stop and join the scheduler's thread.
     void stop() { _scheduler.stop(); }

@@ -115,6 +115,11 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     gr::Annotated<std::vector<double>, "tx_gains", gr::Unit<"dB">, gr::Visible, gr::Doc<"overall transmit gain">>     tx_gains  = std::vector<double>{0.0};
     gr::Annotated<double, "frequency_correction", gr::Unit<"ppm">, gr::Doc<"reference error in parts per million">>   frequency_correction = 0.0;
     gr::Annotated<std::vector<std::string>, "tx_antennae", gr::Doc<"transmit connector name">>                       tx_antennae;
+    /*| contract: read by start() alone, which writes it before it reads the transmit surface
+            and builds the streamer. A write while streaming applies at the next start.
+        verified-by: uhd.transmit-side
+    */
+    gr::Annotated<std::string, "subdev", gr::Doc<"transmit frontend as a subdevice spec, 'A:A'; empty keeps the device's">> subdev;
     // The seven settings below are read by start() alone; withDeviceArgs states why.
     gr::Annotated<std::string, "wire_format", gr::Doc<"'sc16' or 'sc8'">>                                             wire_format  = std::string("sc16");
     gr::Annotated<std::string, "clock_source", gr::Doc<"reference the device is disciplined by">>                     clock_source;
@@ -134,7 +139,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     gr::Annotated<double, "thread_priority", gr::Doc<"transmit thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
     gr::Annotated<double, "cpu", gr::Doc<"transmit thread's processor; -1 keeps the system's choice">>                cpu             = -1.0;
 
-    GR_MAKE_REFLECTABLE(Sink, in, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, tx_antennae, wire_format, clock_source, time_source, master_clock_rate,
+    GR_MAKE_REFLECTABLE(Sink, in, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, tx_antennae, subdev, wire_format, clock_source, time_source, master_clock_rate,
                         send_frame_size, num_send_frames, send_buff_size, queue_duration, queue_max_bytes, thread_priority, cpu);
 
     // The longest one send may block. It is longer than any chunk the drain hands over, so a
@@ -848,8 +853,11 @@ reports the first such tag of a run on its message port. Other tags are ignored.
                 return; // a stop took the handle between the state read and this mutex
             }
             applyReferenceSourcesLocked();
+            failure = applySubdevSpec(*_usrp, Direction::Transmit, subdev.value);
             try {
-                readTruthInto(*_usrp, _openTruth);
+                if (failure.empty()) {
+                    readTruthInto(*_usrp, _openTruth);
+                }
             } catch (const std::exception& e) {
                 /*| invariant: caught here rather than left to escape, so the device is released
                         and the record cleared before the start throws. A block whose start

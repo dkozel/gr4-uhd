@@ -211,6 +211,11 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     gr::Annotated<bool, "emit_timing_tags", gr::Doc<"emit wall-clock timing tags">>                               emit_timing_tags = true;
     gr::Annotated<float, "tag_interval", gr::Unit<"s">, gr::Doc<"minimum interval between timing tags">>          tag_interval     = 1.0f;
     gr::Annotated<std::string, "trigger_name", gr::Doc<"tag trigger_name">>                                       trigger_name     = std::string("SDR_WALLCLOCK");
+    /*| contract: read by start() alone, which writes it before it reads the control surface and
+            builds the streamer. A write while streaming applies at the next start.
+        verified-by: uhd.receive-side
+    */
+    gr::Annotated<std::string, "subdev", gr::Doc<"receive frontend as a subdevice spec, 'A:B'; empty keeps the device's">> subdev;
     // The nine settings below are read by start() alone; withDeviceArgs states why.
     gr::Annotated<std::string, "wire_format", gr::Doc<"'sc16' or 'sc8'">>                                         wire_format       = std::string("sc16");
     gr::Annotated<std::string, "clock_source", gr::Doc<"reference to discipline the device by; empty keeps its own">> clock_source;
@@ -235,7 +240,7 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
     gr::Annotated<double, "thread_priority", gr::Doc<"receive thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
     gr::Annotated<double, "cpu", gr::Doc<"receive thread's processor; -1 keeps the system's choice">>             cpu               = -1.0;
 
-    GR_MAKE_REFLECTABLE(Source, out, device, device_parameter, sample_rate, frequency, rx_gains, gain_mode, frequency_correction, rx_antennae, emit_timing_tags, tag_interval, trigger_name, wire_format, clock_source, time_source, master_clock_rate, recv_frame_size, num_recv_frames, recv_buff_size, thread_priority, cpu);
+    GR_MAKE_REFLECTABLE(Source, out, device, device_parameter, sample_rate, frequency, rx_gains, gain_mode, frequency_correction, rx_antennae, emit_timing_tags, tag_interval, trigger_name, subdev, wire_format, clock_source, time_source, master_clock_rate, recv_frame_size, num_recv_frames, recv_buff_size, thread_priority, cpu);
 
     ::uhd::usrp::multi_usrp::sptr _usrp;
     ::uhd::rx_streamer::sptr      _stream;
@@ -1665,11 +1670,17 @@ use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.)">;
 
         /*| invariant: the reference and the timing selection are written before anything
                 else this start configures, and the device time after them, which is the
-                order the vendor states.
+                order the vendor states. The subdevice spec follows them and comes before
+                the surface read below.
         */
+        std::string subdevFailure;
         {
             std::lock_guard lock(_ctrlMutex);
             applyReferenceSourcesLocked();
+            subdevFailure = applySubdevSpec(*_usrp, Direction::Receive, subdev.value);
+        }
+        if (!subdevFailure.empty()) {
+            failStartOnOpenDevice(subdevFailure);
         }
 
         /*| invariant: the whole control surface is read here, once, from the device this

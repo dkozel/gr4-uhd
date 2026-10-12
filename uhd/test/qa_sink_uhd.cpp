@@ -71,6 +71,7 @@ struct SensorStandIn {
     std::vector<std::string>                     rx{"lo_locked", "rssi"};
     std::vector<std::string>                     tx{"lo_locked"};
     int                                          slowRecordMs = 8; // a GPSDO's serial record, slower than a poll affords
+    std::string                                  servoRecord = "26-10-12 636 56399 -223.18 -3.35E-10 12 8 6 0x0"; // what gps_servo reads
 
     std::string get_clock_source(std::size_t) const {
         if (clockThrows) {
@@ -93,6 +94,9 @@ struct SensorStandIn {
             return {"MIMO", false, "locked", "unlocked"};
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(slowRecordMs));
+        if (name == "gps_servo") {
+            return {"GPS servo", servoRecord, ""};
+        }
         return {"GPS epoch", std::string("1790000000"), "seconds"};
     }
     ::uhd::sensor_value_t get_rx_sensor(const std::string& name, std::size_t) {
@@ -757,6 +761,19 @@ int main(int argc, char** argv) {
         out.clear();
         expect(!capture::uhd::readDeviceSensors(out, device, names, capture::uhd::Direction::Transmit, capture::uhd::SensorSweep::Full, dropped)) << "a device going down mid-sweep ends it";
         expect(out.empty()) << "with nothing published";
+
+        // A GPSDO's servo record, parsed into its state, its phase and its tracking time.
+        SensorStandIn gpsdo;
+        gpsdo.mboard          = {"gps_servo", "ref_locked"};
+        const auto gpsdoNames = capture::uhd::sensorNamesOf(gpsdo, capture::uhd::Direction::Transmit, "case", 50.0);
+        out.clear();
+        expect(capture::uhd::readDeviceSensors(out, gpsdo, gpsdoNames, capture::uhd::Direction::Transmit, capture::uhd::SensorSweep::Full, live));
+        expect(find("gps_servo") != out.end() && find("gps_servo_state") != out.end() && find("gps_servo_state")->value == "6, health 0x0") << "the servo state beside the record";
+        expect(find("gps_phase_offset") != out.end() && find("gps_phase_offset")->value == "-223.18 ns" && find("gps_servo_tracking") != out.end()) << "and its phase and tracking time";
+        gpsdo.servoRecord = "no record";
+        out.clear();
+        capture::uhd::readDeviceSensors(out, gpsdo, gpsdoNames, capture::uhd::Direction::Transmit, capture::uhd::SensorSweep::Full, live);
+        expect(find("gps_servo") != out.end() && find("gps_servo_state") == out.end()) << "a record that does not parse adds nothing";
     });
 
     cases("sink.uhd-readings-are-what-the-stream-produces", [] {

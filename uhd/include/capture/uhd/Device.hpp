@@ -17,8 +17,10 @@
 #include <uhd/types/sensors.hpp>
 #include <uhd/usrp/mboard_eeprom.hpp>
 #include <uhd/usrp/multi_usrp.hpp>
+#include <uhd/usrp/subdev_spec.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -135,6 +137,12 @@ struct DeviceTruth {
             states none.
     */
     std::string              frontend;
+    /*| frame: the subdevice spec of the channel read, as "A:B": the daughterboard slot, then
+            the frontend on it. Empty where the device states none.
+        measured: a B210 opens on "A:A A:B", so channel 0 is "A:A", frontend "FE-RX2" on
+            receive and "FE-TX2" on transmit; "A:B" is "FE-RX1" and "FE-TX1".
+    */
+    std::string              subdev;
     /*| frame: the device kind UHD names at the root of its property tree: "B-Series Device"
             for a B2xx or a B100, "USRP2 / N-Series Device" for an N2xx, "X-Series Device" for an
             X3xx. Empty where the tree names none.
@@ -179,7 +187,8 @@ struct DeviceTruth {
     }
 
     /*| contract: one line naming the unit: the model, the serial, the firmware and FPGA
-            versions where it states them, and the link. The link part states the rate UHD
+            versions where it states them, the frontend of the channel read and its subdevice
+            spec where it states either, and the link. The link part states the rate UHD
             gives for it, or says the link rate is unknown and names the ceiling the ladder
             takes instead, the radio's own fastest rate. Empty where nothing was probed.
         verified-by: uhd.hardware-information
@@ -199,6 +208,11 @@ struct DeviceTruth {
         }
         if (!fpgaVersion.empty()) {
             out += std::format(", FPGA {}", fpgaVersion);
+        }
+        if (!frontend.empty() && !subdev.empty()) {
+            out += std::format(", frontend {} at {}", frontend, subdev);
+        } else if (!frontend.empty() || !subdev.empty()) {
+            out += std::format(", frontend {}", frontend.empty() ? subdev : frontend);
         }
         if (linkBytesPerS > 0.0) {
             out += std::format(", link {:g} MB/s as UHD states it", linkBytesPerS / 1e6);
@@ -1155,6 +1169,10 @@ void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir) {
         truth.fwVersion   = info.get("mboard_fw_version", "");
         truth.fpgaVersion = info.get("mboard_fpga_version", "");
     });
+    readOptional([&] {
+        const auto spec = rx ? usrp.get_rx_subdev_spec(0) : usrp.get_tx_subdev_spec(0);
+        truth.subdev    = spec.empty() ? std::string{} : spec.at(0).db_name + ":" + spec.at(0).sd_name;
+    });
     readOptional([&] { truth.model = usrp.get_mboard_name(0); });
     /*| frame: the versions the information map leaves out. An N-series carries them on the
             motherboard node; a B2xx states them in the map above. */
@@ -1427,6 +1445,37 @@ inline void applyReferenceSources(::uhd::usrp::multi_usrp& usrp, const std::stri
             std::fprintf(stderr, "[%s] set_%s_source(%s): %s (the device keeps the selection it had)\n", std::string(blockTag).c_str(), isClock ? "clock" : "time", want.c_str(), e.what());
         }
     }
+}
+
+/*| contract: put channel 0 of one direction on the frontend a subdevice spec names, "A:B" for
+        frontend B in slot A, and answer the failure the device gave, or an empty string. An
+        empty spec writes nothing and leaves the device's own. Called with the block's control
+        mutex held, from start() alone, after the reference sources and before the surface is
+        read and the streamer is built.
+    why: the spec decides which frontend every control call on channel 0 and every channel of
+        a streamer reach. A surface read before the write states the frontend the device opened
+        on, and a streamer built before it streams from that frontend.
+    trap: a spec the device refuses fails the start. A start that went on would receive from,
+        or transmit into, a connector the caller did not choose.
+    verified-by: controls.uhd-a-subdevice-spec-is-written-before-the-surface
+*/
+template <typename Usrp>
+std::string applySubdevSpec(Usrp& usrp, Direction dir, const std::string& spec) {
+    if (spec.empty()) {
+        return {};
+    }
+    const bool rx = dir == Direction::Receive;
+    try {
+        const ::uhd::usrp::subdev_spec_t parsed(spec);
+        if (rx) {
+            usrp.set_rx_subdev_spec(parsed, 0);
+        } else {
+            usrp.set_tx_subdev_spec(parsed, 0);
+        }
+    } catch (const std::exception& e) {
+        return std::format("uhd set_{}_subdev_spec({}): {}", rx ? "rx" : "tx", spec, e.what());
+    }
+    return {};
 }
 
 // ---- the control surface both directions state ---------------------------------------------
@@ -1822,6 +1871,71 @@ inline std::string_view operatorLabel(std::string_view id) {
     return {};
 }
 
+/*| frame: the fields of a GPSDO's gps_servo record that say how far its discipline has got:
+        the seconds its servo has tracked, the phase of the oscillator against the GPS pulse in
+        nanoseconds, the servo state and the health word. The record is nine fields separated
+        by spaces: the date as YY-MM-DD, the tracking seconds, the DAC word, the phase in ns, the
+        frequency error, two satellite counts, the state and the health word in hexadecimal.
+    measured: the LC_XO GPSDO of a B210 reads "26-10-12 636 56399 -223.18 -3.35E-10 12 8 6 0x0"
+        after more than ten minutes with no stream, "06-01-01 0 56367 0.00 1.00E-08 0 0 0 0x28"
+        for tens of seconds after it boots, the date being its own epoch, and state 2 with health
+        0x8 while it begins tracking. gps_locked reads true within seconds of a boot, so these
+        fields alone say whether the warm-up is over.
+*/
+struct GpsServo {
+    std::int64_t  trackingS = 0;
+    double        phaseNs   = 0.0;
+    int           state     = 0;
+    std::uint32_t health    = 0;
+};
+
+/*| contract: the servo fields of a gps_servo record, or nothing where the text is not a
+        record of nine fields whose first is a date and whose tracking seconds, phase, state and
+        health parse whole.
+    verified-by: controls.uhd-parses-the-gps-servo-record
+*/
+inline std::optional<GpsServo> gpsServoFrom(std::string_view text) {
+    std::vector<std::string_view> fields;
+    for (auto word : std::views::split(text, ' ')) {
+        if (!word.empty()) {
+            fields.emplace_back(word.begin(), word.end());
+        }
+    }
+    if (fields.size() != 9UZ) {
+        return std::nullopt;
+    }
+    const std::string_view date = fields[0];
+    const bool isDate = date.size() == 8UZ && date[2] == '-' && date[5] == '-' && std::ranges::all_of(std::array{0, 1, 3, 4, 6, 7}, [date](int i) { return date[static_cast<std::size_t>(i)] >= '0' && date[static_cast<std::size_t>(i)] <= '9'; });
+    const auto whole = [](std::string_view f, auto& into, int base = 10) {
+        const auto [ptr, ec] = std::from_chars(f.data(), f.data() + f.size(), into, base);
+        return ec == std::errc{} && ptr == f.data() + f.size();
+    };
+    GpsServo         servo;
+    std::string_view health = fields[8];
+    if (health.starts_with("0x") || health.starts_with("0X")) {
+        health.remove_prefix(2);
+    }
+    const auto phase = std::from_chars(fields[3].data(), fields[3].data() + fields[3].size(), servo.phaseNs);
+    if (!isDate || !whole(fields[1], servo.trackingS) || phase.ec != std::errc{} || phase.ptr != fields[3].data() + fields[3].size() || !whole(fields[7], servo.state) || !whole(health, servo.health, 16)) {
+        return std::nullopt;
+    }
+    return servo;
+}
+
+/*| contract: the readings a parsed gps_servo record adds beside the record itself:
+        gps_servo_state, the state with the health word, good where the health word is zero;
+        gps_phase_offset in ns; and gps_servo_tracking in seconds. None of the three is brief,
+        since the record they come from is not.
+    verified-by: controls.uhd-parses-the-gps-servo-record
+*/
+inline std::vector<SensorReading> gpsServoReadings(const GpsServo& servo) {
+    return {
+        {.id = "gps_servo_state", .label = "GPS servo state", .value = std::format("{}, health 0x{:x}", servo.state, servo.health), .good = servo.health == 0U, .brief = false},
+        {.id = "gps_phase_offset", .label = "GPS phase offset", .value = std::format("{:.2f} ns", servo.phaseNs), .good = true, .brief = false},
+        {.id = "gps_servo_tracking", .label = "GPS servo tracking", .value = std::format("{} s", servo.trackingS), .good = true, .brief = false},
+    };
+}
+
 // One UHD sensor value as the generic reading the sensor seam publishes.
 inline SensorReading toReading(const std::string& id, const ::uhd::sensor_value_t& sv) {
     SensorReading r;
@@ -2016,7 +2130,8 @@ inline bool lockReadingApplies(std::string_view id, std::string_view clockSource
         A lock reading the selection in force does not use is published, marked good and kept
         off the glance rows, by lockReadingApplies. Where names.gpsdoUndetected holds, a gpsdo
         reading marked failed says the EEPROM names a GPSDO and the open published no GPS
-        sensor, in both sweeps.
+        sensor, in both sweeps. Where the sweep read a gps_servo record that parses, the three
+        readings gpsServoReadings states follow.
     frame: a transmit frontend's sensors carry the tx_ prefix on their ids and TX on their
         labels, because a receive frontend of the same unit names its own the same way: both
         state an lo_locked, and they are two synthesizers. The motherboard's carry the ids the
@@ -2068,6 +2183,11 @@ bool readDeviceSensors(std::vector<SensorReading>& out, Usrp& usrp, const Sensor
     }
     if (names.gpsdoUndetected) {
         out.push_back({.id = "gpsdo", .label = "GPSDO", .value = "EEPROM names one, no GPS sensor; power-cycle if UHD did not search", .good = false, .brief = true});
+    }
+    if (const auto record = std::ranges::find(out, std::string("gps_servo"), &SensorReading::id); record != out.end()) {
+        if (const auto servo = gpsServoFrom(record->value); servo.has_value()) {
+            std::ranges::move(gpsServoReadings(*servo), std::back_inserter(out));
+        }
     }
     for (SensorReading& r : out) {
         if (!lockReadingApplies(r.id, clockSource, timeSource)) {
