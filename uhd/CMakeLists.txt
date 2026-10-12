@@ -161,7 +161,8 @@ if(CAPTURE_UHD_FOUND)
           sink.uhd-a-burst-ends-at-its-tagged-sample
           sink.uhd-two-bursts-in-one-buffer-end-at-their-own-samples
           sink.uhd-a-timed-burst-starts-at-its-time
-          sink.uhd-transmits-on-the-one-channel-listed
+          sink.uhd-feeds-one-or-two-channels
+          sink.uhd-two-channels-send-together
           sink.uhd-a-mistyped-burst-tag-is-reported-once
           sink.uhd-a-stream-end-tag-ends-the-burst-at-the-last-sample
           sink.uhd-a-stream-end-tag-after-the-last-send-ends-the-burst-alone
@@ -201,7 +202,8 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
       uhd.coverage-past-the-stated-range uhd.vendor-agc-claim
       uhd.wire-format uhd.transport-sizing uhd.master-clock uhd.tx-burst uhd.tx-loopback
       uhd.tx-underrun uhd.tx-tagged-bursts uhd.transmit-side uhd.two-channels-align
-      uhd.two-channels-follow-their-antennas uhd.one-channel-on-side-b uhd.two-channel-clean-rate)
+      uhd.two-channels-follow-their-antennas uhd.one-channel-on-side-b uhd.two-channel-clean-rate
+      uhd.tx-two-channels uhd.tx-channel-one-alone uhd.device-settings-across-two-blocks)
   capture_test(
     hw_uhd
     DIR test
@@ -216,5 +218,7 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
   set_tests_properties(uhd.device-time-from-gps PROPERTIES TIMEOUT 1080)
   # The clean-rate case runs two channels for 20 s at up to five rates.
   set_tests_properties(uhd.two-channel-clean-rate PROPERTIES TIMEOUT 420)
+  # The two-block case opens the radio twice for each of eight rows.
+  set_tests_properties(uhd.device-settings-across-two-blocks PROPERTIES TIMEOUT 300)
   message(STATUS "capture: the USRP hardware cases are ENABLED (label hardware)")
 endif()

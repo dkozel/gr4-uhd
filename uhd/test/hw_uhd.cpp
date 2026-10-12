@@ -87,7 +87,9 @@ std::uint64_t steadyNs() { return static_cast<std::uint64_t>(std::chrono::durati
         component, which is where an LO leakage spike sits), and the stream correlated
         against one frequency (the bin a transmitted tone lands in). The bin's phase index
         runs from the reset, because the phase of a received tone is arbitrary and only the
-        magnitude of the correlation is read.
+        magnitude of the correlation is read. Four more correlations sit 5 and 10 thousandths
+        of a cycle per sample either side of the bin, a local floor that rises with anything
+        broad in the band and not with a tone in the bin.
     trap: a mutex rather than atomics, since a complex accumulator is two numbers that have
         to move together.
 */
@@ -100,13 +102,17 @@ struct Accumulator {
     std::uint64_t        phase   = 0;
     double               binFreq = 0.0; // cycles per sample
 
+    static constexpr std::array<double, 4> kNeighborOffsets{-0.01, -0.005, 0.005, 0.01};
+    std::array<std::complex<double>, 4>    neighbors{};
+
     void reset() {
         std::lock_guard g(lock);
-        power = 0.0;
-        dc    = {};
-        bin   = {};
-        n     = 0;
-        phase = 0;
+        power     = 0.0;
+        dc        = {};
+        bin       = {};
+        neighbors = {};
+        n         = 0;
+        phase     = 0;
     }
     void setBinFreq(double cyclesPerSample) {
         std::lock_guard g(lock);
@@ -121,6 +127,10 @@ struct Accumulator {
             if (binFreq != 0.0) {
                 const double ph = -2.0 * std::numbers::pi * binFreq * static_cast<double>(phase + i);
                 bin += s * std::complex<double>(std::cos(ph), std::sin(ph));
+                for (std::size_t k = 0UZ; k < kNeighborOffsets.size(); ++k) {
+                    const double nph = -2.0 * std::numbers::pi * (binFreq + kNeighborOffsets[k]) * static_cast<double>(phase + i);
+                    neighbors[k] += s * std::complex<double>(std::cos(nph), std::sin(nph));
+                }
             }
         }
         phase += v.size();
@@ -184,6 +194,19 @@ double dcDbfs() {
 double binDbfs() {
     std::lock_guard g(g_accum.lock);
     return g_accum.n == 0UL ? -300.0 : 20.0 * std::log10(std::abs(g_accum.bin) / static_cast<double>(g_accum.n) + 1e-30);
+}
+
+// The mean of the four neighbor correlations, in the bin's own scale.
+double neighborDbfs() {
+    std::lock_guard g(g_accum.lock);
+    if (g_accum.n == 0UL) {
+        return -300.0;
+    }
+    double sum = 0.0;
+    for (const auto& c : g_accum.neighbors) {
+        sum += std::norm(c / static_cast<double>(g_accum.n));
+    }
+    return 10.0 * std::log10(sum / static_cast<double>(g_accum.neighbors.size()) + 1e-30);
 }
 
 void countTag(const gr::property_map& map, std::size_t index) {
@@ -824,6 +847,154 @@ bool withTxGraph(gr::property_map settings, Body&& body) {
     body(sink, scheduled);
     scheduled.stop();
     return true;
+}
+
+/*| contract: whether a transmit at freqHz with an overall gain of gainDb may reach a port with
+        no load on this bench: the gain at the least the radio states for transmit, and the
+        frequency inside 902 to 928 MHz or 2400 to 2483.5 MHz.
+    why: side B's TX/RX of the bench's B210 carries no load. A case that transmits on channel 1
+        checks its own settings here before any graph starts; the block carries no such rule.
+*/
+bool unloadedTransmitAllowed(double freqHz, double gainDb, double minGainDb) {
+    const bool ism = (freqHz >= 902.0e6 && freqHz <= 928.0e6) || (freqHz >= 2400.0e6 && freqHz <= 2483.5e6);
+    return ism && gainDb <= minGainDb;
+}
+
+// The transmit surface of this bench's unit, read once.
+const capture::uhd::DeviceTruth& transmitTruth() {
+    static const capture::uhd::DeviceTruth truth = [] {
+        capture::uhd::DeviceTruth t;
+        if (!capture::uhd::Sink::probeTruth(deviceArgs(), 2.0e6, t)) {
+            std::fprintf(stderr, "the transmit surface could not be read\n");
+        }
+        return t;
+    }();
+    return truth;
+}
+
+/*| contract: the settings a case transmitting on the device channels listed gives the sink: this
+        bench's unit at freqHz, the least overall gain the radio states, and TX/RX on each
+        channel. The caller checks them with unloadedTransmitAllowed before any graph starts.
+*/
+gr::property_map unloadedSinkSettings(double rateHz, double freqHz, std::vector<gr::Size_t> listed) {
+    gr::property_map settings = sinkSettings(rateHz, freqHz, {});
+    settings.insert_or_assign("tx_gains", std::vector<double>{transmitTruth().gainMinDb});
+    settings.insert_or_assign("tx_antennae", std::vector<std::string>{});
+    settings.insert_or_assign("channels", std::move(listed));
+    return settings;
+}
+
+/*| contract: run body(sink) against a started transmit graph whose sink takes a tone of
+        cycles[0] cycles per sample on in and, where cycles holds two, one of cycles[1] on in2;
+        then stop it and release the device.
+*/
+template <typename Body>
+bool withTxTones(gr::property_map settings, std::vector<double> cycles, Body&& body) {
+    gr::Graph flow;
+    auto&     sink = flow.emplaceBlock<capture::uhd::Sink>(std::move(settings));
+    auto&     tone = flow.emplaceBlock<hw_tone>({{"name", std::string("tone")}, {"cycles_per_sample", cycles.at(0)}});
+    if (!flow.connect<"out", "in">(tone, sink).has_value()) {
+        std::fprintf(stderr, "the tone does not wire to in\n");
+        return false;
+    }
+    if (cycles.size() > 1UZ) {
+        auto& tone2 = flow.emplaceBlock<hw_tone>({{"name", std::string("tone2")}, {"cycles_per_sample", cycles[1]}});
+        if (!flow.connect<"out", "in2">(tone2, sink).has_value()) {
+            std::fprintf(stderr, "the second tone does not wire to in2\n");
+            return false;
+        }
+    }
+    Scheduled scheduled;
+    if (const auto adopted = scheduled.adopt(std::move(flow)); !adopted.has_value()) {
+        std::fprintf(stderr, "the transmit graph did not build: %s\n", adopted.error().message.c_str());
+        return false;
+    }
+    if (const auto started = scheduled.start(); !started.has_value()) {
+        std::fprintf(stderr, "the transmit scheduler did not start: %s\n", started.error().message.c_str());
+        return false;
+    }
+    body(sink);
+    scheduled.stop();
+    return true;
+}
+
+// The same read as deviceRead, through the sink's handle and under its control mutex.
+template <typename R, typename Fn>
+R sinkRead(capture::uhd::Sink& sink, R fallback, Fn&& fn) {
+    std::lock_guard lock(sink._ctrlMutex);
+    if (sink._usrp == nullptr) {
+        return fallback;
+    }
+    try {
+        return fn(*sink._usrp);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "device read failed: %s\n", e.what());
+        return fallback;
+    }
+}
+
+/*| contract: what a case measuring a transmit on side B reads: the tone bin with nothing
+        transmitting, during the burst and after it, and the gain and center the sink's
+        channel 1 held while it transmitted.
+*/
+struct SideBHearing {
+    double floorBin = -300.0, burstBin = -300.0, afterBin = -300.0;
+    double floorNear = -300.0, burstNear = -300.0, afterNear = -300.0; // the neighbor bins
+    double floorBand = -300.0, burstBand = -300.0, afterBand = -300.0; // the whole band
+    double gain1Db  = -1.0, freq1Hz = 0.0;
+    std::uint64_t gaps = 0, lost = 0, late = 0, queued = 0; // the sink's counts at the burst's end
+    bool   ran = false, received = false, sinkRan = false, sinkUp = false;
+    std::string sinkLine;
+};
+
+/*| contract: receive side B's RX2 at freqHz with the source's channels set to rxChannels, the
+        first of them 1, and measure the bin at binCycles and its neighbors on out over windows
+        of windowMs before, during and after a transmit by a sink of settings fed tones of
+        cycles.
+    trap: a B210 runs one receive and one transmit chain, or two of each, and UHD refuses a
+        streamer that would leave three running. A sink of two channels beside a source needs a
+        source of two, and out carries channel 1 when the list starts with it.
+    trap: the transmit settings are checked by the caller before this runs, and channel 1's
+        gain and center are read back while the sink transmits, so a report states what the
+        radio held rather than what was asked.
+*/
+SideBHearing hearOnSideB(double rateHz, double freqHz, std::vector<gr::Size_t> rxChannels, gr::property_map sinkSettingsMap, std::vector<double> cycles, double binCycles, int windowMs = 700) {
+    SideBHearing     h;
+    gr::property_map rx = sourceSettings(rateHz, freqHz, benchTruth().gainMaxDb, "RX2");
+    rx.insert_or_assign("channels", std::move(rxChannels));
+    const bool ran = withGraph(std::move(rx), [&](capture::uhd::Source&, auto&) {
+        h.received = waitForSamples(std::chrono::milliseconds(6000));
+        g_accum.setBinFreq(binCycles);
+        resetPower();
+        settle(windowMs);
+        h.floorBin  = binDbfs();
+        h.floorNear = neighborDbfs();
+        h.floorBand = meanDbfs();
+        h.sinkRan   = withTxTones(std::move(sinkSettingsMap), std::move(cycles), [&](capture::uhd::Sink& sink) {
+            h.sinkUp = waitForDeviceUp(sink, std::chrono::seconds(10));
+            settle(400);
+            h.sinkLine = sink.describe();
+            h.gain1Db  = sinkRead(sink, -1.0, [](uhd::usrp::multi_usrp& u) { return u.get_tx_gain(1); });
+            h.freq1Hz  = sinkRead(sink, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_tx_freq(1); });
+            resetPower();
+            settle(windowMs);
+            h.burstBin  = binDbfs();
+            h.burstNear = neighborDbfs();
+            h.burstBand = meanDbfs();
+            h.gaps      = sink.underrunEvents();
+            h.lost      = sink.sequenceErrors();
+            h.late      = sink.latePackets();
+            h.queued    = sink.queuedSamples();
+        });
+        settle(400);
+        resetPower();
+        settle(windowMs);
+        h.afterBin  = binDbfs();
+        h.afterNear = neighborDbfs();
+        h.afterBand = meanDbfs();
+    });
+    h.ran = ran;
+    return h;
 }
 
 // What the source counts as shed, where the accessor exists at all.
@@ -3158,6 +3329,189 @@ int main(int argc, char** argv) {
                 than they lift the whole band.
         */
         expect(burstBin - floorBin > burstBand - floorBand) << "and the bin it lands in rises more than the whole band, which is why the tone is measured in its own bin";
+    });
+
+    cases("uhd.tx-two-channels", [] {
+        /*| frame: the sink transmits on channels {0, 1}, a tone of 0.125 cycles per sample on in
+                and one of 0.25 on in2, at the least gain the radio states and at 915 MHz. Side
+                A's TX/RX is terminated and side B's carries no load, which bounds a transmit
+                there to that gain and an ISM band. The source receives on channels {1, 0}, so
+                out carries side B's RX2, and reads the bin in2's tone lands in.
+        */
+        if (const std::size_t offered = receiveChannels(); offered < 2UZ) {
+            skipCase(std::format("the radio offers {} receive channels", offered));
+            return;
+        }
+        constexpr double kRate   = 2.0e6;
+        constexpr double kFreq   = 915.0e6;
+        const double     minGain = transmitTruth().gainMinDb;
+        expect(fatal(transmitTruth().gainMaxDb > minGain)) << "the transmit gain range was read";
+        expect(fatal(unloadedTransmitAllowed(kFreq, minGain, minGain))) << "channel 1 transmits at the least gain inside an ISM band";
+        const SideBHearing h = hearOnSideB(kRate, kFreq, {1U, 0U}, unloadedSinkSettings(kRate, kFreq, {0U, 1U}), {0.125, 0.25}, 0.25, 2000);
+        std::printf("tx two channels: the sink says \"%s\"\n", h.sinkLine.c_str());
+        std::printf("tx two channels: channel 1 held %.2f dB at %.0f Hz; side B's bin reads %.2f dBFS idle, %.2f dBFS during the burst and %.2f dBFS after it\n", h.gain1Db, h.freq1Hz, h.floorBin, h.burstBin,
+                    h.afterBin);
+        std::printf("tx two channels: the neighbor bins read %.2f, %.2f and %.2f dBFS, the whole band %.2f, %.2f and %.2f dBFS over the same windows\n", h.floorNear, h.burstNear, h.afterNear, h.floorBand,
+                    h.burstBand, h.afterBand);
+        expect(h.ran && h.received) << "the receive graph ran and streamed";
+        expect(h.sinkRan && h.sinkUp) << "the sink started on both channels beside the source";
+        expect(std::abs(h.gain1Db - minGain) < 0.5 && unloadedTransmitAllowed(h.freq1Hz, h.gain1Db, minGain + 0.5)) << "channel 1 held the least gain inside the band";
+        expect(h.burstBin > h.burstNear + 10.0) << "side B hears channel 1's tone above the bins beside it";
+        expect(h.burstBin > h.floorBin + 10.0) << "and above the bin with nothing transmitting";
+        expect(h.burstBin > h.afterBin + 10.0) << "and the bin falls back when the burst ends";
+    });
+
+    cases("uhd.tx-channel-one-alone", [] {
+        /*| frame: the sink transmits on channels {1} alone, a tone of 0.125 cycles per sample on
+                in, under the bounds uhd.tx-two-channels states. The source receives side B's
+                RX2 on channel 1.
+        */
+        if (const std::size_t offered = receiveChannels(); offered < 2UZ) {
+            skipCase(std::format("the radio offers {} receive channels", offered));
+            return;
+        }
+        constexpr double kRate   = 2.0e6;
+        constexpr double kFreq   = 915.0e6;
+        const double     minGain = transmitTruth().gainMinDb;
+        expect(fatal(transmitTruth().gainMaxDb > minGain)) << "the transmit gain range was read";
+        expect(fatal(unloadedTransmitAllowed(kFreq, minGain, minGain))) << "channel 1 transmits at the least gain inside an ISM band";
+        const SideBHearing h = hearOnSideB(kRate, kFreq, {1U}, unloadedSinkSettings(kRate, kFreq, {1U}), {0.125}, 0.125, 2000);
+        std::printf("tx channel 1: the sink says \"%s\"\n", h.sinkLine.c_str());
+        std::printf("tx channel 1: channel 1 held %.2f dB at %.0f Hz; side B's bin reads %.2f dBFS idle, %.2f dBFS during the burst and %.2f dBFS after it\n", h.gain1Db, h.freq1Hz, h.floorBin, h.burstBin,
+                    h.afterBin);
+        std::printf("tx channel 1: the neighbor bins read %.2f, %.2f and %.2f dBFS, the whole band %.2f, %.2f and %.2f dBFS over the same windows\n", h.floorNear, h.burstNear, h.afterNear, h.floorBand,
+                    h.burstBand, h.afterBand);
+        expect(h.ran && h.received) << "the receive graph ran and streamed";
+        expect(h.sinkRan && h.sinkUp) << "the sink started on channel 1 beside the source";
+        expect(std::abs(h.gain1Db - minGain) < 0.5 && unloadedTransmitAllowed(h.freq1Hz, h.gain1Db, minGain + 0.5)) << "channel 1 held the least gain inside the band";
+        expect(h.burstBin > h.burstNear + 10.0) << "side B hears channel 1's tone above the bins beside it";
+        expect(h.burstBin > h.floorBin + 10.0) << "and above the bin with nothing transmitting";
+        expect(h.burstBin > h.afterBin + 10.0) << "and the bin falls back when the burst ends";
+    });
+
+    cases("uhd.device-settings-across-two-blocks", [] {
+        /*| frame: a measurement. A source and a sink hold the radio in one process, and the
+                block that comes second asks for a device-wide setting other than the first's:
+                the reference, the timing source, the master clock, or a rate that needs another
+                clock. Each row prints what the second block's start or write did, what each
+                block then states, and what the device runs. The sink transmits on channel 0
+                into side A's terminated TX/RX at 0 dB and 915 MHz. Standard output is left
+                unbuffered, so each block's lines on standard error fall inside the row they
+                belong to.
+        */
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        constexpr double kRate = 2.0e6;
+        const double     freq  = bandFreq();
+        const auto       controlsOf = [](const std::vector<capture::ControlDesc>& surface) {
+            std::string line;
+            for (const auto& c : surface) {
+                if (c.id == "CLOCK_SOURCE" || c.id == "TIME_SOURCE" || c.id == "MASTER_CLOCK") {
+                    const auto at = static_cast<std::size_t>(std::lround(c.defValue));
+                    line += std::format(" {}=\"{}\"[{}]", c.id, c.label, c.kind == 3 && at < c.options.size() ? c.options[at] : std::format("{:g}", c.defValue));
+                }
+            }
+            return line.empty() ? std::string(" none") : line;
+        };
+        struct Row {
+            std::string      name;
+            gr::property_map rx;
+            gr::property_map tx;
+            bool             sinkFirst = false;
+            std::function<void(capture::uhd::Source&, capture::uhd::Sink&)> live;
+        };
+        const auto rxWith = [&](gr::property_map extra) {
+            gr::property_map m = sourceSettings(kRate, freq, 38.0, sourcePort());
+            for (auto& [k, v] : extra) {
+                m.insert_or_assign(k, v);
+            }
+            return m;
+        };
+        const auto txWith = [&](gr::property_map extra) {
+            gr::property_map m = sinkSettings(kRate, freq, {});
+            for (auto& [k, v] : extra) {
+                m.insert_or_assign(k, v);
+            }
+            return m;
+        };
+        const auto optionIndex = [](const std::vector<capture::ControlDesc>& surface, const std::string& id, const std::string& name) {
+            for (const auto& c : surface) {
+                if (c.id == id) {
+                    for (std::size_t i = 0UZ; i < c.options.size(); ++i) {
+                        if (c.options[i] == name) {
+                            return static_cast<double>(i);
+                        }
+                    }
+                }
+            }
+            return -1.0;
+        };
+        std::vector<Row> rows;
+        rows.push_back({"clock_source at the sink's start", rxWith({{"clock_source", std::string("internal")}}), txWith({{"clock_source", std::string("gpsdo")}}), false, {}});
+        rows.push_back({"time_source at the sink's start", rxWith({{"time_source", std::string("internal")}}), txWith({{"time_source", std::string("gpsdo")}}), false, {}});
+        rows.push_back({"master_clock_rate at the sink's start", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 30.72e6}}), false, {}});
+        rows.push_back({"master_clock_rate at the source's start", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 30.72e6}}), true, {}});
+        rows.push_back({"a rate needing another clock at the sink's start", rxWith({}), txWith({{"sample_rate", 7.68e6}}), false, {}});
+        rows.push_back({"a rate needing another clock written to the running sink", rxWith({}), txWith({}), false,
+                        [](capture::uhd::Source&, capture::uhd::Sink& sink) { std::ignore = sink.settings().setStaged({{"sample_rate", 7.68e6}}); }});
+        rows.push_back({"MASTER_CLOCK written to the running source", rxWith({}), txWith({}), false,
+                        [](capture::uhd::Source& src, capture::uhd::Sink&) { std::printf("  the source's setControl(MASTER_CLOCK, 30.72) answered %d\n", src.setControl("MASTER_CLOCK", 30.72) ? 1 : 0); }});
+        rows.push_back({"CLOCK_SOURCE written to the running source", rxWith({{"clock_source", std::string("internal")}}), txWith({}), false,
+                        [&](capture::uhd::Source& src, capture::uhd::Sink&) {
+                            const double at = optionIndex(src.controlSurface(), "CLOCK_SOURCE", "gpsdo");
+                            std::printf("  the source's setControl(CLOCK_SOURCE, %g) answered %d\n", at, at >= 0.0 && src.setControl("CLOCK_SOURCE", at) ? 1 : 0);
+                        }});
+
+        for (Row& row : rows) {
+            std::printf("row: %s\n", row.name.c_str());
+            bool sinkRan = false;
+            bool sinkUp  = false;
+            const auto measure = [&](capture::uhd::Source& src, capture::uhd::Sink& sink) {
+                sinkUp = waitForDeviceUp(sink, std::chrono::seconds(10));
+                settle(600);
+                if (row.live) {
+                    row.live(src, sink);
+                    settle(1500);
+                }
+                const std::uint64_t before = g_samples.load();
+                const auto          t0     = Clock::now();
+                settle(1000);
+                const double streamed = static_cast<double>(g_samples.load() - before) / std::chrono::duration<double>(Clock::now() - t0).count();
+                const auto   dev      = [&](auto fn) { return deviceRead(src, std::string("?"), fn); };
+                std::printf("  device: tuned rx %s Hz, tx %s Hz\n", dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.0f}", u.get_rx_freq(0)); }).c_str(),
+                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.0f}", u.get_tx_freq(0)); }).c_str());
+                std::printf("  device: clock_source %s, time_source %s, master clock %s Hz, rx rate %s S/s, tx rate %s S/s\n",
+                            dev([](uhd::usrp::multi_usrp& u) { return u.get_clock_source(0); }).c_str(), dev([](uhd::usrp::multi_usrp& u) { return u.get_time_source(0); }).c_str(),
+                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.0f}", u.get_master_clock_rate(0)); }).c_str(),
+                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.1f}", u.get_rx_rate(0)); }).c_str(),
+                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.1f}", u.get_tx_rate(0)); }).c_str());
+                std::printf("  source: settings clock_source \"%s\" time_source \"%s\" master_clock_rate %g sample_rate %g; streamed %.0f S/s; controls%s\n", src.clock_source.value.c_str(),
+                            src.time_source.value.c_str(), src.master_clock_rate.value, src.sample_rate.value, streamed, controlsOf(src.controlSurface()).c_str());
+                const capture::uhd::DeviceTruth st = src.deviceTruth();
+                std::printf("  source's record: clock_source %s, time_source %s, master clock %.0f Hz\n", st.clockSource.c_str(), st.timeSource.c_str(), st.mclkHz);
+                std::printf("  sink: up %d; settings clock_source \"%s\" time_source \"%s\" master_clock_rate %g sample_rate %g; controls%s\n", sinkUp ? 1 : 0, sink.clock_source.value.c_str(),
+                            sink.time_source.value.c_str(), sink.master_clock_rate.value, sink.sample_rate.value, controlsOf(sink.controlSurface()).c_str());
+                const capture::uhd::DeviceTruth kt = sink.deviceTruth();
+                std::printf("  sink's record: clock_source %s, time_source %s, master clock %.0f Hz; sink says \"%s\"\n", kt.clockSource.c_str(), kt.timeSource.c_str(), kt.mclkHz, sink.describe().c_str());
+            };
+            bool ran = false;
+            if (!row.sinkFirst) {
+                ran = withGraph(row.rx, [&](capture::uhd::Source& src, auto&) {
+                    expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
+                    sinkRan = withTxGraph(row.tx, [&](capture::uhd::Sink& sink, auto&) { measure(src, sink); });
+                });
+            } else {
+                // The sink opens the device first, and the source joins it.
+                sinkRan = withTxGraph(row.tx, [&](capture::uhd::Sink& sink, auto&) {
+                    std::ignore = waitForDeviceUp(sink, std::chrono::seconds(10));
+                    ran         = withGraph(row.rx, [&](capture::uhd::Source& src, auto&) {
+                        expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
+                        measure(src, sink);
+                    });
+                });
+            }
+            expect(ran && sinkRan) << std::format("{}: both graphs built and ran", row.name);
+            capture::uhd::awaitReleases();
+        }
     });
 
     cases("uhd.tx-underrun", [] {

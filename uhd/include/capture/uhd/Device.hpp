@@ -718,6 +718,19 @@ inline std::optional<std::string> channelsRefusal(std::span<const std::uint32_t>
     return std::nullopt;
 }
 
+/*| contract: the connector each of channelCount streaming channels takes from names: the
+        name at the channel's place in the channels setting, and the first name for a place the
+        names do not reach. An empty name leaves that channel's connector unwritten.
+    verified-by: controls.uhd-each-channel-takes-its-own-antenna
+*/
+inline std::vector<std::string> antennaPerChannel(std::span<const std::string> names, std::size_t channelCount) {
+    std::vector<std::string> out;
+    for (std::size_t i = 0UZ; i < channelCount; ++i) {
+        out.push_back(i < names.size() ? names[i] : (names.empty() ? std::string{} : names.front()));
+    }
+    return out;
+}
+
 /*| contract: the truth the rate decisions read for a stream of the given number of channels:
         the link's bytes per second shared among them, and on a radio with one continuous clock
         range the top of that range over the channel count. One channel leaves the truth as it
@@ -921,6 +934,27 @@ inline double clockInForceAtOpen(const ::uhd::device_addr_t& openAddress, const 
     }
     return openAddress.has_key("master_clock_rate") ? truth.mclkHz : 0.0;
 }
+
+// The master clock the device reads, and zero where the read fails.
+template <typename Usrp>
+double masterClockOf(Usrp& usrp) {
+    try {
+        return usrp.get_master_clock_rate(0);
+    } catch (const std::exception&) {
+        return 0.0;
+    }
+}
+
+/*| contract: whether building a streamer moved the master clock: both reads above zero and more
+        than a hertz apart. A block retunes its channels where it did, before the stream starts.
+    why: UHD 4.9's B2xx picks its automatic clock for the channels a streamer carries, and a
+        rate written before any streamer exists is taken for one channel. A streamer of two
+        channels then moves the clock, 32 to 16 MHz at 2 MS/s, and the radio leaves the center
+        the tune before it set: the tuner reads back a hertz low, and a tone 250 kHz off the
+        center is not received or sent until the frequency is written again.
+    verified-by: uhd.tx-two-channels
+*/
+constexpr bool streamMovedClock(double beforeHz, double afterHz) { return beforeHz > 0.0 && afterHz > 0.0 && std::abs(afterHz - beforeHz) > 1.0; }
 
 /*| contract: the rate to hand the device for a request. On a radio whose clock is programmable
         it is the request, UHD choosing a clock that reaches it, and the link ceiling UHD states

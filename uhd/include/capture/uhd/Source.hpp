@@ -1785,9 +1785,14 @@ environment.)">;
         try {
             ::uhd::stream_args_t streamArgs("fc32", _wireFormat);
             streamArgs.channels = _channels;
+            const double clock  = masterClockOf(*_usrp);
             _stream             = _usrp->get_rx_stream(streamArgs);
             {
                 std::lock_guard lock(_ctrlMutex);
+                if (_requestedFreqHz > 0.0 && streamMovedClock(clock, masterClockOf(*_usrp))) {
+                    _freqWrittenHz.reset(); // the tune made at the earlier clock is off the center
+                    std::ignore = tuneLocked(_requestedFreqHz, _ppmApplied, true);
+                }
                 _maxRecvSamples = _stream->get_max_num_samps();
                 // The two clocks read beside each other, which carries every device
                 // timestamp into the host's epoch for as long as this stream runs.
@@ -2811,19 +2816,6 @@ environment.)">;
         if (!rx_antennae->empty()) {
             std::ignore = applyAntennasOf(rx_antennae.value);
         }
-    }
-
-    /*| contract: the connector each of channelCount streaming channels takes from names: the
-            name at the channel's place in the channels setting, and the first name for a place
-            the names do not reach. An empty name leaves that channel's connector unwritten.
-        verified-by: controls.uhd-each-channel-takes-its-own-antenna
-    */
-    static std::vector<std::string> antennaPerChannel(std::span<const std::string> names, std::size_t channelCount) {
-        std::vector<std::string> out;
-        for (std::size_t i = 0UZ; i < channelCount; ++i) {
-            out.push_back(i < names.size() ? names[i] : (names.empty() ? std::string{} : names.front()));
-        }
-        return out;
     }
 
     // The antenna applier for one name, which every streaming channel takes.

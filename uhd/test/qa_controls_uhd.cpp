@@ -3029,10 +3029,10 @@ int main(int argc, char** argv) {
     cases("controls.uhd-each-channel-takes-its-own-antenna", [] {
         using capture::uhd::Source;
         using Names = std::vector<std::string>;
-        expect(Source::antennaPerChannel(Names{"TX/RX", "RX2"}, 2UZ) == Names{"TX/RX", "RX2"}) << "each listed channel takes the name at its place";
-        expect(Source::antennaPerChannel(Names{"RX2"}, 2UZ) == Names{"RX2", "RX2"}) << "one name applies to both";
-        expect(Source::antennaPerChannel(Names{"TX/RX", "RX2"}, 1UZ) == Names{"TX/RX"}) << "a name past the channels is not used";
-        expect(Source::antennaPerChannel(Names{"", "RX2"}, 2UZ) == Names{"", "RX2"}) << "an empty name leaves its channel alone";
+        expect(capture::uhd::antennaPerChannel(Names{"TX/RX", "RX2"}, 2UZ) == Names{"TX/RX", "RX2"}) << "each listed channel takes the name at its place";
+        expect(capture::uhd::antennaPerChannel(Names{"RX2"}, 2UZ) == Names{"RX2", "RX2"}) << "one name applies to both";
+        expect(capture::uhd::antennaPerChannel(Names{"TX/RX", "RX2"}, 1UZ) == Names{"TX/RX"}) << "a name past the channels is not used";
+        expect(capture::uhd::antennaPerChannel(Names{"", "RX2"}, 2UZ) == Names{"", "RX2"}) << "an empty name leaves its channel alone";
 
         // The applier refuses a name the unit does not offer on any channel.
         RunningSource src{};

@@ -73,8 +73,23 @@ of none or of three, a channel listed twice, and a connected `out2` with one cha
 after the open a channel the spec does not offer. The ladder for two channels shares the link
 between them and, on a radio with one continuous clock range, halves the top of that range:
 UHD's `b200_impl.cpp` refuses a master clock above 30.72 MHz with two channels in use. The sink's
-`channels` setting names the one channel `in` feeds, and every transmit control call names it; a
-list of other than one channel fails the start before the open.
+`channels` setting takes the same lists, `in` feeding the first channel and `in2`, an optional
+port, the second. `in2` is connected exactly when two channels are listed: a start refuses a
+connected `in2` with one channel and two channels with `in2` unconnected. One streamer carries
+both, every send taking the same samples of each from two queues that share their indices, and
+the queue byte bound is split between them. A burst tag on either input marks the burst on both
+channels. The rate, the tune, the gain and the filter go to every listed channel alike,
+`tx_antennae` names a connector per channel as `rx_antennae` does, and the first channel answers
+every read-back. Each transmit chain acknowledges an end of burst on its own, and the
+asynchronous message names the chain, so with two channels an end counts as acknowledged once
+both chains have acknowledged it. Each chain also reports its own gaps, so a gap of a
+two-channel stream counts once per chain.
+UHD 4.9's B2xx takes a rate written before any streamer exists for one channel, so a streamer
+of two channels moves its automatic clock, 32 to 16 MHz at 2 MS/s, and the radio leaves the
+center the earlier tune set while the tuner reads back a hertz low. Each block retunes its
+channels where building its streamer moved the clock. A B210 runs one receive and one transmit
+chain, or two of each: UHD refuses the streamer that would leave three running, so a sink of two
+channels beside a source needs a source of two.
 Both records state the link rate UHD gives, one link carrying both directions; the
 receive record carries three fields more, the three optional frontend corrections, which the
 receive frontend alone states. The link rate is the double UHD keeps at
@@ -363,6 +378,14 @@ reading then states the frame alone.
   one cause of it: UHD hands a second open in one process the device already open, with the
   first open's keys. A driver coercing a clock inside its range gives the same difference. A radio stating one clock that the table
   does not hold for its product is offered no clock control.
+- A source and a sink holding one radio share its device-wide selections, and neither block
+  learns what the other wrote. On a B210, a sink started beside a running source puts the
+  device on the `clock_source` and `time_source` it names while the source goes on stating its
+  own. A `master_clock_rate` named by the second block to open is not applied, and that block
+  states its setting beside a record carrying the clock the device runs. A rate the running
+  clock does not reach is coerced: UHD warns and the block states the rate it got. A
+  `MASTER_CLOCK` write on a running source moves the clock under the sink, whose rate, tune and
+  record stay where they were; the tuners of both directions then read back a hertz low.
 - The table leaves out 120 MHz on an X3xx: UHD 4.9.0.1's device arguments take 184.32 to 200
   MHz and refuse it at the open. It leaves out the X410 clocks MPM's clock policy takes beyond
   the manual's: 122.88 and 125 MHz and a 200 MHz legacy clock. A TwinRX behind a channel other

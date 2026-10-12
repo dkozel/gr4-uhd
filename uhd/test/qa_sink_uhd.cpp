@@ -296,19 +296,25 @@ RunEnd runToEnd(gr::Graph flow) {
 
 /*| role: a stand-in for a transmit streamer that keeps every send's metadata: where in the
         stream it starts, how many samples it asks for, whether they come from the queue, and
-        the start, the end and the time it carries. No device is opened.
+        the start, the end and the time it carries. With a second buffer it also keeps whether
+        that buffer reads the second channel's queue at the same position, and whether every
+        sample there holds the value of the first. No device is opened.
     frame: a send that does not read the queue is an end of burst placed on its own, which
-        carries one zero sample.
+        carries one zero sample per channel.
 */
 struct BurstStream : ::uhd::tx_streamer {
     struct Send {
-        std::size_t  first     = 0UZ;
-        std::size_t  n         = 0UZ;
-        bool         fromQueue = false;
-        bool         starts    = false;
-        bool         ends      = false;
-        bool         timed     = false;
-        std::int64_t timeNs    = 0;
+        std::size_t         first     = 0UZ;
+        std::size_t         n         = 0UZ;
+        bool                fromQueue = false;
+        bool                starts    = false;
+        bool                ends      = false;
+        bool                timed     = false;
+        std::int64_t        timeNs    = 0;
+        std::size_t         channels  = 1UZ;
+        bool                secondInPlace = false;
+        std::complex<float> secondValue{};
+        bool                secondEven = false;
     };
     capture::uhd::Sink&      sink;
     mutable std::mutex       mutex;
@@ -325,7 +331,14 @@ struct BurstStream : ::uhd::tx_streamer {
         const auto*     begin     = sink._ring.buf.data();
         const bool      fromQueue = p >= begin && p < begin + sink._ring.buf.size();
         std::lock_guard lock(mutex);
-        log.push_back({placed, nsamps, fromQueue, md.start_of_burst, md.end_of_burst, md.has_time_spec, md.has_time_spec ? md.time_spec.to_ticks(1e9) : 0});
+        Send            send{placed, nsamps, fromQueue, md.start_of_burst, md.end_of_burst, md.has_time_spec, md.has_time_spec ? md.time_spec.to_ticks(1e9) : 0, buffs.size()};
+        if (buffs.size() > 1UZ) {
+            const auto* q      = static_cast<const std::complex<float>*>(buffs[1]);
+            send.secondInPlace = fromQueue && q == sink._ring2.buf.data() + (p - begin);
+            send.secondValue   = q[0];
+            send.secondEven    = std::all_of(q, q + nsamps, [&](const std::complex<float>& v) { return v == q[0]; });
+        }
+        log.push_back(send);
         if (fromQueue) {
             placed += nsamps;
             queued.store(placed);
@@ -351,8 +364,13 @@ struct BurstRig {
     capture::uhd::Sink           sink{};
     std::shared_ptr<BurstStream> stream;
 
-    explicit BurstRig(std::size_t queueSamples = 65536UZ) {
+    explicit BurstRig(std::size_t queueSamples = 65536UZ, std::size_t channels = 1UZ) {
         capture::resizeRing(sink._ring, queueSamples);
+        if (channels > 1UZ) {
+            sink._channels = {0UZ, 1UZ};
+            sink._channelCount.store(2UZ);
+            capture::resizeRing(sink._ring2, queueSamples);
+        }
         sink._maxSendSamples = 363UZ;
         sink._rateActualHz   = 1.0e6;
         sink.publishSendCapLocked();
@@ -387,7 +405,8 @@ struct BurstRig {
     }
 };
 
-/*| role: a stream of n samples of 0.5 carrying the tags a case lists, at their stream indices.
+/*| role: a stream of n samples of value, 0.5 unless a case sets it, carrying the tags a case
+        lists, at their stream indices.
         It ends its stream once mayEnd holds, where a case gives one.
 */
 struct BurstFeed : gr::Block<BurstFeed> {
@@ -397,11 +416,12 @@ struct BurstFeed : gr::Block<BurstFeed> {
     std::size_t                                          n = 0UZ;
     std::vector<std::pair<std::size_t, gr::property_map>> tags;
     std::function<bool()>                                mayEnd;
+    std::complex<float>                                  value{0.5f, 0.0f};
     std::size_t                                          _sent = 0UZ;
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& output) {
         const std::size_t count = std::min(output.size(), n - _sent);
-        std::fill_n(output.begin(), count, std::complex<float>{0.5f, 0.0f});
+        std::fill_n(output.begin(), count, value);
         for (const auto& [index, map] : tags) {
             if (index >= _sent && index < _sent + count) {
                 output.publishTag(map, index - _sent);
@@ -451,12 +471,23 @@ struct BurstProbe : gr::Block<BurstProbe> {
 
     capture::uhd::Sink* target = nullptr;
 
-    gr::work::Status processBulk(gr::InputSpanLike auto& input) noexcept { return target->processBulk(input); }
+    gr::work::Status processBulk(gr::InputSpanLike auto& input) noexcept { return target->stageBulk(input); }
 
     gr::work::Status processEpilogue(gr::InputSpanLike auto& input) noexcept {
         std::ignore = target->endBurstAtStreamEnd(in, input.streamIndex);
         return gr::work::Status::OK;
     }
+};
+
+// The same graph end for a sink of two channels: in2's spans go to the second channel.
+struct BurstPairProbe : gr::Block<BurstPairProbe> {
+    gr::PortIn<std::complex<float>> in;
+    gr::PortIn<std::complex<float>> in2;
+    GR_MAKE_REFLECTABLE(BurstPairProbe, in, in2);
+
+    capture::uhd::Sink* target = nullptr;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::InputSpanLike auto& input2) noexcept { return target->stageBulk(input, input2); }
 };
 
 using BurstTags = std::vector<std::pair<std::size_t, gr::property_map>>;
@@ -482,6 +513,28 @@ bool runBursts(BurstRig& rig, std::size_t n, BurstTags tags, bool relayed = fals
             return false;
         }
     } else if (!flow.connect<"out", "in">(feed, probe).has_value()) {
+        return false;
+    }
+    const RunEnd end = runToEnd(std::move(flow));
+    return end.returned && !end.failed;
+}
+
+/*| contract: run n samples through two feeds, the first of value 0.5 carrying tags and the
+        second of value second carrying tags2, into rig's two-channel sink, and answer whether
+        the run ended by itself.
+*/
+bool runBurstPair(BurstRig& rig, std::size_t n, BurstTags tags, BurstTags tags2, std::complex<float> second) {
+    gr::Graph flow;
+    auto&     feed  = flow.emplaceBlock<BurstFeed>();
+    feed.n          = n;
+    feed.tags       = std::move(tags);
+    auto& feed2     = flow.emplaceBlock<BurstFeed>();
+    feed2.n         = n;
+    feed2.tags      = std::move(tags2);
+    feed2.value     = second;
+    auto& probe     = flow.emplaceBlock<BurstPairProbe>();
+    probe.target    = &rig.sink;
+    if (!flow.connect<"out", "in">(feed, probe).has_value() || !flow.connect<"out", "in2">(feed2, probe).has_value()) {
         return false;
     }
     const RunEnd end = runToEnd(std::move(flow));
@@ -2636,32 +2689,53 @@ int main(int argc, char** argv) {
         expect(!rig.sink._bursting.load()) << "and no burst is left open";
     });
 
-    cases("sink.uhd-transmits-on-the-one-channel-listed", [] {
+    cases("sink.uhd-feeds-one-or-two-channels", [] {
         using gr::lifecycle::State;
-        // Two channels are refused before the open: the address is one UHD refuses to parse,
-        // and the failure names the list rather than the open.
+        // Two channels with in2 unconnected are refused before the open: the address is one
+        // UHD refuses to parse, and the failure names the list rather than the open.
         expect(fatal(capture::uhd::test::uhdRefusesAddress())) << "UHD's parser refuses the address, so no device is asked for";
-        capture::uhd::Sink two{};
-        two.channels = std::vector<gr::Size_t>{0U, 1U};
-        expect(two.takeChannelSetting().contains("channels lists 2 device channels")) << "a list of two is refused";
-        two.device_parameter = capture::uhd::test::kUnparsedAddress;
-        std::ignore          = two.changeStateTo(State::INITIALISED);
-        const auto started   = two.changeStateTo(State::RUNNING);
+        capture::uhd::Sink unfed{};
+        unfed.channels = std::vector<gr::Size_t>{0U, 1U};
+        expect(unfed.takeChannelSetting().contains("in2 is not connected")) << "two channels need in2";
+        unfed.device_parameter = capture::uhd::test::kUnparsedAddress;
+        std::ignore            = unfed.changeStateTo(State::INITIALISED);
+        const auto started     = unfed.changeStateTo(State::RUNNING);
         expect(fatal(!started.has_value())) << "the start fails";
-        expect(started.error().message.contains("the sink feeds one") && !started.error().message.contains("uhd make")) << started.error().message;
-        expect(!two.deviceUp() && two._stream == nullptr) << "with no streamer built";
+        expect(started.error().message.contains("in2 is not connected") && !started.error().message.contains("uhd make")) << started.error().message;
+        expect(!unfed.deviceUp() && unfed._stream == nullptr) << "with no streamer built";
+
+        capture::uhd::Sink               fed{};
+        gr::PortOut<std::complex<float>> feed2;
+        expect(fatal(feed2.connect(fed.in2).has_value())) << "in2 has a writer";
+        expect(fed.takeChannelSetting().contains("in2 is connected")) << "a connected in2 needs a second channel";
+        fed.channels = std::vector<gr::Size_t>{0U, 1U, 2U};
+        expect(fed.takeChannelSetting().contains("channels lists 3 device channels")) << "three channels are refused";
+        fed.channels = std::vector<gr::Size_t>{1U, 1U};
+        expect(fed.takeChannelSetting().contains("twice")) << "and so is a channel listed twice";
+        fed.channels = std::vector<gr::Size_t>{1U, 0U};
+        expect(fed.takeChannelSetting().empty()) << "two channels with in2 connected are taken, in either order";
+        const auto               stream = std::make_shared<StreamStandIn>();
+        std::vector<std::size_t> asked;
+        expect(fed.armAfterReferenceWait([&](const ::uhd::stream_args_t& args) -> ::uhd::tx_streamer::sptr {
+            asked = args.channels;
+            return stream;
+        }).empty());
+        expect(asked == std::vector<std::size_t>{1UZ, 0UZ}) << "one streamer is built on both, in the order listed";
+        expect(fed._ring2.buf.size() == fed._ring.buf.size()) << "and the second channel's queue is the first's size";
+        fed.stop();
+        capture::uhd::awaitReleases();
 
         // The second channel alone is the one the streamer is built on.
         capture::uhd::Sink side{};
         side.channels = std::vector<gr::Size_t>{1U};
         expect(side.takeChannelSetting().empty()) << "one channel is taken";
-        const auto               stream = std::make_shared<StreamStandIn>();
-        std::vector<std::size_t> asked;
+        asked.clear();
         expect(side.armAfterReferenceWait([&](const ::uhd::stream_args_t& args) -> ::uhd::tx_streamer::sptr {
             asked = args.channels;
             return stream;
         }).empty());
         expect(asked == std::vector<std::size_t>{1UZ}) << "the streamer is built on device channel 1";
+        expect(side._ring2.buf.size() == 1UZ) << "with no second queue";
         side.stop();
         capture::uhd::awaitReleases();
 
@@ -2675,6 +2749,39 @@ int main(int argc, char** argv) {
         expect(asked == std::vector<std::size_t>{0UZ}) << "and the default list builds it on channel 0";
         plain.stop();
         capture::uhd::awaitReleases();
+    });
+
+    cases("sink.uhd-two-channels-send-together", [] {
+        /*| frame: in carries 0.5 and in2 0.25j, with the burst tags on in2 alone. The send
+                that carries them is one for both channels, so the tags shape it as they would
+                on in.
+        */
+        constexpr std::size_t       kSamples = 1500UZ;
+        constexpr std::int64_t      kTimeNs  = 1'720'000'000'123'456'789LL;
+        const std::complex<float>   second{0.0f, 0.25f};
+        BurstRig                    rig(65536UZ, 2UZ);
+        rig.startDrain();
+        const BurstTags tags2{{300UZ, {{"tx_time", kTimeNs}}}, {899UZ, burstEnd()}, {1499UZ, burstEnd()}};
+        expect(runBurstPair(rig, kSamples, {}, tags2, second)) << "the stream ends and the run returns";
+        expect(rig.waitFor(kSamples, 2UZ)) << "the drain sends every sample and both ends";
+        const auto sends = rig.stream->sends();
+        expectBurstSends("tags on in2", sends, kSamples, {899UZ, 1499UZ}, {{300UZ, kTimeNs}});
+        for (const BurstStream::Send& send : sends) {
+            expect(send.channels == 2UZ) << std::format("the send at {} carries both channels", send.first);
+            if (send.fromQueue) {
+                expect(send.secondInPlace && send.secondEven && send.secondValue == second) << std::format("the send at {} reads in2's samples from the second queue at its own position", send.first);
+            }
+        }
+
+        // An end counts as acknowledged once both chains have acknowledged it.
+        using Code = ::uhd::async_metadata_t::event_code_t;
+        rig.sink.countAsyncEvent(Code::EVENT_CODE_BURST_ACK, 0UZ);
+        expect(rig.sink.burstAcks() == 0UZ) << "one chain's acknowledgment is half of one end";
+        rig.sink.countAsyncEvent(Code::EVENT_CODE_BURST_ACK, 1UZ);
+        expect(rig.sink.burstAcks() == 1UZ) << "the other chain's completes it";
+        capture::uhd::Sink one{};
+        one.countAsyncEvent(Code::EVENT_CODE_BURST_ACK, 1UZ);
+        expect(one.burstAcks() == 1UZ) << "with one channel, an acknowledgment from either chain counts";
     });
 
     return cases.report();

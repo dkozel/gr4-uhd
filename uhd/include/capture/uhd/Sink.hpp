@@ -25,6 +25,7 @@
 #include <uhd/usrp/multi_usrp.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -78,8 +79,10 @@ struct Sink : gr::Block<Sink> {
     using Description = gr::Doc<R"(USRP sink via libuhd.
 fc32 host samples over the sc16 or sc8 wire format, clipped to full scale 1.0 before they
 reach the wire. The setting names are the USRP source's, with the tx_ prefix where a
-transmitter carries the thing, so one caller drives both directions identically. The device
-list asks libuhd with use_dpdk=1 where CAPTURE_UHD_USE_DPDK is set in the environment.
+transmitter carries the thing, so one caller drives both directions identically. in feeds the
+first device channel the channels setting lists, and in2 the second where it lists two; in2 is
+connected exactly when two channels are listed. The device list asks libuhd with use_dpdk=1
+where CAPTURE_UHD_USE_DPDK is set in the environment.
 
 Three tags on the input mark transmit bursts. A send ends at a sample tagged tx_eob = true
 and carries end_of_burst. The first send after an end carries start_of_burst, and tx_sob asks
@@ -90,9 +93,11 @@ sample. It ends the burst at the last sample the block staged. When the device h
 taken that sample, a send of one zero sample carries end_of_burst. Under a stop request the
 end of the stream ends no burst, and the stop ends the burst itself. The block ignores a
 tx_eob that is not a bool and a tx_time that is not an integer from 0 to 2^63 - 1. It
-reports the first such tag of a run on its message port. Other tags are ignored.)">;
+reports the first such tag of a run on its message port. Other tags are ignored. With two
+channels one send carries both, so a burst tag on either input marks the burst on both.)">;
 
-    gr::PortIn<std::complex<float>> in;
+    gr::PortIn<std::complex<float>>               in;
+    gr::PortIn<std::complex<float>, gr::Optional> in2;
 
     static constexpr const char* kDevice = "uhd"; // the family name a device listing and a probe carry
     static constexpr std::string_view kTxEob  = "tx_eob";  // the burst ends at this sample
@@ -114,19 +119,29 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     gr::Annotated<std::vector<double>, "frequency", gr::Unit<"Hz">, gr::Visible, gr::Doc<"center frequency">>         frequency = std::vector<double>{kDefaultFrequencyHz};
     gr::Annotated<std::vector<double>, "tx_gains", gr::Unit<"dB">, gr::Visible, gr::Doc<"overall transmit gain">>     tx_gains  = std::vector<double>{0.0};
     gr::Annotated<double, "frequency_correction", gr::Unit<"ppm">, gr::Doc<"reference error in parts per million">>   frequency_correction = 0.0;
-    gr::Annotated<std::vector<std::string>, "tx_antennae", gr::Doc<"transmit connector name">>                       tx_antennae;
+    gr::Annotated<std::vector<std::string>, "tx_antennae", gr::Doc<"transmit connector per listed channel, or one for all">> tx_antennae;
     /*| contract: read by start() alone, which writes it before it reads the transmit surface
             and builds the streamer. A write while streaming applies at the next start.
         verified-by: uhd.transmit-side
     */
     gr::Annotated<std::string, "subdev", gr::Doc<"transmit frontend as a subdevice spec, 'A:A'; empty keeps the device's">> subdev;
-    /*| contract: read by start() alone. in feeds the one device channel listed, and every
-            control call and read-back names that channel. A start refuses a list of other than
-            one channel before it opens the device, and a channel the device does not offer
-            under the subdevice spec in force after the open, before any stream is built.
-        verified-by: sink.uhd-transmits-on-the-one-channel-listed
+    /*| contract: read by start() alone. One streamer carries the device channels listed, the
+            first fed from in and the second from in2. A start refuses, before it opens the
+            device, a list of no channel or of three, a channel listed twice, a connected in2
+            with one channel listed and two channels with in2 unconnected. It refuses after the
+            open a channel the device does not offer under the subdevice spec in force, before
+            any stream is built.
+        contract: the sample rate, the frequency, the overall and element gain and the filter
+            apply to every listed channel alike, as the source applies them, and the first
+            channel answers every read-back and the surface. tx_antennae names a connector per
+            listed channel in the same order, and a single name applies to all of them.
+        why: a B210's two transmit chains share one local oscillator and one converter clock,
+            as its two receive chains do.
+        verified-by: sink.uhd-feeds-one-or-two-channels
+        verified-by: sink.uhd-two-channels-send-together
+        verified-by: uhd.tx-two-channels
     */
-    gr::Annotated<std::vector<gr::Size_t>, "channels", gr::Doc<"device channel fed from in">> channels = std::vector<gr::Size_t>{0U};
+    gr::Annotated<std::vector<gr::Size_t>, "channels", gr::Doc<"device channels fed from in and in2">> channels = std::vector<gr::Size_t>{0U};
     // The seven settings below are read by start() alone; withDeviceArgs states why.
     gr::Annotated<std::string, "wire_format", gr::Doc<"'sc16' or 'sc8'">>                                             wire_format  = std::string("sc16");
     gr::Annotated<std::string, "clock_source", gr::Doc<"reference the device is disciplined by">>                     clock_source;
@@ -146,7 +161,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     gr::Annotated<double, "thread_priority", gr::Doc<"transmit thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
     gr::Annotated<double, "cpu", gr::Doc<"transmit thread's processor; -1 keeps the system's choice">>                cpu             = -1.0;
 
-    GR_MAKE_REFLECTABLE(Sink, in, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, tx_antennae, subdev, channels, wire_format, clock_source, time_source, master_clock_rate,
+    GR_MAKE_REFLECTABLE(Sink, in, in2, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, tx_antennae, subdev, channels, wire_format, clock_source, time_source, master_clock_rate,
                         send_frame_size, num_send_frames, send_buff_size, queue_duration, queue_max_bytes, thread_priority, cpu);
 
     // The longest one send may block. It is longer than any chunk the drain hands over, so a
@@ -190,9 +205,14 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     // The answer of one attempt to end a burst: no burst was open, the end was placed, or the
     // send placed nothing and the carrier stays up.
     enum class EndOfBurst { NoneOpen, Placed, NotPlaced };
-    // What the device's asynchronous channel carried beside the gaps, counted since the run
-    // started: burst acknowledgments, packets lost on the link and packets that arrived late.
-    std::atomic<std::uint64_t> _burstAcks{0};
+    /*| role: what the device's asynchronous channel carried beside the gaps, counted since the
+            run started: burst acknowledgments, packets lost on the link and packets that
+            arrived late.
+        frame: the acknowledgments are counted by the radio chain the message names, the
+            channel field of the message. A B2xx fills it with the index of the transmit chain
+            that sent it, whatever the streamer's own channel order is.
+    */
+    std::array<std::atomic<std::uint64_t>, kMaxChannels> _burstAcksOn{};
     std::atomic<std::uint64_t> _sequenceErrors{0};
     std::atomic<std::uint64_t> _latePackets{0};
     std::atomic<std::uint64_t> _endsPlaced{0};       // ends of burst placed since the run started
@@ -226,10 +246,11 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     RingStorage<std::complex<float>>       _queueSpare;
     mutable SensorNames                    _sensorNames;              // timed at the first sweep of a run
     mutable bool                           _sensorNamesTaken = false; // whether that sweep has kept them
-    std::size_t                            _channel          = 0UZ; // the device channel in feeds, written by start() before the device opens
+    std::vector<std::size_t>               _channels{0UZ};          // the device channels in and in2 feed, written by start() before the device opens
+    std::atomic<std::size_t>               _channelCount{1UZ};      // their count, for a reader on another thread
     std::atomic<double>                    _refLockWaitMs{0.0};
     std::optional<double>                  _freqWrittenHz, _rateWrittenHz, _gainWrittenDb, _bwWrittenHz;
-    std::optional<std::string>             _antennaWritten;
+    std::optional<std::vector<std::string>> _antennaWritten;
 
     /*| invariant: the ring is declared before the threads that index it. Members are
             destroyed in reverse declaration order, so a buffer declared after a ConsumerThread
@@ -237,6 +258,14 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             the guard swallows — leaves the drain reading storage that has gone.
     */
     SpscRing<std::complex<float>> _ring{1UZ << 19};
+    /*| role: the second channel's samples, at the ring indices of the first channel's.
+        invariant: with two channels listed, its storage is the size of the ring's own and is
+            resized with it, and the ring's head and tail index both. The work call writes a
+            span here before it publishes the head that covers the span. With one channel it
+            holds a single element no one reads.
+    */
+    SpscRing<std::complex<float>> _ring2{1UZ};
+    RingStorage<std::complex<float>> _queueSpare2; // the second channel's _queueSpare
     /*| invariant: the ring's capacity, published where a reader can see it. A rate change
             replaces the ring's storage, so a reading taken on a third thread asks this rather
             than asking the vector being reassigned how large it is.
@@ -288,11 +317,11 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             reads it without _ctrlMutex. */
     std::vector<ControlDesc> controlSurface() {
         const SurfaceValues v = _surfaceValues.read();
-        return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0}, v.filterHz, v.clockHz, v.wireFormat);
+        return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0}, v.filterHz, v.clockHz, v.wireFormat, v.channelCount);
     }
 
     // Hand the values controlSurface() reads to the snapshot. The caller holds _ctrlMutex.
-    void publishSurfaceLocked() { _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz, .wireFormat = _wireFormat}); }
+    void publishSurfaceLocked() { _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz, .wireFormat = _wireFormat, .channelCount = _channels.size()}); }
 
     /*| contract: the value one control holds, in the unit its descriptor states: the filter the
             device settled on, and a gain element's gain read back from the device. Nothing for
@@ -309,7 +338,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             return std::nullopt;
         }
         try {
-            return _usrp->get_tx_gain(id, _channel);
+            return _usrp->get_tx_gain(id, _channels.front());
         } catch (const std::exception&) {
             return std::nullopt;
         }
@@ -335,20 +364,25 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     */
     static bool probeTruth(const std::string& kwargs, double sampleRateHz, DeviceTruth& truth) { return capture::uhd::probeTruth(kwargs, sampleRateHz, truth, Direction::Transmit, "uhd::Sink"); }
 
-    // Read one open device's transmit surface into truth, replacing it.
-    /*| contract: take the device channel the channels setting names as the one in feeds, or
-            answer why the list is refused and keep the channel in force. Called by start()
-            before the open.
-        verified-by: sink.uhd-transmits-on-the-one-channel-listed
+    /*| contract: take the device channels the channels setting lists as the ones in and in2
+            feed, or answer why the list is refused and keep the channels in force. Called by
+            start() before the open. channelsRefusal states the lists it takes, and two channels
+            with in2 unconnected are refused as well: the second channel has no samples to send.
+        verified-by: sink.uhd-feeds-one-or-two-channels
     */
     std::string takeChannelSetting() {
-        if (channels->size() != 1UZ) {
-            return std::format("channels lists {} device channels; the sink feeds one", channels->size());
+        if (const auto refusal = channelsRefusal(channels.value, in2.isConnected(), "in2"); refusal.has_value()) {
+            return *refusal;
         }
-        _channel = channels->front();
+        if (channels->size() > 1UZ && !in2.isConnected()) {
+            return std::format("channels lists {} device channels, and in2 is not connected", channels->size());
+        }
+        _channels.assign(channels->begin(), channels->end());
+        _channelCount.store(_channels.size(), std::memory_order_release);
         return {};
     }
 
+    // Read one open device's transmit surface into truth, replacing it.
     static void readTruthInto(::uhd::usrp::multi_usrp& usrp, DeviceTruth& truth, std::size_t channel = 0UZ) { capture::uhd::readTruthInto(usrp, truth, Direction::Transmit, channel); }
 
     /*| contract: the transmit control surface from probed truth — the gain elements, the
@@ -364,7 +398,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             or where empty ctx.wireFormat, the one an unstarted block holds staged or set.
     */
     static std::vector<ControlDesc> describeControls(const DeviceTruth& t, const TruthContext& ctx, double heldBandwidthHz = 0.0, std::optional<double> clockInForceHz = std::nullopt,
-                                                     std::string_view wireFormat = {}) {
+                                                     std::string_view wireFormat = {}, std::size_t channelCount = 1UZ) {
         std::vector<ControlDesc> out = gainElementControls(t);
         /*| frame: the connector, as an index into the device's own list. A model with one port
                 states one entry, which a caller draws as a single choice rather than as a
@@ -387,7 +421,8 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (auto bandwidth = bandwidthControl(t, ctx, heldBandwidthHz); bandwidth.has_value()) {
             out.push_back(std::move(*bandwidth));
         }
-        appendLadderAndCoverage(out, t, clockInForceHz.value_or(clockInForceAtOpen(::uhd::device_addr_t(ctx.deviceParams), t)), validWireFormat(std::string(wireFormat.empty() ? std::string_view(ctx.wireFormat) : wireFormat)), kDefaultRateHz, kDefaultFrequencyHz);
+        appendLadderAndCoverage(out, t, clockInForceHz.value_or(clockInForceAtOpen(::uhd::device_addr_t(ctx.deviceParams), t)), validWireFormat(std::string(wireFormat.empty() ? std::string_view(ctx.wireFormat) : wireFormat)), kDefaultRateHz, kDefaultFrequencyHz,
+                                channelCount);
         return out;
     }
 
@@ -553,10 +588,18 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     std::uint64_t unsentAtStopSamples() const { return _counters.unsentAtStop.load(std::memory_order_relaxed); }
 
     /*| contract: ends of burst the device acknowledged since the run started: one per burst whose
-            last sample left the radio, a pause, a rate change and a stop each ending one.
+            last sample left the radio, a pause, a rate change and a stop each ending one. With
+            two channels an end counts once both chains have acknowledged it, and with one
+            channel every acknowledgment counts, whichever chain it names.
+        why: each transmit chain of a stream acknowledges an end of burst on its own.
         verified-by: sink.uhd-counts-the-burst-acknowledgment
+        verified-by: sink.uhd-two-channels-send-together
     */
-    std::uint64_t burstAcks() const { return _burstAcks.load(std::memory_order_acquire); }
+    std::uint64_t burstAcks() const {
+        const std::uint64_t first  = _burstAcksOn[0].load(std::memory_order_acquire);
+        const std::uint64_t second = _burstAcksOn[1].load(std::memory_order_acquire);
+        return _channelCount.load(std::memory_order_acquire) > 1UZ ? std::min(first, second) : first + second;
+    }
 
     /*| contract: what the device said about the end of burst the last stop placed: NoneOpen where
             no burst was open at the stop, Acknowledged where the stop's own acknowledgment
@@ -781,7 +824,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             named = _sensorNamesTaken;
         }
         if (!named) {
-            names = sensorNamesOf(usrp, Direction::Transmit, "uhd::Sink", kFirstSweepSensorLimitMs, live, _channel);
+            names = sensorNamesOf(usrp, Direction::Transmit, "uhd::Sink", kFirstSweepSensorLimitMs, live, _channels.front());
             CtrlGuard guard(_ctrlMutex, _deviceUp, kStatusWait);
             if (!guard) {
                 return false;
@@ -813,7 +856,9 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         _rateBreak.store(false, std::memory_order_release);
         _drainParked.store(false, std::memory_order_release);
         _refLockWaitMs.store(0.0, std::memory_order_release);
-        _burstAcks.store(0, std::memory_order_release);
+        for (auto& acks : _burstAcksOn) {
+            acks.store(0, std::memory_order_release);
+        }
         _sequenceErrors.store(0, std::memory_order_relaxed);
         _latePackets.store(0, std::memory_order_relaxed);
         _endsPlaced.store(0, std::memory_order_release);
@@ -880,10 +925,10 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             failure = applySubdevSpec(*_usrp, Direction::Transmit, subdev.value);
             try {
                 if (failure.empty()) {
-                    failure = channelsRefusal(channels.value, false, "", _usrp->get_tx_num_channels()).value_or(std::string{});
+                    failure = channelsRefusal(channels.value, in2.isConnected(), "in2", _usrp->get_tx_num_channels()).value_or(std::string{});
                 }
                 if (failure.empty()) {
-                    readTruthInto(*_usrp, _openTruth, _channel);
+                    readTruthInto(*_usrp, _openTruth, _channels.front());
                 }
             } catch (const std::exception& e) {
                 /*| invariant: caught here rather than left to escape, so the device is released
@@ -895,7 +940,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             }
             publishSurfaceLocked();
             if (failure.empty()) {
-                failure = configureOpenDeviceLocked([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", std::span<const std::size_t>(&_channel, 1UZ)); });
+                failure = configureOpenDeviceLocked([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", _channels); });
             }
         }
         if (!failure.empty()) {
@@ -938,8 +983,9 @@ reports the first such tag of a run on its message port. Other tags are ignored.
 
     /*| contract: the start's steps behind the reference wait, the caller holding _startMutex:
             nothing where a stop ended the wait or took the handle, and otherwise the streamer
-            makeStream builds under _ctrlMutex, the queue sized for its maximum send, deviceUp()
-            raised, and the asynchronous thread and the drain started. makeStream answers no
+            makeStream builds under _ctrlMutex, a retune where the build moved the master clock as
+            streamMovedClock states, the queue sized for its maximum send, deviceUp() raised,
+            and the asynchronous thread and the drain started. makeStream answers no
             streamer where the block holds no handle. Answers the failure the streamer build
             met, or an empty string.
         why: a stop that ended the wait has lowered referenceWaitLive() and waits on _startMutex
@@ -959,10 +1005,15 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         try {
             std::lock_guard      lock(_ctrlMutex);
             ::uhd::stream_args_t args("fc32", _wireFormat);
-            args.channels = {_channel};
-            _stream       = makeStream(args);
+            args.channels      = _channels;
+            const double clock = _usrp == nullptr ? 0.0 : masterClockOf(*_usrp);
+            _stream            = makeStream(args);
             if (_stream == nullptr) {
                 return {};
+            }
+            if (_usrp != nullptr && streamMovedClock(clock, masterClockOf(*_usrp))) {
+                _freqWrittenHz.reset(); // the tune made at the earlier clock is off the center
+                std::ignore = applyFrequencyLocked();
             }
             _maxSendSamples  = _stream->get_max_num_samps();
             _deviceHeldBytes = deviceHeldBytesFor(openAddress());
@@ -978,6 +1029,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         */
         try {
             resizeRing(_ring, want);
+            resizeRing(_ring2, secondQueueSamples(want));
         } catch (const std::exception& e) {
             return std::format("uhd tx queue of {} samples: {}", want, e.what());
         }
@@ -1125,29 +1177,48 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             them at the device's pace. The clip and the copy into the queue are one pass, the
             only one the block makes over the samples before send() reads the queue in place.
     */
-    gr::work::Status processBulk(gr::InputSpanLike auto& input) noexcept {
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::InputSpanLike auto& input2) noexcept {
+        if (input2.isConnected) {
+            return stageBulk(input, input2);
+        }
+        return stageBulk(input);
+    }
+
+    /*| contract: the work call's body over in's span and, with two channels, in2's: stage the
+            samples both spans hold that the ring has room for, the second span's into the second
+            channel's queue at the same indices, and consume that many from each.
+    */
+    gr::work::Status stageBulk(gr::InputSpanLike auto& input, gr::InputSpanLike auto&... second) noexcept {
         if (!_deviceUp.load(std::memory_order_acquire)) {
             std::ignore = input.consume(input.size()); // no streamer behind the ring
+            ((std::ignore = second.consume(second.size())), ...);
             return gr::work::Status::OK;
         }
-        const std::size_t want = input.size();
+        const std::size_t want = std::min({input.size(), second.size()...});
         if (want == 0UZ) {
             return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
         }
         const std::size_t room = std::min(want, ringRoom(_ring));
-        markBurstTags(input, room);
-        const std::size_t take = stage(input.data(), room);
-        std::ignore            = input.consume(take);
+        markBurstTags(room, input, second...);
+        std::size_t take = 0UZ;
+        if constexpr (sizeof...(second) == 0UZ) {
+            take = stage(input.data(), room);
+        } else {
+            take = stage(input.data(), room, second.data()...);
+        }
+        std::ignore = input.consume(take);
+        ((std::ignore = second.consume(take)), ...);
         return take == 0UZ ? gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS : gr::work::Status::OK;
     }
 
-    /*| contract: a tx_eob = true at or past the first sample the block did not consume ends the
-            burst at the last sample staged, as endBurstAtStreamEnd states. Only the input's tag
-            ring holds such a tag: it sits at the end-of-stream index, one past the last sample,
-            and no input span reaches it.
+    /*| contract: a tx_eob = true at or past the first sample the block did not consume, on in or
+            on in2, ends the burst at the last sample staged, as endBurstAtStreamEnd states. Only
+            an input's tag ring holds such a tag: it sits at the end-of-stream index, one past
+            the last sample, and no input span reaches it.
     */
-    gr::work::Status processEpilogue(gr::InputSpanLike auto& input) noexcept {
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& input, gr::InputSpanLike auto& input2) noexcept {
         std::ignore = endBurstAtStreamEnd(in, input.streamIndex);
+        std::ignore = endBurstAtStreamEnd(in2, input2.streamIndex);
         return gr::work::Status::OK;
     }
 
@@ -1198,18 +1269,35 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         wakeDrain();
     }
 
-    /*| contract: mark the burst tags on the first nStaged samples of input, which the caller
-            stages behind this call at the ring's head. A tag the span hands back at a negative
-            index was read by an earlier call and is skipped.
+    /*| contract: mark the burst tags on the first nStaged samples of each span, which the
+            caller stages behind this call at the ring's head. The spans are one per channel and
+            share their sample indices, so a mark from either span applies to the send that
+            carries both. A tag the span hands back at a negative index was read by an earlier
+            call and is skipped.
         verified-by: sink.uhd-a-burst-ends-at-its-tagged-sample
+        verified-by: sink.uhd-two-channels-send-together
     */
-    void markBurstTags(gr::InputSpanLike auto& input, std::size_t nStaged) {
-        const std::size_t head = _ring.head.load(std::memory_order_relaxed);
-        for (const auto& [relIndex, tagMap] : input.tags(nStaged)) {
-            if (relIndex >= 0) {
-                const auto offset = static_cast<std::size_t>(relIndex);
-                addBurstMark(head + offset, input.streamIndex + offset, tagMap.get());
+    void markBurstTags(std::size_t nStaged, gr::InputSpanLike auto&... spans) {
+        const std::size_t      head = _ring.head.load(std::memory_order_relaxed);
+        std::vector<BurstMark> marks;
+        const auto             collect = [&](auto& span) {
+            for (const auto& [relIndex, tagMap] : span.tags(nStaged)) {
+                if (relIndex >= 0) {
+                    const auto offset = static_cast<std::size_t>(relIndex);
+                    if (const auto mark = burstMarkOf(head + offset, span.streamIndex + offset, tagMap.get()); mark.has_value()) {
+                        marks.push_back(*mark);
+                    }
+                }
             }
+        };
+        (collect(spans), ...);
+        if (marks.empty()) {
+            return;
+        }
+        std::ranges::stable_sort(marks, {}, &BurstMark::position);
+        std::lock_guard lock(_burstMutex);
+        for (const BurstMark& mark : marks) {
+            holdBurstMark(mark);
         }
     }
 
@@ -1226,7 +1314,9 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         return false;
     }
 
-    void addBurstMark(std::size_t position, std::size_t streamIndex, const gr::property_map& tagMap) {
+    // The mark a tag at the ring index position puts on its sample, or nothing for a tag that
+    // carries no burst key the block takes.
+    std::optional<BurstMark> burstMarkOf(std::size_t position, std::size_t streamIndex, const gr::property_map& tagMap) {
         BurstMark mark{.position = position, .endsBurst = tagEndsBurst(tagMap, streamIndex), .timeNs = std::nullopt};
         if (const gr::pmt::Value* value = detail::field(tagMap, kTxTime); value != nullptr) {
             mark.timeNs = deviceTimeNs<std::int64_t, std::uint64_t, std::int32_t, std::uint32_t, std::int16_t, std::uint16_t, std::int8_t, std::uint8_t>(*value);
@@ -1235,14 +1325,14 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             }
         }
         if (!mark.endsBurst && !mark.timeNs.has_value()) {
-            return;
+            return std::nullopt;
         }
-        std::lock_guard lock(_burstMutex);
-        holdBurstMark(mark);
+        return mark;
     }
 
     // Add a mark at the back, or merge it into the mark its sample already holds. Marks arrive
-    // in ring order. The caller holds _burstMutex.
+    // in ring order, and a time on the later of two merged marks is the one kept. The caller
+    // holds _burstMutex.
     void holdBurstMark(const BurstMark& mark) {
         if (_burstMarks.empty() || _burstMarks.back().position != mark.position) {
             _burstMarks.push_back(mark);
@@ -1289,14 +1379,28 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     }
 
     /*| contract: clip and copy what the queue has room for out of the n samples at samples, ring
-            the drain's bell where anything went in, and answer how many went in. The caller is
-            the queue's one producer.
+            the drain's bell where anything went in, and answer how many went in. With second
+            given, the same count of the second channel's samples there goes into its queue
+            first, at the same indices. The caller is the queue's one producer.
         why: the bell wakes a drain waiting on an empty queue. The ring costs a fence and a
             load and no system call while the drain is sending.
+        invariant: the second channel's samples are written before the head that covers them is
+            published, so the drain reads both channels' samples behind one acquire of the head.
+            The room is read once: the drain only frees room, so the first channel's write
+            takes the whole count the second's took.
         verified-by: sink.uhd-a-write-wakes-the-waiting-drain
+        verified-by: sink.uhd-two-channels-send-together
     */
-    std::size_t stage(const std::complex<float>* samples, std::size_t n) noexcept {
-        const std::size_t take = writeWhatFitsWith(_ring, samples, n, [](std::complex<float> s) { return clipUnit(s); });
+    std::size_t stage(const std::complex<float>* samples, std::size_t n, const std::complex<float>* second = nullptr) noexcept {
+        const auto clip = [](std::complex<float> s) { return clipUnit(s); };
+        if (second != nullptr && _ring2.buf.size() == _ring.buf.size()) {
+            n                       = std::min(n, ringRoom(_ring));
+            const std::size_t pos   = _ring.head.load(std::memory_order_relaxed) & _ring.mask();
+            const std::size_t first = std::min(n, _ring2.buf.size() - pos);
+            std::transform(second, second + first, _ring2.buf.data() + pos, clip);
+            std::transform(second + first, second + n, _ring2.buf.data(), clip);
+        }
+        const std::size_t take = writeWhatFitsWith(_ring, samples, n, clip);
         if (take > 0UZ) {
             wakeDrain();
         }
@@ -1317,8 +1421,10 @@ reports the first such tag of a run on its message port. Other tags are ignored.
                 rate of another size makes the resize allocate under the mutex instead.
         */
         RingStorage<std::complex<float>> storage;
+        RingStorage<std::complex<float>> storage2;
         if (newSettings.contains("sample_rate")) {
-            storage = queueStorageFor(queueSamplesForRequest());
+            storage  = queueStorageFor(queueSamplesForRequest());
+            storage2 = secondQueueStorageFor(storage);
         }
         std::lock_guard lock(_ctrlMutex);
         if (_usrp == nullptr) {
@@ -1329,8 +1435,10 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         }
         if (newSettings.contains("sample_rate")) {
             _queueSpare.swap(storage);
+            _queueSpare2.swap(storage2);
             std::ignore = applyRateLocked();
             _queueSpare.swap(storage);
+            _queueSpare2.swap(storage2);
         }
         if (newSettings.contains("tx_gains")) {
             applyGainLocked();
@@ -1408,7 +1516,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (_usrp == nullptr) {
             return true;
         }
-        return applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", std::span<const std::size_t>(&_channel, 1UZ)); });
+        return applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", _channels); });
     }
 
     /*| contract: write the rate rateToWrite chooses for the request through write, which answers
@@ -1517,7 +1625,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             signal on the air.
         verified-by: sink.uhd-snaps-the-rate-as-the-source-does
     */
-    double rateToWrite(double requestHz) const { return capture::uhd::rateToWrite(requestHz, _openTruth, _clockInForceHz, _wireFormat, Direction::Transmit, "uhd::Sink"); }
+    double rateToWrite(double requestHz) const { return capture::uhd::rateToWrite(requestHz, _openTruth, _clockInForceHz, _wireFormat, Direction::Transmit, "uhd::Sink", _channels.size()); }
 
     /*| contract: take the clock the open address fixed as the clock in force, so the transmit
             ladder is that clock's. The caller holds _ctrlMutex and has read the truth of the open
@@ -1584,6 +1692,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             return;
         }
         _counters.discardedAtRateChange.fetch_add(static_cast<std::uint64_t>(resizeRingCountingDiscard(_ring, ringWantSamplesLocked(), _queueSpare)), std::memory_order_relaxed);
+        resizeRing(_ring2, secondQueueSamples(_ring.buf.size()), _queueSpare2);
         _ringCapacity.store(_ring.buf.size(), std::memory_order_release);
         dropBurstMarks();
     }
@@ -1591,9 +1700,14 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     // The queue capacity the rate in force asks for, in samples. The caller holds _ctrlMutex.
     std::size_t ringWantSamplesLocked() const { return ringSamplesFor(_rateActualHz, ringFloorSamples(_maxSendSamples), _queueBound); }
 
-    // Read queue_duration and queue_max_bytes into the bound every sizing takes. The caller
-    // holds _ctrlMutex.
-    void takeQueueBoundLocked() { _queueBound = {.seconds = queue_duration, .maxBytes = queue_max_bytes}; }
+    /*| contract: read queue_duration and queue_max_bytes into the bound every sizing takes. The
+            caller holds _ctrlMutex.
+        frame: the bound is one channel's: queue_max_bytes is shared among the listed channels,
+            each queue holding the same samples at the same indices.
+    */
+    void takeQueueBoundLocked() { _queueBound = queueBoundOfSettings(); }
+
+    QueueBound queueBoundOfSettings() const { return {.seconds = queue_duration, .maxBytes = queue_max_bytes / static_cast<double>(std::max(_channels.size(), 1UZ))}; }
 
     // The queue capacity the rate the current request snaps to asks for, in samples. Zero
     // where the control mutex stays busy past the status readers' deadline.
@@ -1602,7 +1716,17 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (!guard) {
             return 0UZ;
         }
-        return ringSamplesFor(rateToWrite(sample_rate), ringFloorSamples(_maxSendSamples), {.seconds = queue_duration, .maxBytes = queue_max_bytes});
+        return ringSamplesFor(rateToWrite(sample_rate), ringFloorSamples(_maxSendSamples), queueBoundOfSettings());
+    }
+
+    // The second channel's queue capacity beside a first of samples: the same with two
+    // channels listed, and one element with one.
+    std::size_t secondQueueSamples(std::size_t samples) const { return _channels.size() > 1UZ ? samples : 1UZ; }
+
+    // Storage for the second channel's queue beside storage for the first's, where two channels
+    // are listed. The caller holds no lock, as for queueStorageFor.
+    RingStorage<std::complex<float>> secondQueueStorageFor(const RingStorage<std::complex<float>>& first) const {
+        return _channels.size() > 1UZ && !first.empty() ? RingStorage<std::complex<float>>(first.size()) : RingStorage<std::complex<float>>{};
     }
 
     // Publish the send cap of the rate in force for the drain. The caller holds _ctrlMutex.
@@ -1664,15 +1788,18 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (!queueOutsizesRate() || !_drainParked.load(std::memory_order_acquire)) {
             return;
         }
-        RingStorage<std::complex<float>> storage = queueStorageFor(_ringWantSamples.load(std::memory_order_acquire));
+        RingStorage<std::complex<float>> storage  = queueStorageFor(_ringWantSamples.load(std::memory_order_acquire));
+        RingStorage<std::complex<float>> storage2 = secondQueueStorageFor(storage);
         CtrlGuard                        guard(_ctrlMutex, _deviceUp, kStatusWait);
         if (!guard || !queueOutsizesRate()) {
             return;
         }
         std::fprintf(stderr, "[uhd::Sink] the queue the refused park left is sized for a faster rate than the %.0f S/s in force; what it holds is discarded\n", _rateActualHz);
         _queueSpare.swap(storage);
+        _queueSpare2.swap(storage2);
         resizeQueueForRateLocked(true);
         _queueSpare.swap(storage);
+        _queueSpare2.swap(storage2);
         _rateBreak.store(false, std::memory_order_release);
         wakeDrain();
     }
@@ -1680,7 +1807,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     // The shared filter write on this block's device. The caller holds _ctrlMutex.
     void applyBandwidthLocked(double hz) {
         if (_usrp != nullptr) {
-            applyBandwidth(*_usrp, Direction::Transmit, hz, _bwWrittenHz, _bwCurHz, "uhd::Sink", std::span<const std::size_t>(&_channel, 1UZ));
+            applyBandwidth(*_usrp, Direction::Transmit, hz, _bwWrittenHz, _bwCurHz, "uhd::Sink", _channels);
             publishSurfaceLocked();
         }
     }
@@ -1688,7 +1815,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     // The shared coverage re-read on this block's device. The caller holds _ctrlMutex.
     void refreshFreqRangesLocked() {
         if (_usrp != nullptr) {
-            refreshFreqRanges(*_usrp, Direction::Transmit, _freqRanges, "uhd::Sink", _channel);
+            refreshFreqRanges(*_usrp, Direction::Transmit, _freqRanges, "uhd::Sink", _channels.front());
         }
     }
 
@@ -1721,10 +1848,12 @@ reports the first such tag of a run on its message port. Other tags are ignored.
                 return false;
             }
             try {
-                _usrp->set_tx_freq(::uhd::tune_request_t(*f), _channel);
+                for (const std::size_t ch : _channels) {
+                    _usrp->set_tx_freq(::uhd::tune_request_t(*f), ch);
+                }
                 _freqWrittenHz = *f;
                 // The read-back carried back into the frame the caller asks in.
-                _appliedFreqHz    = _usrp->get_tx_freq(_channel);
+                _appliedFreqHz    = _usrp->get_tx_freq(_channels.front());
                 _appliedRequestHz = tunedFrequencyFrom(_appliedFreqHz, frequency_correction);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[uhd::Sink] set_tx_freq(%.0f) failed: %s (continuing)\n", *f, e.what());
@@ -1774,33 +1903,44 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             return;
         }
         try {
-            _usrp->set_tx_gain(want, _channel); // overall gain, UHD distributes it across the elements
+            for (const std::size_t ch : _channels) {
+                _usrp->set_tx_gain(want, ch); // overall gain, UHD distributes it across the elements
+            }
             _gainWrittenDb = want;
-            _actualGainDb  = _usrp->get_tx_gain(_channel);
+            _actualGainDb  = _usrp->get_tx_gain(_channels.front());
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Sink] set_tx_gain(%.1f) failed: %s (continuing)\n", want, e.what());
         }
     }
 
+    /*| contract: put each listed channel on the connector antennaPerChannel gives it from
+            tx_antennae, as chooseAntenna picks it from that channel's own list. The first
+            channel's connector is the one the block states.
+    */
     void applyAntennaLocked() {
         if (_usrp == nullptr) {
             return;
         }
-        const std::string wanted = tx_antennae->empty() ? std::string{} : tx_antennae->front();
-        std::string       pick;
+        const auto               wants = antennaPerChannel(tx_antennae.value, _channels.size());
+        std::vector<std::string> picks;
         try {
-            pick = chooseAntenna(_usrp->get_tx_antennas(_channel), wanted);
+            for (std::size_t i = 0UZ; i < _channels.size(); ++i) {
+                picks.push_back(chooseAntenna(_usrp->get_tx_antennas(_channels[i]), wants[i]));
+            }
         } catch (const std::exception&) { // a frontend with one connector and no list
+            return;
         }
-        if (pick.empty() || !writeNeeded(_antennaWritten, pick)) {
+        if (std::ranges::any_of(picks, &std::string::empty) || !writeNeeded(_antennaWritten, picks)) {
             return;
         }
         try {
-            _usrp->set_tx_antenna(pick, _channel);
-            _antennaWritten = pick;
-            _actualAntenna  = _usrp->get_tx_antenna(_channel);
+            for (std::size_t i = 0UZ; i < _channels.size(); ++i) {
+                _usrp->set_tx_antenna(picks[i], _channels[i]);
+            }
+            _antennaWritten = picks;
+            _actualAntenna  = _usrp->get_tx_antenna(_channels.front());
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "[uhd::Sink] set_tx_antenna(%s): %s (continuing)\n", pick.c_str(), e.what());
+            std::fprintf(stderr, "[uhd::Sink] set_tx_antenna(%s): %s (continuing)\n", picks.front().c_str(), e.what());
         }
     }
 
@@ -1926,13 +2066,17 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         }
         const double bounded = boundedGainFor(_openTruth, element, dB, "uhd::Sink");
         try {
-            if (element.empty()) {
-                _usrp->set_tx_gain(bounded, _channel);
-                _gainWrittenDb = bounded;
-            } else {
-                _usrp->set_tx_gain(bounded, element, _channel);
+            for (const std::size_t ch : _channels) {
+                if (element.empty()) {
+                    _usrp->set_tx_gain(bounded, ch);
+                } else {
+                    _usrp->set_tx_gain(bounded, element, ch);
+                }
             }
-            _actualGainDb = _usrp->get_tx_gain(_channel);
+            if (element.empty()) {
+                _gainWrittenDb = bounded;
+            }
+            _actualGainDb = _usrp->get_tx_gain(_channels.front());
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[uhd::Sink] set_tx_gain(%s, %.1f): %s (continuing)\n", element.c_str(), dB, e.what());
             return false;
@@ -1985,8 +2129,9 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             md.start_of_burst = false;
             md.end_of_burst   = true;
             md.has_time_spec  = false;
-            const std::complex<float> nothing{};
-            if (stream->send(&nothing, 1, md, kSendTimeoutS) == 0UZ) {
+            const std::array<std::complex<float>, kMaxChannels> nothing{};
+            const std::array<const void*, kMaxChannels>         buffs{&nothing[0], &nothing[1]};
+            if (stream->send(::uhd::tx_streamer::buffs_type(buffs.data(), sendChannels()), 1, md, kSendTimeoutS) == 0UZ) {
                 _bursting.store(true, std::memory_order_release);
                 std::fprintf(stderr, "[uhd::Sink] the end of burst was not placed after %.0f s; the carrier stays up\n", kSendTimeoutS);
                 return EndOfBurst::NotPlaced;
@@ -2198,7 +2343,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
             }
             const std::size_t pos   = tail & _ring.mask();
             const BurstSend   burst = nextBurstSend(tail, std::min({have, _sendCapSamples.load(std::memory_order_acquire), _ring.buf.size() - pos}));
-            const bool        sent  = sendChunk(stream, _ring.buf.data() + pos, burst.n, burst.endsBurst, burst.timeNs);
+            const bool        sent  = sendChunk(stream, pos, burst.n, burst.endsBurst, burst.timeNs);
             const bool        owed  = retireBurstMarks(tail, burst);
             if (!sent) {
                 _drainDead.store(true, std::memory_order_release);
@@ -2272,16 +2417,20 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         }
     }
 
-    /*| contract: place the n samples at samples on the streamer, opening a burst where none is
-            open. endsBurst ends the burst at the last of them, counted as an end placed. timeNs
-            times the first of them on the device clock. False where the device stopped taking
-            them, which is a send that timed out or threw. The burst flag is written where the
-            call opens a burst and where it ends one.
+    // The channels one send carries: those listed, at most two.
+    std::size_t sendChannels() const { return std::min(_channels.size(), kMaxChannels); }
+
+    /*| contract: place the n samples at the queue position pos on the streamer, each listed
+            channel's from its own queue, opening a burst where none is open. endsBurst ends
+            the burst at the last of them, counted as an end placed. timeNs times the first of
+            them on the device clock. False where the device stopped taking them, which is a
+            send that timed out or threw. The burst flag is written where the call opens a
+            burst and where it ends one.
         frame: a send UHD returns short is finished by further sends of the rest, which carry
             neither the start nor the time and carry the end of burst where the first asked
             for it.
     */
-    bool sendChunk(const ::uhd::tx_streamer::sptr& stream, const std::complex<float>* samples, std::size_t n, bool endsBurst = false, std::optional<std::int64_t> timeNs = std::nullopt) {
+    bool sendChunk(const ::uhd::tx_streamer::sptr& stream, std::size_t pos, std::size_t n, bool endsBurst = false, std::optional<std::int64_t> timeNs = std::nullopt) {
         std::lock_guard    send(_sendMutex);
         ::uhd::tx_metadata_t md;
         md.start_of_burst = !_bursting.load(std::memory_order_acquire);
@@ -2290,10 +2439,16 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (timeNs.has_value()) {
             md.time_spec = ::uhd::time_spec_t::from_ticks(*timeNs, 1e9);
         }
+        const std::size_t                                   channels = sendChannels();
+        std::array<const std::complex<float>*, kMaxChannels> from{_ring.buf.data() + pos, nullptr};
+        if (channels > 1UZ) {
+            from[1] = _ring2.buf.data() + pos;
+        }
         std::size_t done = 0UZ;
         try {
             while (done < n) {
-                const std::size_t sent = stream->send(samples + done, n - done, md, kSendTimeoutS);
+                const std::array<const void*, kMaxChannels> buffs{from[0] + done, channels > 1UZ ? from[1] + done : nullptr};
+                const std::size_t                           sent = stream->send(::uhd::tx_streamer::buffs_type(buffs.data(), channels), n - done, md, kSendTimeoutS);
                 if (sent == 0UZ) {
                     std::fprintf(stderr, "[uhd::Sink] the send timed out after %.0f s; the device stopped taking samples\n", kSendTimeoutS);
                     return false;
@@ -2317,20 +2472,22 @@ reports the first such tag of a run on its message port. Other tags are ignored.
     }
 
     /*| contract: count one message of the device's asynchronous channel, one count per kind it
-            carries: a gap, a lost packet, a late packet, a burst acknowledgment.
+            carries: a gap, a lost packet, a late packet, a burst acknowledgment. chain is the
+            transmit chain the message names, which counts the acknowledgments apart.
         frame: the device raises an underflow when the host stopped feeding it, an
             underflow-in-packet when a packet ran out mid-way, a sequence error in or out of a
             burst when a packet never arrived, a time error when a packet arrived after the time
             it carried, and a burst acknowledgment when the last sample of a burst left the
-            radio.
+            radio. Each chain of a two-channel stream sends its own message, so a gap there
+            counts once per chain.
         trap: the codes are bit flags and one message can carry several. Compared for equality,
             a message carrying two flags counts as neither.
         verified-by: sink.uhd-counts-transmit-events-by-bit
     */
-    void countAsyncEvent(::uhd::async_metadata_t::event_code_t code) {
+    void countAsyncEvent(::uhd::async_metadata_t::event_code_t code, std::size_t chain = 0UZ) {
         using Md = ::uhd::async_metadata_t;
         if ((code & Md::EVENT_CODE_BURST_ACK) != 0) {
-            _burstAcks.fetch_add(1, std::memory_order_acq_rel);
+            _burstAcksOn[std::min(chain, kMaxChannels - 1UZ)].fetch_add(1, std::memory_order_acq_rel);
         }
         if ((code & (Md::EVENT_CODE_UNDERFLOW | Md::EVENT_CODE_UNDERFLOW_IN_PACKET)) != 0) {
             _counters.underrunEvents.fetch_add(1, std::memory_order_relaxed);
@@ -2353,7 +2510,7 @@ reports the first such tag of a run on its message port. Other tags are ignored.
         if (!channel.recv_async_msg(md, timeoutS)) {
             return false;
         }
-        countAsyncEvent(md.event_code);
+        countAsyncEvent(md.event_code, md.channel);
         return true;
     }
 
