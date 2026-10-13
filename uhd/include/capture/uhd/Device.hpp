@@ -949,7 +949,8 @@ double masterClockOf(Usrp& usrp) {
 }
 
 /*| contract: whether building a streamer moved the master clock: both reads above zero and more
-        than a hertz apart. A block retunes its channels where it did, before the stream starts.
+        than a hertz apart. Where it did, a block writes again what the clock change resets,
+        before the stream starts: its tune, its analog filter and a receiver's gain control.
     why: UHD 4.9's B2xx picks its automatic clock for the channels a streamer carries, and a
         rate written before any streamer exists is taken for one channel. A streamer of two
         channels then moves the clock, 32 to 16 MHz at 2 MS/s, and the radio leaves the center
@@ -998,11 +999,13 @@ inline double rateToWrite(double requestHz, const DeviceTruth& truth, double clo
     return picked;
 }
 
-// What a rate write left on the device: whether the write went through, and the rate the
-// device answers afterwards, zero where it could not be asked either.
+// What a rate write left on the device: whether the write went through, the rate the device
+// answers afterwards, zero where it could not be asked either, and why a channel's write was
+// not made, empty where every channel was written.
 struct RateWrite {
-    bool   landed = false;
-    double heldHz = 0.0;
+    bool        landed = false;
+    double      heldHz = 0.0;
+    std::string refusal{};
 };
 
 /*| contract: write a rate through write and read what the device holds through readBack, each
@@ -1051,23 +1054,39 @@ constexpr bool rateWriteSettled(const RateWrite& written) { return written.lande
 constexpr bool filterFollowsRate(const RateWrite& written, double bwMinHz, double bwMaxHz) { return rateWriteSettled(written) && bwMaxHz > bwMinHz; }
 
 /*| contract: the same write on one open device, the direction choosing the receive or the
-        transmit call. The rate goes to every channel listed, and the first of them answers the
-        read-back.
+        transmit call. The rate goes to every channel listed, one at a time, and the first of
+        them answers the read-back. guard(at, hz) runs before the write of channels[at] and
+        answers why that write must not be made, or an empty string. A refusal ends the writes
+        there, and the result carries it and states the rate as not landed.
+    why: UHD takes each channel's write beside the rates every other channel holds at that
+        moment, the channels this block wrote a moment before included, so the check has to
+        run before each write and not once for the block.
+    verified-by: controls.uhd-a-two-channel-rate-write-is-checked-before-each-channel
 */
-template <typename Usrp>
-RateWrite writeRate(Usrp& usrp, Direction dir, double hz, std::string_view blockTag, std::span<const std::size_t> channels = kFirstChannel) {
-    return writeRateWith(
+template <typename Usrp, typename Guard = decltype([](std::size_t, double) { return std::string{}; })>
+RateWrite writeRate(Usrp& usrp, Direction dir, double hz, std::string_view blockTag, std::span<const std::size_t> channels = kFirstChannel, Guard&& guard = {}) {
+    std::string refusal;
+    RateWrite   out = writeRateWith(
         hz,
-        [&usrp, dir, channels](double r) {
-            for (const std::size_t ch : channels) {
+        [&usrp, dir, channels, &guard, &refusal](double r) {
+            for (std::size_t at = 0UZ; at < channels.size(); ++at) {
+                refusal = guard(at, r);
+                if (!refusal.empty()) {
+                    return;
+                }
                 if (dir == Direction::Receive) {
-                    usrp.set_rx_rate(r, ch);
+                    usrp.set_rx_rate(r, channels[at]);
                 } else {
-                    usrp.set_tx_rate(r, ch);
+                    usrp.set_tx_rate(r, channels[at]);
                 }
             }
         },
         [&usrp, dir, channels] { return dir == Direction::Receive ? usrp.get_rx_rate(channels.front()) : usrp.get_tx_rate(channels.front()); }, dir, blockTag);
+    if (!refusal.empty()) {
+        out.landed  = false;
+        out.refusal = std::move(refusal);
+    }
+    return out;
 }
 
 /*| contract: the entry an enum control's value selects out of a list of count options, and
@@ -1574,6 +1593,8 @@ constexpr bool ownerCountMeasured(std::string_view model) { return model.starts_
         keys, and the device runs the first open's master clock. A block on such a handle writes
         no reference or timing selection either: the device's selection belongs to the handle
         that opened it, and the start compares its own settings with what the device runs.
+    trap: a probe of the control surface holds a handle of the same kind for the length of its
+        open, and the count reads it as another block's.
     verified-by: controls.uhd-the-owner-count-is-read-on-a-b2xx-alone
 */
 template <typename Usrp>
@@ -1713,9 +1734,8 @@ std::vector<DspRate> autoClockRates(Usrp& usrp) {
         start fails with this message before UHD is asked. A 2 MS/s receive request beside a
         7.68 MS/s transmit rate passes at the write and is coerced to 1.981935 MS/s, whose
         multiple with 7.68 MS/s overflows when the streamer is built.
-    trap: a block of two channels writes them one at a time, and UHD takes the second write
-        beside the rate the first one landed on. The check before the write takes the request
-        for both channels.
+    frame: writeRate asks before each channel's write, with that channel alone in channels,
+        so a channel the block wrote a moment before counts at the rate it landed on.
     verified-by: controls.uhd-a-rate-pair-past-the-automatic-clock-is-refused
     verified-by: uhd.a-rate-pair-past-the-automatic-clock-fails-the-start
 */
@@ -1741,6 +1761,120 @@ inline std::string autoClockOverflow(double asked, double hz, Direction dir, std
     }
     const std::string rate = std::abs(hz - asked) > 0.5 ? std::format("sample_rate asked {:.0f} Hz runs as {:.0f} Hz", asked, hz) : std::format("sample_rate asked {:.0f} Hz", asked);
     return std::format("{} beside the device's {}; their least common multiple passes the 32 bits UHD's automatic master clock computes it in, and UHD would end the process", rate, beside);
+}
+
+/*| contract: the master clock UHD's B2xx picks for lcmHz, the least common multiple of the
+        rates set, with n channels on a streamer: lcmHz times the largest power of two that
+        keeps it at or below maxHz over n, where a power of two is taken as one once lcmHz
+        reaches minHz. Zero where lcmHz passes maxHz over n, where UHD keeps the clock in force.
+    frame: UHD 4.9's ad936x_manager get_auto_tick_rate, with the converter's clock range for
+        minHz and maxHz.
+    verified-by: controls.uhd-a-rate-that-moves-the-shared-clock-is-refused
+*/
+inline double autoClockChoice(double lcmHz, std::size_t n, double minHz, double maxHz) {
+    const double top = maxHz / static_cast<double>(std::max(n, 1UZ));
+    if (!(lcmHz > 0.0) || lcmHz > top + 0.1) {
+        return 0.0;
+    }
+    std::int32_t multiplier = std::int32_t{1} << static_cast<std::int32_t>(std::log2(top / lcmHz));
+    if (multiplier == 2 && lcmHz >= minHz) {
+        multiplier = 1;
+    }
+    return lcmHz * multiplier;
+}
+
+/*| contract: why the write of hz to channels[at] in direction dir on a shared B2xx would leave
+        the automatic master clock of clockHz unmet or moved, or an empty string. The rates set
+        are read as autoClockRates reads them, and the clock range is the converter's. The
+        overflow autoClockOverflow names comes first. A device whose rates set are all the
+        block's own channels in dir holds no other block's rate, and is not checked.
+    frame: UHD picks the clock for the rates set with as many channels as the widest streamer
+        open on the device, and again for the block's own channel count when its streamer is
+        built. The streamer channel count of another block is not read: it is the count whose
+        choice for the rates set is the clock in force, and both counts where neither or both
+        are. The write and the build are checked here, before anything is written.
+    why: a write that moves the clock moves it under the block that runs on it, and the clock
+        change resets that block's analog filter, its gain control and its tune. A rate the
+        clock does not reach would be coerced and fail the start's comparison after the write.
+    verified-by: controls.uhd-a-rate-that-moves-the-shared-clock-is-refused
+    verified-by: uhd.a-rate-that-moves-the-shared-clock-fails-the-start
+*/
+inline std::string autoClockRefusal(double asked, double hz, Direction dir, std::span<const std::size_t> channels, std::size_t at, std::span<const DspRate> set, double clockHz, double minHz, double maxHz) {
+    const std::size_t channel = channels[at];
+    if (std::string overflow = autoClockOverflow(asked, hz, dir, std::span<const std::size_t>(&channel, 1UZ), set); !overflow.empty()) {
+        return overflow;
+    }
+    const auto ownChannel = [dir, channels](const DspRate& r) { return r.dir == dir && std::ranges::find(channels, r.channel) != channels.end(); };
+    if (!(clockHz > 0.0) || !(maxHz > 0.0) || !(hz > 0.0) || std::ranges::all_of(set, ownChannel)) {
+        return {};
+    }
+    constexpr std::uint64_t kLimit   = std::numeric_limits<std::uint32_t>::max();
+    const auto              whole    = [](double rate) { return static_cast<std::uint64_t>(std::floor(rate + 0.5)); };
+    const auto              multiple = [&](bool withHz, auto&& skip) {
+        std::uint64_t m = withHz ? whole(hz) : 1U;
+        for (const DspRate& r : set) {
+            if (!skip(r) && r.hz > 0.0 && m <= kLimit) {
+                m = std::lcm(m, whole(r.hz));
+            }
+        }
+        return m <= kLimit ? static_cast<double>(m) : 0.0;
+    };
+    const auto close = [clockHz](double hzOf) { return hzOf > 0.0 && std::abs(hzOf - clockHz) <= kRunValueToleranceHz; };
+
+    std::vector<std::size_t> counts;
+    const double             inForce = multiple(false, [](const DspRate&) { return false; });
+    for (const std::size_t n : {1UZ, 2UZ}) {
+        if (close(autoClockChoice(inForce, n, minHz, maxHz))) {
+            counts.push_back(n);
+        }
+    }
+    if (counts.empty()) {
+        counts = {1UZ, 2UZ};
+    }
+    std::string beside;
+    for (const DspRate& r : set) {
+        if (!ownChannel(r) && r.hz > 0.0) {
+            beside += std::format("{}{} rate of {:.0f} Hz", beside.empty() ? "" : " and ", r.dir == Direction::Receive ? "receive" : "transmit", r.hz);
+        }
+    }
+    const std::string holder = "another block in this process holds the device and runs its own clock";
+    const auto        moved  = [&](double to) {
+        return std::format("sample_rate asked {:.0f} Hz on {} channel{} beside the device's {} would move UHD's automatic master clock from {:.0f} Hz to {:.0f} Hz; {}", asked, channels.size(), channels.size() == 1UZ ? "" : "s", beside,
+                                   clockHz, to, holder);
+    };
+    const double written = multiple(true, [dir, channel](const DspRate& r) { return r.dir == dir && r.channel == channel; });
+    const double built   = multiple(true, ownChannel);
+    for (const std::size_t n : counts) {
+        if (const double to = autoClockChoice(written, n, minHz, maxHz); !(to > 0.0)) {
+            return std::format("sample_rate asked {:.0f} Hz beside the device's {} is not met at the {:.0f} Hz master clock in force; {}", asked, beside, clockHz, holder);
+        } else if (!close(to)) {
+            return moved(to);
+        }
+        if (const double to = autoClockChoice(built, std::max(channels.size(), n), minHz, maxHz); to > 0.0 && !close(to)) {
+            return moved(to);
+        }
+    }
+    return {};
+}
+
+/*| contract: autoClockRefusal over the device usrp holds: the rates set as autoClockRates
+        reads them, the clock in force and the clock range the device states.
+*/
+template <typename Usrp>
+std::string autoClockRefusalOf(Usrp& usrp, double asked, double hz, Direction dir, std::span<const std::size_t> channels, std::size_t at) {
+    const std::vector<DspRate> set = autoClockRates(usrp);
+    if (set.empty()) {
+        return {};
+    }
+    double minHz = 0.0, maxHz = 0.0;
+    try {
+        const auto range = usrp.get_master_clock_rate_range(0);
+        minHz            = range.start();
+        maxHz            = range.stop();
+    } catch (const std::exception&) {
+        return {};
+    }
+    return autoClockRefusal(asked, hz, dir, channels, at, set, masterClockOf(usrp), minHz, maxHz);
 }
 
 /*| contract: the line naming the values in force that the block left automatic: an empty

@@ -1685,21 +1685,17 @@ environment.)">;
         // enumerated once, and each tick reads the values alone.
         _sensorNames = sensorNamesOf(*_usrp, Direction::Receive, "uhd::Source", kBriefSensorLimitMs, AlwaysLive{}, _channels.front());
 
-        if (const std::string overflow = autoClockOverflowOf(askedRateHz, true); !overflow.empty()) {
-            failStartOnOpenDevice(overflow);
+        if (const std::string refusal = applySampleRate(); !refusal.empty()) {
+            sample_rate = askedRateHz; // the next start asks for the request again
+            failStartOnOpenDevice(refusal);
         }
-        applySampleRate();
         applyAntenna();
         applyFrequency();
         applyAgc(); // before gains: manual gain writes are skipped while AGC holds them
         applyGain();
-        if (_deviceTime.load(std::memory_order_acquire)) {
-            std::lock_guard lock(_ctrlMutex);
-            setDeviceTimeLocked();
-        }
         _refLockWaitMs = capture::uhd::waitForReference(*_usrp, "uhd::Source").waitedMs;
 
-        if (const std::string overflow = autoClockOverflowOf(askedRateHz, false); !overflow.empty()) {
+        if (const std::string overflow = autoClockOverflowOf(askedRateHz); !overflow.empty()) {
             sample_rate = askedRateHz; // the next start asks for the request again
             failStartOnOpenDevice(overflow);
         }
@@ -1711,9 +1707,20 @@ environment.)">;
             _stream             = _usrp->get_rx_stream(streamArgs);
             {
                 std::lock_guard lock(_ctrlMutex);
-                if (_requestedFreqHz > 0.0 && streamMovedClock(clock, masterClockOf(*_usrp))) {
-                    _freqWrittenHz.reset(); // the tune made at the earlier clock is off the center
-                    std::ignore = tuneLocked(_requestedFreqHz, _ppmApplied, true);
+                if (streamMovedClock(clock, masterClockOf(*_usrp))) {
+                    rewriteAfterClockMoveLocked();
+                }
+                /*| invariant: the device time is set once the streamer exists, after any
+                        clock move its build made.
+                    why: the device counts its time in ticks of the master clock. A time set
+                        before a move reads scaled by the ratio of the clocks after it.
+                    measured: on a B210, a time of 1000 s set at a 32 MHz clock read 2001.3 s
+                        once a two-channel streamer moved the clock to 16 MHz, and a latch of
+                        5000 s on the next pulse read 10002 s; set after the streamer, the
+                        same latch read 5000 s.
+                */
+                if (_deviceTime.load(std::memory_order_acquire)) {
+                    setDeviceTimeLocked();
                 }
                 conflict = runCheckLocked(askedRateHz);
             }
@@ -2082,18 +2089,51 @@ environment.)">;
         return conflict;
     }
 
-    /*| contract: why this block's rate would overflow UHD's automatic master clock beside the
-            rates another handle set on the shared device, as autoClockOverflow states, or an
-            empty string. beforeWrite takes the rate the block is about to write, and otherwise
-            the rate the device read back, which is checked before the streamer is built. A
-            device no other handle holds is not asked. Called from start() alone.
+    /*| contract: why the rate the device read back would overflow UHD's automatic master clock
+            beside the rates another handle set on the shared device, as autoClockOverflow
+            states, or an empty string. Asked before the streamer is built, which takes that
+            multiple again. A device no other handle holds is not asked. Called from start()
+            alone.
     */
-    std::string autoClockOverflowOf(double askedRateHz, bool beforeWrite) {
+    std::string autoClockOverflowOf(double askedRateHz) {
         std::lock_guard lock(_ctrlMutex);
         if (!_joined || _usrp == nullptr) {
             return {};
         }
-        return autoClockOverflow(askedRateHz, beforeWrite ? rateToWrite(askedRateHz) : _rateActualHz, Direction::Receive, _channels, autoClockRates(*_usrp));
+        return autoClockOverflow(askedRateHz, _rateActualHz, Direction::Receive, _channels, autoClockRates(*_usrp));
+    }
+
+    /*| contract: write again what a master clock change resets on the converter, each where
+            this block wrote it: the tune, the analog filter and the automatic gain control.
+            Called with _ctrlMutex held, from start() alone, once the streamer build moved the
+            clock as streamMovedClock states.
+        measured: on a B210, a two-channel streamer that moved the clock from 32 to 16 MHz left
+            the receive baseband filter's cutoff at 11.2 MHz, where a 2 MHz bandwidth had set
+            1.4 MHz, and the band at the level a manual gain of 0 dB gives, 55 dB below the
+            level with the gain control on; the tuner read back a hertz low. UHD's reads of the
+            bandwidth and the gain control still state the values written. The manual gains
+            hold across the move.
+        verified-by: uhd.two-channels-align
+    */
+    void rewriteAfterClockMoveLocked() {
+        if (_requestedFreqHz > 0.0) {
+            _freqWrittenHz.reset();
+            std::ignore = tuneLocked(_requestedFreqHz, _ppmApplied, true);
+        }
+        if (_bwWrittenHz.has_value()) {
+            const double width = *_bwWrittenHz;
+            _bwWrittenHz.reset();
+            applyBandwidthLocked(width);
+        }
+        if (_agcWritten.value_or(false)) {
+            try {
+                for (const std::size_t ch : _channels) {
+                    _usrp->set_rx_agc(true, ch);
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[uhd::Source] set_rx_agc after the clock move: %s (continuing)\n", e.what());
+            }
+        }
     }
 
     /*| contract: whether a time source disciplines the device clock with a pulse per second,
@@ -2247,12 +2287,14 @@ environment.)">;
         }
     }
 
-    void applySampleRate() {
+    // The rate applier under _ctrlMutex. Answers why a channel's write was refused, or an
+    // empty string.
+    std::string applySampleRate() {
         std::lock_guard lock(_ctrlMutex);
         if (_usrp == nullptr) {
-            return; // teardown resets the handle under this mutex
+            return {}; // teardown resets the handle under this mutex
         }
-        applyRateLocked();
+        return applyRateLocked();
     }
 
     /*| contract: take the clock the open address fixed as the clock in force, so the ladder is that
@@ -2414,9 +2456,20 @@ environment.)">;
         _stream->issue_stream_cmd(cmd);
     }
 
-    // The rate applier's body, with _ctrlMutex already held and the device live.
-    void applyRateLocked() {
-        applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Receive, hz, "uhd::Source", _channels); });
+    /*| contract: the rate applier's body, with _ctrlMutex already held and the device live.
+            On a device another handle holds, each channel's write is checked first, as
+            autoClockRefusal states. Answers why a write was refused, or an empty string.
+    */
+    std::string applyRateLocked() {
+        const double asked = sample_rate.value;
+        std::string  refusal;
+        applyRateWith([this, asked, &refusal](double hz) {
+            RateWrite written = writeRate(*_usrp, Direction::Receive, hz, "uhd::Source", _channels,
+                                          [this, asked](std::size_t at, double r) { return _joined ? autoClockRefusalOf(*_usrp, asked, r, Direction::Receive, _channels, at) : std::string{}; });
+            refusal = written.refusal;
+            return written;
+        });
+        return refusal;
     }
 
     /*| contract: the rate applier with the device's rate write passed in as write, which answers

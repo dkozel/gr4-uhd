@@ -1618,6 +1618,99 @@ int main(int argc, char** argv) {
         expect(autoClockOverflow(2.0e6, coerced, Direction::Receive, first, rates) == built) << "the tree read gives the same answer";
     });
 
+    cases("controls.uhd-a-two-channel-rate-write-is-checked-before-each-channel", [] {
+        using capture::uhd::Direction;
+        /*| frame: a B210 on its automatic clock, which this stand-in holds at 61.44 MHz, so a
+                rate lands on the nearest whole decimation of it, as a shared clock coerces a
+                rate it does not reach. Each write is counted and lands in the property tree as
+                UHD's does.
+        */
+        struct RateStandIn : TreeStandIn {
+            int  writes = 0;
+            void set_rx_rate(double hz, std::size_t ch) {
+                ++writes;
+                const std::string at = "/mboards/0/rx_dsps/" + std::to_string(ch) + "/rate";
+                device->tree->access<bool>(at + "/set").set(true);
+                device->tree->access<double>(at + "/value").set(clockHz / std::round(clockHz / hz));
+            }
+            double get_rx_rate(std::size_t ch) const { return device->tree->access<double>("/mboards/0/rx_dsps/" + std::to_string(ch) + "/rate/value").get(); }
+            void   set_tx_rate(double, std::size_t) { throw std::runtime_error("the receive case writes no transmit rate"); }
+            double get_tx_rate(std::size_t) const { return 0.0; }
+        };
+        const auto fresh = [] {
+            RateStandIn usrp;
+            usrp.mboardName = "B210";
+            usrp.clockHz    = 61.44e6;
+            usrp.clockRange = ::uhd::meta_range_t(220.0e3, 61.44e6, 0.0);
+            usrp.device->tree->create<bool>("/mboards/0/auto_tick_rate").set(true);
+            for (const char* dsp : {"/mboards/0/rx_dsps/0", "/mboards/0/rx_dsps/1"}) {
+                usrp.device->tree->create<bool>(std::string(dsp) + "/rate/set").set(false);
+                usrp.device->tree->create<double>(std::string(dsp) + "/rate/value").set(0.0);
+            }
+            return usrp;
+        };
+        static constexpr std::array<std::size_t, 2> both{0UZ, 1UZ};
+        const auto guardOf = [](RateStandIn& usrp) { return [&usrp](std::size_t at, double hz) { return capture::uhd::autoClockRefusalOf(usrp, 2.0e6, hz, Direction::Receive, both, at); }; };
+
+        RateStandIn guarded = fresh();
+        const auto  written = capture::uhd::writeRate(guarded, Direction::Receive, 2.0e6, "qa", both, guardOf(guarded));
+        expect(guarded.writes == 1) << "the first channel is written and the second is not, of " << guarded.writes << " writes";
+        expect(!written.landed && std::abs(written.heldHz - 61.44e6 / 31.0) < 1.0) << "the rate is not landed, and the first channel holds the rate it was coerced to";
+        expect(written.refusal == "sample_rate asked 2000000 Hz beside the device's receive rate of 1981935 Hz; their least common multiple passes the 32 bits UHD's automatic master clock computes it in, and UHD would end the process")
+            << written.refusal;
+
+        RateStandIn bare = fresh();
+        const auto  open = capture::uhd::writeRate(bare, Direction::Receive, 2.0e6, "qa", both);
+        expect(bare.writes == 2 && open.landed && open.refusal.empty()) << "with no guard both channels are written, the second beside the first's coerced rate";
+    });
+
+    cases("controls.uhd-a-rate-that-moves-the-shared-clock-is-refused", [] {
+        using capture::uhd::autoClockChoice;
+        using capture::uhd::autoClockRefusal;
+        using capture::uhd::Direction;
+        using capture::uhd::DspRate;
+        constexpr double                      kMin = 220.0e3;
+        constexpr double                      kMax = 61.44e6;
+        static constexpr std::array<std::size_t, 1> one{0UZ};
+        static constexpr std::array<std::size_t, 2> two{0UZ, 1UZ};
+        expect(autoClockChoice(2.0e6, 1UZ, kMin, kMax) == 32.0e6 && autoClockChoice(2.0e6, 2UZ, kMin, kMax) == 16.0e6) << "one channel at 2 MS/s takes 32 MHz and two take 16 MHz";
+        expect(autoClockChoice(6.0e6, 1UZ, kMin, kMax) == 48.0e6) << "2 and 3 MS/s together take 48 MHz";
+        expect(autoClockChoice(16.0e6, 1UZ, kMin, kMax) == 16.0e6) << "a multiple of two is taken as one above the minimum";
+        expect(autoClockChoice(192.0e6, 1UZ, kMin, kMax) == 0.0) << "a multiple past the top has no choice";
+
+        const auto receive  = [](double hz, std::size_t ch = 0UZ) { return DspRate{.dir = Direction::Receive, .channel = ch, .hz = hz}; };
+        const auto transmit = [](double hz, std::size_t ch = 0UZ) { return DspRate{.dir = Direction::Transmit, .channel = ch, .hz = hz}; };
+        // An empty channel list stands for channel 0 alone.
+        const auto sinkAt   = [&](double hz, std::span<const DspRate> set, double clock, std::span<const std::size_t> chans = {}, std::size_t at = 0UZ) {
+            return autoClockRefusal(hz, hz, Direction::Transmit, chans.empty() ? std::span<const std::size_t>(one) : chans, at, set, clock, kMin, kMax);
+        };
+        const auto sourceAt = [&](double hz, std::span<const DspRate> set, double clock, std::span<const std::size_t> chans = {}, std::size_t at = 0UZ) {
+            return autoClockRefusal(hz, hz, Direction::Receive, chans.empty() ? std::span<const std::size_t>(one) : chans, at, set, clock, kMin, kMax);
+        };
+
+        const std::vector<DspRate> source2{receive(2.0e6)};
+        const std::string          moved = sinkAt(3.0e6, source2, 32.0e6);
+        expect(moved == "sample_rate asked 3000000 Hz on 1 channel beside the device's receive rate of 2000000 Hz would move UHD's automatic master clock from 32000000 Hz to 48000000 Hz; another block in this process holds the device and runs its own clock")
+            << moved;
+        expect(sourceAt(2.0e6, std::vector<DspRate>{transmit(3.0e6)}, 48.0e6).empty()) << "the other order: 2 MS/s beside 3 MS/s is met at the 48 MHz clock in force";
+        expect(sinkAt(3.2e6, source2, 32.0e6).contains("to 16000000 Hz")) << "3.2 MS/s is met at 32 MHz, and UHD still moves the clock to 16 MHz";
+        expect(sinkAt(2.0e6, source2, 32.0e6).empty() && sinkAt(1.0e6, source2, 32.0e6).empty()) << "a rate whose multiple keeps the clock passes";
+
+        const std::string unmet = sourceAt(2.0e6, std::vector<DspRate>{transmit(7.68e6)}, 61.44e6);
+        expect(unmet == "sample_rate asked 2000000 Hz beside the device's transmit rate of 7680000 Hz is not met at the 61440000 Hz master clock in force; another block in this process holds the device and runs its own clock")
+            << unmet;
+        expect(sinkAt(7.68e6, std::vector<DspRate>{receive(61.44e6 / 31.0)}, 31.71e6).contains("UHD would end the process")) << "the overflow is named first";
+
+        const std::vector<DspRate> twoAt2{receive(2.0e6, 0UZ), receive(2.0e6, 1UZ)};
+        expect(sinkAt(2.0e6, twoAt2, 16.0e6, two).empty()) << "two channels beside two channels at one rate keep 16 MHz";
+        expect(sinkAt(1.0e6, twoAt2, 16.0e6).empty()) << "one channel beside two reads the count of the clock in force";
+        expect(sinkAt(2.0e6, source2, 32.0e6, two).contains("from 32000000 Hz to 16000000 Hz")) << "a two-channel streamer beside one channel would move the clock when it is built";
+        expect(sourceAt(2.0e6, std::vector<DspRate>{transmit(7.68e6), receive(2.0e6, 1UZ)}, 61.44e6, two, 1UZ).contains("is not met")) << "the second channel's write is checked as the first's";
+
+        expect(sinkAt(3.0e6, std::vector<DspRate>{transmit(2.0e6)}, 32.0e6).empty()) << "rates set on the block's own channels alone are no other block's";
+        expect(sinkAt(3.0e6, {}, 32.0e6).empty()) << "nor is a device with no rate set";
+    });
+
     cases("controls.uhd-the-receive-depth-is-stated-in-time", [] {
         using capture::uhd::recvDepthFor;
         expect(capture::uhd::uhdDefaultRecvFrames("B-Series Device") == 16UZ) << "a B2xx over USB";

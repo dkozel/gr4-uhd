@@ -15,10 +15,9 @@ A copy script produces this tree from libcapture. `uhd/` holds the blocks,
 their registration header, their cases and their `CMakeLists.txt`. `common/`
 holds the headers the blocks build on, the discovery library's source, the
 case support and `cmake/capture.cmake`, the build logic `uhd/CMakeLists.txt`
-calls. `extract/uhd.imported` lists every file the copy placed; a change to
-one of them is made in libcapture. This copy is of libcapture as of
-2026-10-12, at "Remove the USRP source's rate-change gap cause", its last
-change to these files.
+calls. `extract/uhd.imported` lists every file the copy placed and names the
+libcapture change the copy was taken at; a change to one of them is made in
+libcapture.
 
 ## Building
 

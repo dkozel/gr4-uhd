@@ -37,8 +37,12 @@ channel alike. `rx_antennae` names one connector per listed channel, in the
 same order, or one connector for all. With two channels the rate list shares
 the link between them, and a B2xx tops out at 30.72 MS/s per channel.
 
-The sink's `channels` setting names the one device channel `in` feeds, `[0]`
-by default. A list of two fails the start.
+The sink's `channels` setting lists the device channels it transmits on, `[0]`
+by default. `in` feeds the first and `in2` the second, and `in2` is connected
+exactly when two channels are listed. One send carries both channels, and a
+burst tag on either input marks the burst on both. The sink refuses a list of
+three channels, a channel listed twice and a channel the device does not
+offer.
 
 ## Controls that wait for a start
 
@@ -52,14 +56,15 @@ state `applies_at` `start`. Each reaches an open-time setting of the source:
 | `TIME_SOURCE`  | `time_source`       |
 | `MASTER_CLOCK` | `master_clock_rate` |
 
-The block keeps a write made while the device is up and opens the device with
-it at its next start. A stopped block refuses the write. A write of the
-setting that changes it drops the kept choice, and a change of
-`device_parameter` drops all four. A program that builds a new block for the
-next start passes the choice in the setting: the option's name for the three
-lists, and the clock in hertz for `MASTER_CLOCK`, whose control counts
-megahertz. An explicit `MASTER_CLOCK` also reaches a running device at once,
-except on a radio that states one clock. Every other control of the source and
+A running source takes a write of the value in force and writes nothing, and
+refuses any other value; the automatic `MASTER_CLOCK` entry is the value in
+force where `master_clock_rate` asked for none. A stopped block refuses the
+write. A program changes one of them by writing the setting while the block is
+stopped, or by passing it to a new block: the option's name for the three lists,
+and the clock in hertz for `MASTER_CLOCK`, whose control counts megahertz.
+`sample_rate`, `master_clock_rate`, `clock_source`, `time_source`,
+`wire_format` and `channels` are fixed for a run in both blocks, and a settings
+write of any of them while the block runs is refused. Every other control of the source and
 the sink applies in the running stream. A list control whose entries are
 separate points takes an entry alone; the block refuses any other value and
 names the entries.

@@ -103,10 +103,12 @@ inline std::optional<double> frequencyInRange(double requestHz, std::span<const 
 
 /*| role: when a write of one control takes effect.
     contract: Runtime, the write reaches the running stream. Start, the device takes the write
-        at the next start of its stream, because it reads that setting only then. The block
-        keeps a Start write made while the device is up, and setControl refuses a write to a
-        stopped block. A caller that builds a new block for the next start passes the value as
-        the open-time setting the family's README names for the control.
+        at the next start of its stream, because it reads that setting only then. setControl
+        refuses a write to a stopped block. A family either keeps a Start write made while the
+        device is up for the next start, or takes only the value in force and refuses any
+        other, as its README states; the USRP source refuses. A caller that builds a new block
+        for the next start passes the value as the open-time setting the family's README names
+        for the control.
     why: a caller draws the controls a running device takes apart from the ones that wait for
         a restart, and a write whose effect waits for one reads as a write that did nothing.
 */

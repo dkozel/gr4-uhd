@@ -920,10 +920,17 @@ channels one send carries both, so a burst tag on either input marks the burst o
             publishSurfaceLocked();
             if (failure.empty()) {
                 takeClockInForceLocked();
-                failure = autoClockOverflowLocked(rateToWrite(_askedRateHz));
-            }
-            if (failure.empty()) {
-                failure = configureOpenDeviceLocked([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", _channels); });
+                std::string refusal;
+                failure = configureOpenDeviceLocked([this, &refusal](double hz) {
+                    RateWrite written = writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", _channels,
+                                                  [this](std::size_t at, double r) { return _joined ? autoClockRefusalOf(*_usrp, _askedRateHz, r, Direction::Transmit, _channels, at) : std::string{}; });
+                    refusal = written.refusal;
+                    return written;
+                });
+                if (!refusal.empty()) {
+                    sample_rate = _askedRateHz; // the next start asks for the request again
+                    failure     = refusal;
+                }
             }
         }
         if (!failure.empty()) {
@@ -968,8 +975,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
     /*| contract: the start's steps behind the reference wait, the caller holding _startMutex:
             nothing where a stop ended the wait or took the handle, the check of
             autoClockOverflowLocked on the rate in force, and otherwise the streamer
-            makeStream builds under _ctrlMutex, a retune where the build moved the master clock as
-            streamMovedClock states, the comparison of runCheckLocked, the queue sized for its
+            makeStream builds under _ctrlMutex, the tune and the analog filter written again
+            where the build moved the master clock as streamMovedClock states, the comparison of runCheckLocked, the queue sized for its
             maximum send, the settings the run holds fixed copied, deviceUp() raised,
             and the asynchronous thread and the drain started. makeStream answers no
             streamer where the block holds no handle. Answers a rate pair UHD's automatic
@@ -1002,8 +1009,14 @@ channels one send carries both, so a burst tag on either input marks the burst o
                 return {};
             }
             if (_usrp != nullptr && streamMovedClock(clock, masterClockOf(*_usrp))) {
-                _freqWrittenHz.reset(); // the tune made at the earlier clock is off the center
+                // What a clock change resets on the converter, as the source states.
+                _freqWrittenHz.reset();
                 std::ignore = applyFrequencyLocked();
+                if (_bwWrittenHz.has_value()) {
+                    const double width = *_bwWrittenHz;
+                    _bwWrittenHz.reset();
+                    applyBandwidthLocked(width);
+                }
             }
             if (const std::string conflict = _usrp == nullptr ? std::string{} : runCheckLocked(); !conflict.empty()) {
                 return conflict;
@@ -1062,9 +1075,9 @@ channels one send carries both, so a burst tag on either input marks the burst o
 
     /*| contract: why the rate hz would overflow UHD's automatic master clock beside the rates
             another handle set on the shared device, as autoClockOverflow states, or an empty
-            string. The start asks with the rate it is about to write, and again with the rate
-            the device read back before the streamer is built. A device no other handle holds
-            is not asked. The caller holds _ctrlMutex.
+            string. The start asks with the rate the device read back, before the streamer is
+            built; the write itself is checked channel by channel, as autoClockRefusal states.
+            A device no other handle holds is not asked. The caller holds _ctrlMutex.
     */
     std::string autoClockOverflowLocked(double hz) {
         if (!_joined || _usrp == nullptr) {

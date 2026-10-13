@@ -86,8 +86,13 @@ both chains have acknowledged it. Each chain also reports its own gaps, so a gap
 two-channel stream counts once per chain.
 UHD 4.9's B2xx takes a rate written before any streamer exists for one channel, so a streamer
 of two channels moves its automatic clock, 32 to 16 MHz at 2 MS/s, and the radio leaves the
-center the earlier tune set while the tuner reads back a hertz low. Each block retunes its
-channels where building its streamer moved the clock. A B210 runs one receive and one transmit
+center the earlier tune set while the tuner reads back a hertz low. The same clock change sets
+the converter's analog filter to the converter's own width and its gain control to manual, while
+UHD's reads of the bandwidth and the gain control still state the values written. Each block
+writes its tune, its analog filter and, on a receiver, its gain control again where building
+its streamer moved the clock. The device counts its time in ticks of the clock, so a time set
+before the move reads scaled by the ratio of the clocks after it; the source sets the device
+time once its streamer exists. A B210 runs one receive and one transmit
 chain, or two of each: UHD refuses the streamer that would leave three running, so a sink of two
 channels beside a source needs a source of two.
 Both records state the link rate UHD gives, one link carrying both directions; the
@@ -368,10 +373,17 @@ reading then states the frame alone.
   a B2xx a block whose handle shares its device with another handle writes no clock or time
   source. The block reads that from the owner count of UHD's device object, which reads two
   for a lone handle on a B210, and reads the count on a B2xx alone. On a B2xx the block
-  started second therefore fails its start wherever its clock source, time source, master
-  clock or rate differs from what the first runs, in either order, and the first streams on.
-  A rate the shared clock does not reach is one such difference: UHD warns that it cannot
-  choose a clock for both rates and coerces the second.
+  started second therefore fails its start wherever its clock source, time source or master
+  clock differs from what the first runs, in either order, and the first streams on.
+- On a B2xx whose automatic clock another handle shares, every rate write moves the clock to
+  UHD's choice for all the rates set, and a move resets the tune, the filter and the gain
+  control of the block running on it. The block started second checks, before each channel's
+  write, that UHD's choice is the clock in force for its write and for the streamer it builds
+  after, and fails its start with one message where the clock would move or its rate is not
+  met. The block cannot read the other block's streamer channel count, and takes the count
+  whose choice for the rates set is the clock in force. Which block fails depends on the start
+  order: a source at 2 MS/s runs 32 MHz, and a sink at 3 MS/s would move it to 48 MHz and
+  fails; the sink first runs 48 MHz, which meets 2 MS/s, and both run.
 - UHD 4.9's B2xx automatic clock takes the least common multiple of every rate set, in 32 bits,
   when a rate is written and when a streamer is built, and a library built with assertions
   aborts the process where it overflows. 7.68 MS/s beside a 2 MS/s request does: the write
@@ -381,9 +393,16 @@ reading then states the frame alone.
   before its rate write with the rate it is about to write and before its streamer with the
   rate it read back. Where the multiple passes 32 bits the start fails with one message
   naming the block's rate and the others, and UHD is not asked. A block of two channels writes
-  them one at a time, and the check before the write takes the request for the second. Where
-  the first channel lands on another rate, the write of the second can still overflow inside
-  UHD.
+  them one at a time, and the check runs before each write with the rates the tree holds then,
+  so a channel written a moment before counts at the rate it landed on.
+- The block reads whether another handle holds the device once, right after its open. Two
+  graphs that start at once in one process are not checked against each other: the block that
+  opened first reads itself alone and writes unchecked, and the other block's checks can run
+  before that write. Inside one graph the scheduler starts the blocks one at a time.
+- A probe of the control surface holds its own handle on the device for the length of its open,
+  and writes a rate. The owner count does not tell that handle from a block's, so a block that
+  opens during a probe reads the device as shared: it writes no clock or time source, checks
+  its rate against the probe's, and names another block as the cause of a miss.
 - On every other radio the block does not read the owner count, because an RFNoC radio (an
   X3xx, an N3xx or an X4xx) may hold more owners on a lone handle. A second block on such a
   radio is not detected. It writes its own clock and time source over the first block's, its

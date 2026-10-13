@@ -287,7 +287,7 @@ struct [[maybe_unused]] hw_sink : gr::Block<hw_sink> {
 
 /*| contract: set by a case whose precondition the bench did not meet, after it has printed
         why. The binary then exits with 77, which ctest reports as a skip, and a case that
-        failed an expectation exits 1 as before.
+        failed an expectation exits 1.
     why: a case that returns early on an unmet precondition would otherwise read as a pass.
 */
 std::atomic<bool> g_skipped{false};
@@ -1664,11 +1664,31 @@ int main(int argc, char** argv) {
         bool       streamed = false;
         std::string spec0;
         std::string spec1;
+        double      cutoffRun = 0.0, cutoffWritten = 0.0, clock = 0.0;
+        /*| frame: the baseband filter's cutoff as the converter's driver states it, where the
+                radio names one, and zero where it does not.
+        */
+        const auto cutoff = [](uhd::usrp::multi_usrp& u) {
+            for (const std::string& name : u.get_rx_filter_names(0)) {
+                if (name.contains("LPF_BB")) {
+                    const auto lp = std::dynamic_pointer_cast<uhd::analog_filter_lp>(u.get_rx_filter(name, 0));
+                    return lp != nullptr ? lp->get_cutoff() : 0.0;
+                }
+            }
+            return 0.0;
+        };
         const bool ran = withPorts(std::move(settings), true, [&](capture::uhd::Source& src) {
             streamed = waitForPortSamples(std::chrono::milliseconds(6000));
             settle(3000);
             spec0 = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_subdev_name(0); });
             spec1 = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_rx_subdev_name(1); });
+            clock     = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
+            cutoffRun = deviceRead(src, 0.0, cutoff);
+            // The width the block states, written again on the running device.
+            cutoffWritten = deviceRead(src, 0.0, [&](uhd::usrp::multi_usrp& u) {
+                u.set_rx_bandwidth(u.get_rx_bandwidth(0), 0);
+                return cutoff(u);
+            });
         });
         expect(fatal(ran)) << "the graph ran";
         expect(streamed) << "the stream starts";
@@ -1681,7 +1701,9 @@ int main(int argc, char** argv) {
             std::printf("two channels: first timing tag at sample %zu, %llu ns on out; at sample %zu, %llu ns on out2\n", a.timing.front().first, static_cast<unsigned long long>(a.timing.front().second),
                         b.timing.front().first, static_cast<unsigned long long>(b.timing.front().second));
         }
+        std::printf("two channels: the clock runs %.0f Hz; the baseband filter's cutoff reads %.0f Hz, and %.0f Hz with the stated width written again\n", clock, cutoffRun, cutoffWritten);
         expect(spec0 != spec1) << "the two channels are two frontends";
+        expect(cutoffRun == cutoffWritten) << "the filter the start leaves is the width the block states, after the clock move";
         expect(a.samples > 0UL && a.samples == b.samples) << "both ports carry the same count";
         expect(a.timing.size() >= 4UZ) << "the run carries timing tags";
         expect(std::ranges::equal(a.timing, b.timing)) << "at the same samples and the same device times on both ports";
@@ -3448,9 +3470,10 @@ int main(int argc, char** argv) {
             {"master_clock_rate", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 32.0e6}}), "master_clock_rate asked"},
             {"a rate needing another clock", rxWith({{"sample_rate", 2.5e6}}), txWith({{"sample_rate", 7.68e6}}), "sample_rate asked"},
         };
-        /*| frame: the rate row asks the source for 2.5 MS/s, which the shared clock coerces to
-                a rate whose least common multiple with 7.68 MS/s fits UHD's 32 bits. The pair
-                whose multiple does not is uhd.a-rate-pair-past-the-automatic-clock-fails-the-start.
+        /*| frame: in the rate row, 2.5 MS/s and 7.68 MS/s have a least common multiple that
+                fits UHD's 32 bits and no clock UHD picks, so the block started second fails
+                before its rate is written. The pair whose multiple does not fit is
+                uhd.a-rate-pair-past-the-automatic-clock-fails-the-start.
         */
         const auto streams = [] {
             const std::uint64_t before = g_samples.load();
@@ -3522,10 +3545,11 @@ int main(int argc, char** argv) {
     cases("uhd.a-rate-pair-past-the-automatic-clock-fails-the-start", [] {
         /*| frame: a source and a sink on one radio in one process, on UHD's automatic clock,
                 asking for rates whose least common multiple passes 32 bits. Sink first at
-                7.68 MS/s, the source's 2 MS/s is coerced to 1.981935 MS/s at the write, and the
-                source fails its start before its streamer is built. Source first at that
-                coerced rate, the sink fails its start before its rate is written. The process
-                outlives both starts, and the first block streams on. The sink transmits on
+                7.68 MS/s, the source's 2 MS/s is no decimation of the 61.44 MHz clock in force,
+                and the source fails its start before its rate is written, where UHD would
+                coerce it to 1.981935 MS/s. Source first at that coerced rate, the sink fails its
+                start before its rate is written. The process outlives both starts, and the
+                first block streams on. The sink transmits on
                 channel 0 into side A's terminated TX/RX at 0 dB and 915 MHz.
         */
         std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -3547,8 +3571,7 @@ int main(int argc, char** argv) {
         capture::uhd::awaitReleases();
         std::printf("sink first: the source's start failed with \"%s\"; the sink %s\n", built.c_str(), sinkUp ? "streams on" : "stopped");
         expect(sinkRan) << "the sink's graph ran";
-        expect(built.contains("sample_rate asked 2000000 Hz runs as 1981935 Hz beside the device's transmit rate of 7680000 Hz")) << "the source names both rates: " << built;
-        expect(built.contains("UHD would end the process")) << "and the overflow";
+        expect(built.contains("sample_rate asked 2000000 Hz beside the device's transmit rate of 7680000 Hz is not met at the 61440000 Hz master clock in force")) << "the source names both rates and the clock: " << built;
         expect(sinkUp) << "the sink streams on";
 
         std::string written;
@@ -3566,6 +3589,80 @@ int main(int argc, char** argv) {
         expect(std::abs(sourceRate - coerced) < 1.0) << "the source runs the rate it asked for alone";
         expect(written.contains("sample_rate asked 7680000 Hz beside the device's receive rate of 1981935 Hz")) << "the sink names both rates: " << written;
         expect(sourceOn) << "the source streams on";
+    });
+
+    cases("uhd.a-rate-that-moves-the-shared-clock-fails-the-start", [] {
+        /*| frame: a source and a sink on one radio in one process, on UHD's automatic clock. A
+                source at 2 MS/s runs a 32 MHz clock, and a sink at 3 MS/s would move it to
+                48 MHz: the sink fails its start with the clock named, and the clock stays. In
+                the other order the sink's 3 MS/s runs a 48 MHz clock, which meets the source's
+                2 MS/s, and both run. A source of two channels at 2 MS/s beside a sink at
+                7.68 MS/s fails at its first channel, where UHD would coerce that channel and
+                end the process at the second. The sink transmits on channel 0 into side A's
+                terminated TX/RX at 0 dB and 915 MHz.
+        */
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        const double freq    = bandFreq();
+        const auto   streams = [] {
+            const std::uint64_t before = g_samples.load();
+            settle(500);
+            return g_samples.load() > before;
+        };
+        const auto clockOf = [](capture::uhd::Source& src) { return deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); }); };
+
+        std::string moved;
+        double      clockBefore = 0.0, clockAfter = 0.0;
+        bool        sourceOn    = false;
+        const bool  sourceRan   = withGraph(sourceSettings(2.0e6, freq, 38.0, sourcePort()), [&](capture::uhd::Source& src, auto&) {
+            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
+            clockBefore = clockOf(src);
+            moved       = startAlone<capture::uhd::Sink>(sinkSettings(3.0e6, freq, {}));
+            clockAfter  = clockOf(src);
+            sourceOn    = streams();
+        });
+        capture::uhd::awaitReleases();
+        std::printf("source first at 2 MS/s: the sink's start at 3 MS/s failed with \"%s\"; the clock read %.0f Hz before and %.0f Hz after; the source %s\n", moved.c_str(), clockBefore, clockAfter, sourceOn ? "streams on" : "stopped");
+        expect(sourceRan) << "the source's graph ran";
+        expect(moved.contains("would move UHD's automatic master clock from 32000000 Hz to 48000000 Hz")) << "the sink names the move: " << moved;
+        expect(moved.contains("another block in this process holds the device")) << "and the other block as the cause";
+        expect(clockBefore == 32.0e6 && clockAfter == clockBefore) << "the clock stays";
+        expect(sourceOn) << "the source streams on";
+
+        std::string joined = "not run";
+        bool        sinkUp = false;
+        double      sharedClock = 0.0;
+        const bool  sinkRan     = withTxGraph(sinkSettings(3.0e6, freq, {}), [&](capture::uhd::Sink& sink, auto&) {
+            expect(waitForDeviceUp(sink, std::chrono::seconds(10))) << "the sink starts";
+            joined = withGraph(sourceSettings(2.0e6, freq, 38.0, sourcePort()), [&](capture::uhd::Source& src, auto&) {
+                         expect(waitForSamples(std::chrono::milliseconds(6000))) << "the joined source streams";
+                         sharedClock = clockOf(src);
+                     })
+                         ? std::string{}
+                         : std::string("the source's graph did not run");
+            sinkUp = sink.deviceUp();
+        });
+        capture::uhd::awaitReleases();
+        std::printf("sink first at 3 MS/s: the source at 2 MS/s %s; the clock read %.0f Hz; the sink %s\n", joined.empty() ? "ran" : joined.c_str(), sharedClock, sinkUp ? "streams on" : "stopped");
+        expect(sinkRan) << "the sink's graph ran";
+        expect(joined.empty() && sharedClock == 48.0e6) << "the source runs on the 48 MHz clock the sink's rate picked";
+        expect(sinkUp) << "the sink streams on";
+
+        if (const std::size_t offered = receiveChannels(); offered < 2UZ) {
+            std::printf("the radio offers %zu receive channels; the two-channel row does not run\n", offered);
+            return;
+        }
+        std::string twoChannels;
+        bool        sinkOn = false;
+        const bool  ran    = withTxGraph(sinkSettings(7.68e6, freq, {}), [&](capture::uhd::Sink& sink, auto&) {
+            expect(waitForDeviceUp(sink, std::chrono::seconds(10))) << "the sink starts";
+            twoChannels = startAlone<capture::uhd::Source>(twoChannelSettings(2.0e6, freq, 38.0, {"RX2", "RX2"}));
+            sinkOn      = sink.deviceUp();
+        });
+        capture::uhd::awaitReleases();
+        std::printf("two channels at 2 MS/s beside 7.68 MS/s: the source's start failed with \"%s\"; the sink %s\n", twoChannels.c_str(), sinkOn ? "streams on" : "stopped");
+        expect(ran) << "the sink's graph ran";
+        expect(twoChannels.contains("is not met at the 61440000 Hz master clock in force")) << "the source fails at its first channel: " << twoChannels;
+        expect(sinkOn) << "the process outlives the start, and the sink streams on";
     });
 
     cases("uhd.tx-underrun", [] {

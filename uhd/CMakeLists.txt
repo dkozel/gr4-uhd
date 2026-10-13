@@ -89,6 +89,8 @@ if(CAPTURE_UHD_FOUND)
           controls.uhd-a-start-names-each-value-the-device-does-not-run
           controls.uhd-the-owner-count-is-read-on-a-b2xx-alone
           controls.uhd-a-rate-pair-past-the-automatic-clock-is-refused
+          controls.uhd-a-two-channel-rate-write-is-checked-before-each-channel
+          controls.uhd-a-rate-that-moves-the-shared-clock-is-refused
           controls.uhd-the-receive-depth-is-stated-in-time controls.uhd-a-drain-ends-by-duration-at-any-rate
           controls.uhd-thread-placement-is-the-callers
           controls.uhd-states-its-filter-and-its-gain-mode
@@ -200,7 +202,8 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
       uhd.tx-underrun uhd.tx-tagged-bursts uhd.transmit-side uhd.two-channels-align
       uhd.two-channels-follow-their-antennas uhd.one-channel-on-side-b uhd.two-channel-clean-rate
       uhd.tx-two-channels uhd.tx-channel-one-alone uhd.device-settings-across-two-blocks
-      uhd.a-rate-pair-past-the-automatic-clock-fails-the-start)
+      uhd.a-rate-pair-past-the-automatic-clock-fails-the-start
+      uhd.a-rate-that-moves-the-shared-clock-fails-the-start)
   capture_test(
     hw_uhd
     DIR test
