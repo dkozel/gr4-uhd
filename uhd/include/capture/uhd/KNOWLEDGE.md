@@ -33,7 +33,7 @@ the marks for each send. The
 queue stays because `send()` blocks while the device's buffers are full, and the work call
 runs on the scheduler's thread with the other blocks of its job. The drain's one timed wait
 is the send's own timeout: on an empty queue or a park it waits on a doorbell the work call
-rings after each write and a pause, a resume, a rate change and a stop ring after they change
+rings after each write and a pause, a resume and a stop ring after they change
 its state. The SAMPLE_RATE descriptor of either block is the ladder of the master clock and the
 wire format the block holds, anyInRange where the clock is programmable, and FREQUENCY is the
 tuner coverage the truth states. An unstarted block's controls property probes the unit, which
@@ -124,7 +124,7 @@ wakes finds them. On an edge whose size the framework did not round to a page, t
 copies the receive into the buffer's mirror: 0.43 to 0.66 ms for a 375,000-sample receive into a
 1,500,000-sample edge at 30 MS/s. In ten 20 s runs at 30 MS/s with UHD's default transport, no
 pass spent 1 ms outside the receive and the wait, and none overflowed. Each receive does no locked operation that its case does not need: the
-restage flag is read before it is exchanged, the shed count is added only when it is not zero,
+shed count is added only when it is not zero,
 the shortfall test reads the clock only once the stream has delivered what its window holds at
 the rate or after a gap, and the time of the first sample, with its device-stamp conversion, is
 read only when the block emits timing tags; the wall clock is read only for a block with no
@@ -132,16 +132,10 @@ device time. The frequency a landed tune holds is written back into the setting 
 the one thread that writes the block's settings. While the
 stream runs, a frequency, a gain, an automatic gain mode and an antenna reach the device on a
 control thread of the block's own, one write at a time in the order given, the last write of
-a key replacing one not yet begun. A rate change runs on the consumer thread once that thread
-has settled, because it stops the stream, empties the transport and starts it again. The wait for
-the control thread ends after 1 s, and the rate is then written behind the write in flight, the
-two serialized on the control mutex. The drain of the stopped stream, at a rate change and at a
-stop, ends on the stream's end-of-burst marker, on a receive that waits 50 ms and finds nothing,
+a key replacing one not yet begun. The drain of the stopped stream at a stop ends on the stream's end-of-burst marker, on a receive that waits 50 ms and finds nothing,
 or after 0.3 s. Both bounds are durations, so a drain at 2 GS/s takes what the transport holds as
 one at 250 kS/s does; a count of receives stops at the same number of samples at every rate. A
-B205mini going from 61.44 to 30.72 MS/s drained 14,147 samples in 0.07 ms and an N210 going from
-25 to 12.5 MS/s 7,647 samples in 0.11 ms, each ended by the marker; a teardown drained 9,305 and
-3,092 samples the same way.
+teardown drained 9,305 samples on a B205mini and 3,092 on an N210, each ended by the marker.
 
 The source's receive thread and the sink's transmit thread take `thread_priority` and `cpu` where
 the caller sets them, at the thread's start: a priority above 0 and at most 1 asks for the
@@ -171,11 +165,10 @@ reading then states the frame alone.
   reaches the parameter map at once. An overflow while a tune is open carries the cause
   `retune`.
 - The source measures a shed as the difference between the stamp a block arrived at and the
-  stamp expected of it, in the nearest whole number of samples at the rate in force. After a
-  live rate change a B2xx can take its samples a fraction of a sample off that rate's grid,
-  half a sample at 8 MS/s from 32 MHz, and that fraction is no shed. A shed the stamps measure
-  that no overflow, lost packet or rate change recorded is marked with the cause
-  `missing samples`, or `retune` while a tune is open.
+  stamp expected of it, in the nearest whole number of samples at the rate in force. A B2xx can
+  take its samples a fraction of a sample off that rate's grid, half a sample at 8 MS/s from
+  32 MHz, and that fraction is no shed. A shed the stamps measure that no overflow or lost
+  packet recorded is marked with the cause `missing samples`, or `retune` while a tune is open.
 - A USRP has no register for a frequency correction, so the block pre-compensates one on
   transmit as well as on receive.
 - Opening a USRP raises whenever no unit answers the address, and so does parsing an address a
@@ -272,19 +265,11 @@ reading then states the frame alone.
   holds at every rate one of these radios runs. 2^19 samples would be 2.6 s of queue at that
   fifth of a megasample, and every wait the block makes is sized from the queue.
 - The sink's `queue_duration` and `queue_max_bytes` state the queue's bound, a quarter of a
-  second and 4 GiB by default. The start and each rate change read them. The storage a rate
-  change needs is allocated before the control mutex is taken, from the rate the request snaps
-  to, and the storage it replaces is freed after the mutex is let go; a device that coerces
-  the write to a rate of another power of two makes the resize allocate under the mutex. The
-  start sizes the queue outside the mutex, before the drain runs.
-- A play-out waits for the queue bounded by the capacity the rate in force asks for, which is
-  under 750 ms for a full queue at every rate a USRP runs. A drain that refused the park keeps
-  the queue's sample count rather than its length of time, so a block taken from a fast rate to
-  a slow one holds a queue far longer than the new rate's own quarter second until that drain
-  comes back. The drain asks for the park again at the head of its own loop while the queue
-  outsizes the rate in force, and the work call takes the resize behind that answer, counting
-  what it throws away under the rate change the park was refused for and saying so once. The
-  bound holds every wait made in between inside that quarter second and its margin.
+  second and 4 GiB by default. The start reads them and sizes the queue outside the control
+  mutex, before the drain runs. The rate is fixed while the block runs, so the queue keeps
+  that size for the run.
+- A play-out waits for the queue at the rate in force, which is under 750 ms for a full queue
+  at every rate a USRP runs.
 - The transmit queue is CF32, eight bytes a sample: 128 MiB at 61.44 MS/s and 4 MiB at 2 MS/s.
   A resize writes no element of it. Sizing 128 MiB takes about 0.02 ms on the bench host,
   and a zero-fill took 75 ms.
@@ -299,15 +284,12 @@ reading then states the frame alone.
   queued, or has the drain place an end of burst of one zero sample where that sample has
   gone. The epilogue reads the drain's tail under the mutex the drain moves it under, and a
   mark that arrives after its send was formed has the drain place that end straight after the
-  send. A resize of the queue drops the marks with the samples, and a stop request makes the
+  send. The start's resize of the queue drops the marks with the samples, and a stop request makes the
   epilogue end nothing.
 - A pause ends the burst, which keys the radio down, and keeps the queue. It throws nothing
   away and the count of what a pause discarded stays at zero; a stop after one counts what is
   left as unsent. The block goes on consuming under a pause: a work call stages into the
   queue until it is full, and the resume sends what the queue holds.
-- A rate change made while the carrier is held finds the queue still full and the parked drain
-  placing nothing, so the play-out returns at once and the resize throws the whole queue away
-  under the rate change's own count.
 - A hole in a burst keys the radio down: the device transmits nothing and reports an event
   carrying no length, so the block counts the events rather than samples. The device's codes
   are bit flags, one message carrying several, and each is tested alone. A packet lost on the
@@ -319,7 +301,7 @@ reading then states the frame alone.
 - A stop waits for the device to acknowledge the end of burst it placed, because the
   acknowledgment is the one statement that the tail left the radio. The device acknowledges
   the ends in the order they were placed, so the stop waits for the count of acknowledgments
-  to reach the count of ends placed in the run: a pause's or a rate change's acknowledgment
+  to reach the count of ends placed in the run: a pause's acknowledgment
   arriving during the stop answers for that earlier burst alone. The wait is bounded by the
   play-out of what the device can hold: the `send_buff_size` the open address states, which
   an N-series takes as its flow-control window, and 1 MiB where it states none, about a second
@@ -328,23 +310,31 @@ reading then states the frame alone.
   placed at all, and a stop that gave up or left the carrier up states what the device can
   still hold as a bound beside the counts.
 - The USRP source and sink read their non-gain controls back through `controlValue`.
-- The source's `WIRE_FORMAT`, `CLOCK_SOURCE`, `TIME_SOURCE` and `MASTER_CLOCK` state that a
-  write applies at the next start: the block keeps the write, and the start alone reads the
-  wire format, the reference and timing selections and the converter clock. An explicit clock
-  also reaches the running device at once and moves the rate with it, except on a radio that
-  states one clock; the automatic entry waits for the next open. Every other control of either
-  block applies in the running stream. A write that changes the setting a kept write shadows
-  (`wire_format`, `clock_source`, `time_source`, `master_clock_rate`) drops that kept write,
-  and a change of `device_parameter` to another value drops all four. A write of the value a
-  setting already holds reaches no settings hook and drops nothing.
+- `sample_rate`, `master_clock_rate`, `clock_source`, `time_source`, `wire_format` and
+  `channels` are fixed for a run, in both blocks. A settings write of any of them while the
+  block runs is refused: the setting returns to the value the start left, leaves the pass and
+  its forward, and is named on standard error. A write while the block is stopped is taken and
+  applies at the next start. The source's `WIRE_FORMAT`, `CLOCK_SOURCE`, `TIME_SOURCE` and
+  `MASTER_CLOCK` state that they apply at the start. A write of one of them to a running source
+  answers true and writes nothing where the value is the one in force, and is refused and named
+  otherwise; for `MASTER_CLOCK` the automatic entry is the value in force where
+  `master_clock_rate` asked for UHD's choice. Every other control of either block applies in
+  the running stream.
+- Each start compares what the device runs, once the streamer exists, with what the block
+  asked for: the clock source, the time source, the master clock and the rate. A value other
+  than the one asked fails the start, with one message naming each such setting, the value
+  asked, the value in force and the likely cause, and leaves `sample_rate` on the request. A
+  rate or a clock is met within 1 Hz, the difference at which UHD warns of a rate it did not
+  meet; a rate the block snapped to an entry of the clock's ladder is not met. An empty
+  selection and a zero clock ask for nothing, and the start names the values the device runs
+  for them.
 - The truth records whether the master clock range UHD states is one continuous span: a
   single sub-range whose start is below its stop. On such a radio `MASTER_CLOCK` is
   `anyInRange`, with `min` and `max` the span in MHz, and a clock between two entries is
   written as it stands. Separate clocks or one sub-range of a single point leave it false, and
   the list then takes its entries alone: the bound refuses any other value, names the entries
   on standard error and moves nothing onto an entry, so a clock stored under another radio is
-  never written as the nearest clock of this one. A clock written by hand makes the truth a
-  fixed clock with no span until the next open.
+  never written as the nearest clock of this one.
 - A radio that states separate clocks is offered those clocks, and each joins the rate offer as
   the rate it reaches at decimation 1, cut at a link ceiling UHD states. A span is offered the
   picks inside it: 5 to 61.44 MHz for a B2xx or an E3xx converter, and above that the clocks UHD
@@ -367,31 +357,44 @@ reading then states the frame alone.
   image takes, is offered the clocks of all three. An X3xx whose frontend UHD names as a TwinRX
   is offered 200 MHz alone: the manual allows no other clock with it, and at 184.32 MHz the
   daughterboard clock is not one the TwinRX takes.
-- A pick on such a radio is an entry of that list, pinned and carried as `master_clock_rate` by
-  the next open. Nothing is written to the running device, and the rate offer stays the ladder
-  of the clock in force until that open, because UHD states a fixed clock's rates for the clock
-  it runs alone. An open that fails, for any reason, while it carries a pin this list made
-  drops the pin and names it in the failure, so the next start opens with the
-  `master_clock_rate` setting. A pin a live write put on a span radio's running device stays
-  through a failed open: the device ran that clock, and an unplugged or busy unit is no cause
-  to forget it. An open whose device runs another clock than the pin names the difference and
-  one cause of it: UHD hands a second open in one process the device already open, with the
-  first open's keys. A driver coercing a clock inside its range gives the same difference. A radio stating one clock that the table
-  does not hold for its product is offered no clock control.
-- A source and a sink holding one radio share its device-wide selections, and neither block
-  learns what the other wrote. On a B210, a sink started beside a running source puts the
-  device on the `clock_source` and `time_source` it names while the source goes on stating its
-  own. A `master_clock_rate` named by the second block to open is not applied, and that block
-  states its setting beside a record carrying the clock the device runs. A rate the running
-  clock does not reach is coerced: UHD warns and the block states the rate it got. A
-  `MASTER_CLOCK` write on a running source moves the clock under the sink, whose rate, tune and
-  record stay where they were; the tuners of both directions then read back a hertz low.
+- A pick on such a radio is an entry of that list, which a caller writes as
+  `master_clock_rate` for the next open. The rate offer stays the ladder of the clock in force
+  until that open, because UHD states a fixed clock's rates for the clock it runs alone. A
+  radio stating one clock that the table does not hold for its product is offered no clock
+  control.
+- A source and a sink holding one radio share its device-wide values, and no block tells the
+  other anything. UHD hands the second open in one process the device the first opened, with
+  the first open's keys, so a `master_clock_rate` named by the second block is not applied. On
+  a B2xx a block whose handle shares its device with another handle writes no clock or time
+  source. The block reads that from the owner count of UHD's device object, which reads two
+  for a lone handle on a B210, and reads the count on a B2xx alone. On a B2xx the block
+  started second therefore fails its start wherever its clock source, time source, master
+  clock or rate differs from what the first runs, in either order, and the first streams on.
+  A rate the shared clock does not reach is one such difference: UHD warns that it cannot
+  choose a clock for both rates and coerces the second.
+- UHD 4.9's B2xx automatic clock takes the least common multiple of every rate set, in 32 bits,
+  when a rate is written and when a streamer is built, and a library built with assertions
+  aborts the process where it overflows. 7.68 MS/s beside a 2 MS/s request does: the write
+  passes and coerces the request to 1.981935 MS/s, and the multiple of that rate with
+  7.68 MS/s overflows at the streamer. On a B2xx whose automatic clock another handle shares,
+  a block reads every rate set from the property tree and computes the multiple in 64 bits,
+  before its rate write with the rate it is about to write and before its streamer with the
+  rate it read back. Where the multiple passes 32 bits the start fails with one message
+  naming the block's rate and the others, and UHD is not asked. A block of two channels writes
+  them one at a time, and the check before the write takes the request for the second. Where
+  the first channel lands on another rate, the write of the second can still overflow inside
+  UHD.
+- On every other radio the block does not read the owner count, because an RFNoC radio (an
+  X3xx, an N3xx or an X4xx) may hold more owners on a lone handle. A second block on such a
+  radio is not detected. It writes its own clock and time source over the first block's, its
+  start finds the device on its own request and passes, and the first block runs on a
+  selection it did not ask for without being told. A master clock or a rate the device does
+  not run still fails the second start, named as the device's own limit.
 - The table leaves out 120 MHz on an X3xx: UHD 4.9.0.1's device arguments take 184.32 to 200
   MHz and refuse it at the open. It leaves out the X410 clocks MPM's clock policy takes beyond
   the manual's: 122.88 and 125 MHz and a 200 MHz legacy clock. A TwinRX behind a channel other
   than the one read is not seen. The table is a copy of UHD's facts and drifts where a later UHD
-  changes them; a clock it offers that the UHD in use refuses fails the next open, which then
-  drops it.
+  changes them; a clock it offers that the UHD in use refuses fails the next open.
 - The device list asks libuhd with the empty hint, or with `use_dpdk=1` where the caller asks
   for DPDK or `CAPTURE_UHD_USE_DPDK` is on in the environment. UHD 4.9.0 starts DPDK for an
   MPM device or an X3xx over Ethernet only for a hint that carries the key, so a radio reached
@@ -418,8 +421,8 @@ either kind carries every reading the cache holds. A full answer carries the new
 readings a brief sweep brought, and a brief answer carries the epoch time the last full sweep
 read. Asked every second, a full sweep every fourth request, the stream kept every sample, and
 no delivery gap reached 5 ms (`uhd.sensor-sweep-beside-a-stream`). The transmit block sweeps on the worker. The transmit
-queue at 61.44 MS/s is 128 MiB of CF32, and a rate change down replaces the storage, which
-gives that memory back.
+queue at 61.44 MS/s is 128 MiB of CF32, and a start at a lower rate replaces the storage,
+which gives that memory back.
 
 The USRP families UHD 4.9.0.1 builds support for, the links each offers, the fastest rate per
 channel, the channel count, and the link rate UHD states in `/mboards/0/link_max_rate`. A

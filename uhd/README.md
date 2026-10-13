@@ -143,7 +143,7 @@ leaves it. The start reads both. A placement the system refuses is a line on
 standard error, and the stream starts anyway. The real-time class needs
 `CAP_SYS_NICE` or an `RLIMIT_RTPRIO` above zero.
 
-A rate change and a stop stop the stream and drain it. The drain ends on the
+A stop stops the stream and drains it. The drain ends on the
 stream's end-of-burst marker, on a receive that finds nothing, or after
 0.3 s, whichever comes first.
 

@@ -33,7 +33,9 @@
 #include <format>
 #include <iterator>
 #include <limits>
+#include <memory_resource>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -42,6 +44,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -919,8 +922,8 @@ inline void appendLadderAndCoverage(std::vector<ControlDesc>& out, const DeviceT
         states its whole clock range, so a ladder read from that range treats the clock as
         programmable and hands the device the request as it stands. UHD then divides the fixed
         clock by the nearest whole number: 2 MS/s at 30.72 MHz is a factor of 15, odd, on the CIC
-        alone, in either direction. The key reaches the address from the setting, from a
-        control's pin or from the device string a caller typed.
+        alone, in either direction. The key reaches the address from the setting or from the
+        device string a caller typed.
     trap: the address alone is wrong for a second open in one process. UHD hands that open the
         device already open with the first open's keys, so a sink opened with the key beside a
         source opened without it runs on UHD's automatic clock, and a sink opened without it
@@ -1113,7 +1116,7 @@ inline std::vector<double> masterClockPicksMHz() { return {5.0, 10.0, 16.0, 20.0
     why: UHD 4.9 states the clock range of these radios as the clock in force alone, so the
         device cannot be asked which other clocks it takes. An X3xx and an X4xx keep the clock
         they were opened at for the whole session. An N3xx can change its clock while open,
-        and the block still pins a clock for the next open, where the rates it offers are
+        and the block still takes a clock only at the open, where the rates it offers are
         read.
     trap: the table is a copy of UHD's facts, and it drifts where a later UHD changes them. A
         clock the table offers and the UHD in use refuses fails the next open.
@@ -1527,8 +1530,8 @@ bool probeTruth(const std::string& kwargs, double sampleRateHz, DeviceTruth& tru
     why: UHD states that reconfiguring the clock source affects the FPGA clocking and the
         timekeeping, that there should be no streaming operation while it happens, and that a
         device time set beforehand is most likely lost. Both writes therefore happen before the
-        streamer exists and before the device time is set, and a control asking for either
-        stages it for the next start.
+        streamer exists and before the device time is set, and a write of either while the
+        block runs is refused.
     trap: the device may move one selection when the other is written, so reading both back is
         the only certain statement of what the radio is running on.
 */
@@ -1546,6 +1549,279 @@ inline void applyReferenceSources(::uhd::usrp::multi_usrp& usrp, const std::stri
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[%s] set_%s_source(%s): %s (the device keeps the selection it had)\n", std::string(blockTag).c_str(), isClock ? "clock" : "time", want.c_str(), e.what());
         }
+    }
+}
+
+/*| contract: whether the owner count of UHD's device object answers heldElsewhere on the
+        motherboard named: true for a B2xx, the family the count is measured on, and false for
+        every other model.
+    measured: on a B210, the device object of a lone handle has two owners, counting the copy
+        heldElsewhere reads. After a second open of the same unit, the first handle reads six
+        and the second five.
+    trap: an RFNoC radio (an X3xx, an N3xx or an X4xx) may hold more owners on a lone handle,
+        and a count read there would take a lone block for one that shares the device. On those
+        radios a block that shares the device is not detected. It writes its own reference and
+        timing selection over the other block's, and the start compares only what the device
+        runs afterwards.
+    verified-by: controls.uhd-the-owner-count-is-read-on-a-b2xx-alone
+*/
+constexpr bool ownerCountMeasured(std::string_view model) { return model.starts_with("B2"); }
+
+/*| contract: whether another handle in this process holds the device this handle opened, on a
+        motherboard ownerCountMeasured names. False on every other motherboard and where the
+        name cannot be read.
+    trap: UHD hands a second open in one process the device already open, with the first open's
+        keys, and the device runs the first open's master clock. A block on such a handle writes
+        no reference or timing selection either: the device's selection belongs to the handle
+        that opened it, and the start compares its own settings with what the device runs.
+    verified-by: controls.uhd-the-owner-count-is-read-on-a-b2xx-alone
+*/
+template <typename Usrp>
+bool heldElsewhere(Usrp& usrp) {
+    if constexpr (requires { usrp.get_device(); usrp.get_mboard_name(0); }) {
+        try {
+            return ownerCountMeasured(usrp.get_mboard_name(0)) && usrp.get_device().use_count() > 2;
+        } catch (const std::exception&) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+}
+
+/*| contract: a rate or a master clock is met where the device runs it within this many hertz
+        of the value asked.
+    why: UHD's own test of a rate it did not meet is a difference of more than one sample per
+        second, on which it warns. A rate is the master clock over a whole decimation, computed
+        in double precision, so a met rate is equal to the request to far less than that.
+*/
+inline constexpr double kRunValueToleranceHz = 1.0;
+
+/*| contract: the four values a start compares with what the device runs once the streamer
+        exists: the reference and timing selections, the master clock and the rate. An empty
+        selection and a zero clock are automatic and ask for nothing.
+*/
+struct RunValues {
+    std::string clockSource{};
+    std::string timeSource{};
+    double      masterClockHz = 0.0;
+    double      rateHz        = 0.0;
+};
+
+/*| contract: the values a device runs for one direction on the channel named. A selection the
+        radio does not state reads empty, and a clock or rate it does not answer reads zero.
+*/
+template <typename Usrp>
+RunValues runValuesOf(Usrp& usrp, Direction dir, std::size_t channel) {
+    RunValues out;
+    try {
+        out.clockSource = usrp.get_clock_source(0);
+    } catch (const std::exception&) {
+    }
+    try {
+        out.timeSource = usrp.get_time_source(0);
+    } catch (const std::exception&) {
+    }
+    out.masterClockHz = masterClockOf(usrp);
+    try {
+        out.rateHz = dir == Direction::Receive ? usrp.get_rx_rate(channel) : usrp.get_tx_rate(channel);
+    } catch (const std::exception&) {
+    }
+    return out;
+}
+
+/*| contract: why a start fails where the device runs a value other than one the block asked
+        for, or an empty string. Each value missed is named with the value asked, the value in
+        force and the likely cause, and a value the device did not read is no conflict. joined
+        is heldElsewhere of the block's handle.
+    frame: a rate is asked for outright. A rate the block snapped to an entry of the clock's
+        ladder misses the request and fails the start as well.
+    verified-by: controls.uhd-a-start-names-each-value-the-device-does-not-run
+*/
+inline std::string runConflict(const RunValues& asked, const RunValues& running, bool joined, Direction dir) {
+    std::string out;
+    const auto  add = [&out](const std::string& line) { out += out.empty() ? line : "; " + line; };
+    const char* holder = "another block in this process holds the device and runs its own";
+    for (const auto& [name, want, have] : {std::tuple{"clock_source", &asked.clockSource, &running.clockSource}, std::tuple{"time_source", &asked.timeSource, &running.timeSource}}) {
+        if (!want->empty() && !have->empty() && *want != *have) {
+            add(std::format("{} asked {}, the device runs {}; {}", name, *want, *have, joined ? std::string(holder) + " selection" : std::string("the device did not take the selection")));
+        }
+    }
+    if (asked.masterClockHz > 0.0 && running.masterClockHz > 0.0 && std::abs(asked.masterClockHz - running.masterClockHz) > kRunValueToleranceHz) {
+        add(std::format("master_clock_rate asked {:.0f} Hz, the device runs {:.0f} Hz; {}", asked.masterClockHz, running.masterClockHz, joined ? std::string(holder) + " clock" : std::string("the device's own limit")));
+    }
+    if (asked.rateHz > 0.0 && running.rateHz > 0.0 && std::abs(asked.rateHz - running.rateHz) > kRunValueToleranceHz) {
+        add(std::format("sample_rate asked {:.0f} Hz, the device runs {:.0f} Hz; {}", asked.rateHz, running.rateHz,
+                        joined ? std::format("{} master clock of {:.0f} Hz", holder, running.masterClockHz) : std::format("the device's own limit: no {} of the {:.0f} Hz master clock reaches it", dir == Direction::Receive ? "decimation" : "interpolation", running.masterClockHz)));
+    }
+    return out;
+}
+
+/*| contract: a rate one DSP of the device has been set to: its direction, its channel and the
+        rate.
+*/
+struct DspRate {
+    Direction   dir     = Direction::Receive;
+    std::size_t channel = 0UZ;
+    double      hz      = 0.0;
+};
+
+/*| contract: the rates UHD's B2xx automatic master clock takes its least common multiple of:
+        every receive and transmit DSP of the first motherboard whose rate has been written,
+        read from the property tree. Empty where the device does not choose its own clock,
+        where the tree states no such node and where the tree cannot be read.
+    frame: UHD 4.9's b200_io_impl.cpp reads the same nodes, rate/set and rate/value under
+        /mboards/0/rx_dsps and /mboards/0/tx_dsps. A rate stays set for as long as the device
+        stays open, after the block that wrote it has stopped.
+*/
+template <typename Usrp>
+std::vector<DspRate> autoClockRates(Usrp& usrp) {
+    std::vector<DspRate> out;
+    try {
+        auto tree = usrp.get_device()->get_tree();
+        if (!tree->exists("/mboards/0/auto_tick_rate") || !tree->template access<bool>("/mboards/0/auto_tick_rate").get()) {
+            return out;
+        }
+        for (const Direction dir : {Direction::Receive, Direction::Transmit}) {
+            const std::string root = dir == Direction::Receive ? "/mboards/0/rx_dsps" : "/mboards/0/tx_dsps";
+            if (!tree->exists(root)) {
+                continue;
+            }
+            for (const std::string& dsp : tree->list(root)) {
+                const std::string path = root + "/" + dsp + "/rate";
+                std::size_t       channel = 0UZ;
+                if (std::from_chars(dsp.data(), dsp.data() + dsp.size(), channel).ec != std::errc{} || !tree->exists(path + "/set") || !tree->template access<bool>(path + "/set").get()) {
+                    continue;
+                }
+                out.push_back({.dir = dir, .channel = channel, .hz = tree->template access<double>(path + "/value").get()});
+            }
+        }
+    } catch (const std::exception&) {
+        out.clear();
+    }
+    return out;
+}
+
+/*| contract: why a rate of hz on the block's channels in direction dir would overflow UHD's
+        B2xx automatic master clock beside the rates set, or an empty string. The multiple takes
+        hz and every rate set other than those of the block's own channels in dir, each rounded
+        to a whole hertz as UHD rounds it, and is computed in 64 bits. asked is the block's
+        request, named beside hz where the device coerced it. A zero hz asks nothing.
+    why: UHD 4.9 takes that multiple in uint32_t when a rate is written and again when a
+        streamer is built (b200_io_impl.cpp), and a library built with assertions aborts the
+        process where it overflows. Two blocks of one graph can ask for such a pair, so the
+        start fails with this message before UHD is asked. A 2 MS/s receive request beside a
+        7.68 MS/s transmit rate passes at the write and is coerced to 1.981935 MS/s, whose
+        multiple with 7.68 MS/s overflows when the streamer is built.
+    trap: a block of two channels writes them one at a time, and UHD takes the second write
+        beside the rate the first one landed on. The check before the write takes the request
+        for both channels.
+    verified-by: controls.uhd-a-rate-pair-past-the-automatic-clock-is-refused
+    verified-by: uhd.a-rate-pair-past-the-automatic-clock-fails-the-start
+*/
+inline std::string autoClockOverflow(double asked, double hz, Direction dir, std::span<const std::size_t> channels, std::span<const DspRate> set) {
+    constexpr std::uint64_t kLimit = std::numeric_limits<std::uint32_t>::max();
+    const auto              whole  = [](double rate) { return static_cast<std::uint64_t>(std::floor(rate + 0.5)); };
+    if (!(hz > 0.0) || whole(hz) > kLimit) {
+        return {};
+    }
+    std::uint64_t multiple = whole(hz);
+    std::string   beside;
+    for (const DspRate& other : set) {
+        if ((other.dir == dir && std::ranges::find(channels, other.channel) != channels.end()) || !(other.hz > 0.0) || whole(other.hz) > kLimit) {
+            continue;
+        }
+        beside += std::format("{}{} rate of {:.0f} Hz", beside.empty() ? "" : " and ", other.dir == Direction::Receive ? "receive" : "transmit", other.hz);
+        if (multiple <= kLimit) {
+            multiple = std::lcm(multiple, whole(other.hz));
+        }
+    }
+    if (multiple <= kLimit) {
+        return {};
+    }
+    const std::string rate = std::abs(hz - asked) > 0.5 ? std::format("sample_rate asked {:.0f} Hz runs as {:.0f} Hz", asked, hz) : std::format("sample_rate asked {:.0f} Hz", asked);
+    return std::format("{} beside the device's {}; their least common multiple passes the 32 bits UHD's automatic master clock computes it in, and UHD would end the process", rate, beside);
+}
+
+/*| contract: the line naming the values in force that the block left automatic: an empty
+        selection or a zero clock. Empty where the block asked for every one.
+*/
+inline std::string automaticInForceLine(const RunValues& asked, const RunValues& running, std::string_view blockTag) {
+    std::string parts;
+    const auto  add = [&parts](const std::string& part) { parts += parts.empty() ? part : ", " + part; };
+    if (asked.clockSource.empty() && !running.clockSource.empty()) {
+        add("clock source " + running.clockSource);
+    }
+    if (asked.timeSource.empty() && !running.timeSource.empty()) {
+        add("time source " + running.timeSource);
+    }
+    if (!(asked.masterClockHz > 0.0) && running.masterClockHz > 0.0) {
+        add(std::format("master clock {:.0f} Hz", running.masterClockHz));
+    }
+    return parts.empty() ? std::string{} : std::format("[{}] the device runs {}", blockTag, parts);
+}
+
+/*| contract: the settings a run holds fixed, copied when the start has finished: the rate, the
+        master clock, the reference and timing selections, the wire format and the channel list.
+    why: each is either a device-wide value or an argument the streamer was built with. A rate
+        or a clock written under a running stream moves the rate and the tune of every block on
+        the device, and no other block is told.
+*/
+template <typename Channels>
+struct HeldForRun {
+    double      sampleRateHz  = 0.0;
+    double      masterClockHz = 0.0;
+    std::string clockSource;
+    std::string timeSource;
+    std::string wireFormat;
+    Channels    channels;
+};
+
+template <typename Block>
+HeldForRun<std::remove_cvref_t<decltype(std::declval<const Block&>().channels.value)>> heldForRun(const Block& block) {
+    return {.sampleRateHz = block.sample_rate.value, .masterClockHz = block.master_clock_rate.value, .clockSource = block.clock_source.value, .timeSource = block.time_source.value, .wireFormat = block.wire_format.value, .channels = block.channels.value};
+}
+
+/*| contract: refuse a write of a setting the run holds fixed. Each such setting in newSettings
+        goes back to the value held, leaves newSettings and forwardSettings, and is named on
+        standard error under blockTag. Called from the settings hook while the device is up.
+    verified-by: controls.uhd-a-running-source-refuses-the-settings-it-runs-on
+    verified-by: sink.uhd-a-running-sink-refuses-the-settings-it-runs-on
+*/
+template <typename Block, typename Channels, typename Map>
+void refuseRunningWrites(Block& block, const HeldForRun<Channels>& held, Map& newSettings, Map& forwardSettings, std::string_view blockTag) {
+    const auto refuse = [&](std::string_view key, const std::string& kept) {
+        newSettings.erase(std::pmr::string(key));
+        forwardSettings.erase(std::pmr::string(key));
+        std::fprintf(stderr, "[%s] %s is fixed while the block runs and keeps %s; a write applies while the block is stopped\n", std::string(blockTag).c_str(), std::string(key).c_str(), kept.c_str());
+    };
+    if (newSettings.contains("sample_rate")) {
+        block.sample_rate = held.sampleRateHz;
+        refuse("sample_rate", std::format("{:.0f} Hz", held.sampleRateHz));
+    }
+    if (newSettings.contains("master_clock_rate")) {
+        block.master_clock_rate = held.masterClockHz;
+        refuse("master_clock_rate", std::format("{:.0f} Hz", held.masterClockHz));
+    }
+    if (newSettings.contains("clock_source")) {
+        block.clock_source = held.clockSource;
+        refuse("clock_source", "'" + held.clockSource + "'");
+    }
+    if (newSettings.contains("time_source")) {
+        block.time_source = held.timeSource;
+        refuse("time_source", "'" + held.timeSource + "'");
+    }
+    if (newSettings.contains("wire_format")) {
+        block.wire_format = held.wireFormat;
+        refuse("wire_format", "'" + held.wireFormat + "'");
+    }
+    if (newSettings.contains("channels")) {
+        block.channels = held.channels;
+        std::string list;
+        for (const auto ch : held.channels) {
+            list += list.empty() ? std::to_string(ch) : "," + std::to_string(ch);
+        }
+        refuse("channels", "{" + list + "}");
     }
 }
 
@@ -1702,7 +1978,7 @@ inline std::optional<double> boundedControlValue(std::span<const ControlDesc> su
             within a millionth of the unit of one of its entries as that entry. It refuses every
             other value and names the entries on standard error under blockTag.
         why: a value stored under one radio is not moved onto an entry of another. A B2xx's
-            30.72 MHz clock replayed onto an X310 would otherwise pin a clock nobody picked.
+            30.72 MHz clock replayed onto an X310 would otherwise ask for a clock nobody picked.
         verified-by: controls.uhd-a-list-takes-its-entries-alone
     */
     if (desc->kind == 4 && !desc->anyInRange && value == value && !desc->listValues.empty()) {
@@ -1835,7 +2111,7 @@ void applyBandwidth(Usrp& usrp, Direction dir, double hz, std::optional<double>&
 
 /*| contract: replace ranges with the coverage the device states now for one direction, and keep
         the last statement when the device cannot be asked or states none.
-    invariant: it runs on every rate change, because a USRP's coverage moves with the rate and a
+    invariant: it runs behind every rate write, because a USRP's coverage moves with the rate and a
         request legal at one rate is outside the radio at another.
 */
 template <typename Usrp>

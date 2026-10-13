@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -44,6 +45,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -200,9 +202,7 @@ std::function<void()> onRefusal;
         was given, each stamped from whole master-clock ticks as UHD stamps a packet. A receive
         that asks for less than the rest of a block takes what it asked for, and the next one
         takes on from there, stamped at its own first sample as UHD stamps the rest of a frame.
-        A block at a rate other than the one before it moves the source's rate first and counts
-        a rate break, as the source's own rate change does. After the last block it asks the
-        loop to stop. No device is opened.
+        After the last block it asks the loop to stop. No device is opened.
 */
 struct StampedStream : ::uhd::rx_streamer {
     struct Block {
@@ -228,11 +228,6 @@ struct StampedStream : ::uhd::rx_streamer {
             return 0UZ;
         }
         const Block& block = blocks[next];
-        if (taken == 0UZ && block.rateHz != static_cast<double>(src.sample_rate.value)) {
-            src.sample_rate = block.rateHz;
-            src._rateBreaks.fetch_add(1, std::memory_order_relaxed);
-            src._lastGapCause.store(capture::uhd::Source::kGapRateChange, std::memory_order_relaxed);
-        }
         const std::size_t n = std::min(block.samples - taken, nsamps);
         std::fill_n(static_cast<std::complex<float>*>(buffs[0]), n, std::complex<float>{});
         md.has_time_spec = true;
@@ -252,9 +247,8 @@ struct StampedStream : ::uhd::rx_streamer {
         samples it read as shed and the gap markers it placed, by cause.
 */
 struct StampedRun {
-    std::uint64_t shed        = 0UL;
-    std::size_t   missing     = 0UZ;
-    std::size_t   rateChanges = 0UZ;
+    std::uint64_t shed    = 0UL;
+    std::size_t   missing = 0UZ;
 };
 
 StampedRun runStamped(double clockHz, double firstRateHz, std::vector<StampedStream::Block> blocks) {
@@ -275,7 +269,6 @@ StampedRun runStamped(double clockHz, double firstRateHz, std::vector<StampedStr
             if (std::string_view(key.data(), key.size()) == "rx_overflow_cause") {
                 const std::string_view cause = value.value_or(std::string_view{});
                 run.missing += cause == std::string_view("missing samples") ? 1UZ : 0UZ;
-                run.rateChanges += cause == std::string_view("rate change") ? 1UZ : 0UZ;
             }
         }
     }
@@ -501,8 +494,7 @@ int main(int argc, char** argv) {
         // A 300 ms gap at 8 MS/s, the cost of a host that stopped draining.
         expect(Source::shedBetween(t0, t0 + Spec(0.3), hz) == 2'400'000UL) << "the gap is the count, in samples";
 
-        // A block that arrived early is a reset and not a negative gap: the expectation was
-        // formed at the rate before a rate change.
+        // A block that arrived early is no negative gap.
         expect(Source::shedBetween(t0 + Spec(0.3), t0, hz) == 0UL) << "an early arrival sheds nothing";
         expect(Source::shedBetween(Spec(0.0), Spec(-5.0 / hz), hz) == 0UL) << "and neither does a stamp before the stream";
 
@@ -1432,7 +1424,7 @@ int main(int argc, char** argv) {
         expect(b205Clock->label == std::string("Master clock")) << "and the plain label";
     });
 
-    cases("controls.uhd-a-table-clock-applies-at-the-next-open", [] {
+    cases("controls.uhd-a-running-source-refuses-a-clock-it-does-not-run", [] {
         // An X310 opened on UHD's default 200 MHz clock, with no handle behind the block: a
         // device write would reach no handle.
         capture::uhd::Source source{};
@@ -1441,32 +1433,20 @@ int main(int argc, char** argv) {
         source._openTruth.mclkMaxHz = 200.0e6;
         source._openTruth.mclkHz    = 200.0e6;
         source.device_parameter     = std::string("type=x300,addr=192.168.40.2");
+        source._heldForRun          = capture::uhd::heldForRun(source);
         source._deviceUp.store(true);
-        expect(capture::kwargsValue(source.openAddress().to_string(), "master_clock_rate").empty()) << "the open carries no clock before a pick";
 
-        bool              taken  = false;
+        bool              taken  = true;
         const std::string change = stderrOf([&] { taken = source.setControl("MASTER_CLOCK", 184.32); });
-        expect(taken) << "a table clock is taken";
-        expect(change.find("the master clock 184.32 MHz takes effect at the next start that opens the device") != std::string::npos) << "and named: " << change;
-        expect(change.find("another block of this process holds open") != std::string::npos) << "with the open that does not apply it";
-        expect(source._masterClockPinnedHz == 184.32e6) << "pinned";
-        expect(source.openAddress().get("master_clock_rate", "") == std::string("184320000")) << "the next open carries it: " << source.openAddress().to_string();
-        expect(source.controlValue("MASTER_CLOCK") == std::optional<double>{200.0}) << "the clock in force is still the one the control reads";
+        expect(!taken) << "a table clock other than the one in force is refused";
+        expect(change.find("master_clock_rate is fixed while the block runs and keeps the 200000000 Hz clock") != std::string::npos) << "and named: " << change;
+        expect(capture::kwargsValue(source.openAddress().to_string(), "master_clock_rate").empty()) << "the next open carries no clock";
+        expect(source.controlValue("MASTER_CLOCK") == std::optional<double>{200.0}) << "the control reads the clock in force";
 
-        const std::string replay = stderrOf([&] { taken = source.setControl("MASTER_CLOCK", 184.32); });
-        expect(taken && replay.empty()) << "a replay of the pick says nothing: " << replay;
-        const std::string back = stderrOf([&] { taken = source.setControl("MASTER_CLOCK", 200.0); });
-        expect(taken && source._masterClockPinnedHz == 200.0e6 && back.find("200 MHz") != std::string::npos) << "the other entry is taken and named: " << back;
+        const std::string replay = stderrOf([&] { taken = source.setControl("MASTER_CLOCK", 200.0); });
+        expect(taken && replay.empty()) << "a write of the clock in force is taken and says nothing: " << replay;
         const std::string automatic = stderrOf([&] { taken = source.setControl("MASTER_CLOCK", 0.0); });
-        expect(taken && automatic.find("automatic master clock") != std::string::npos) << "the automatic entry leaves the clock to UHD at the next open";
-        expect(capture::kwargsValue(source.openAddress().to_string(), "master_clock_rate").empty()) << "with no clock in the open address";
-
-        // The start compares the clock it reads with the pin.
-        using capture::uhd::Source;
-        expect(Source::clockPinMissedLine(184.32e6, 184.32e6).empty()) << "a pin the open put in force says nothing";
-        expect(Source::clockPinMissedLine(0.0, 200.0e6).empty() && Source::clockPinMissedLine(184.32e6, 0.0).empty()) << "nor does no pin, or no clock read";
-        const std::string missed = Source::clockPinMissedLine(184.32e6, 200.0e6);
-        expect(missed.find("runs a 200 MHz master clock, not the pinned 184.32 MHz") != std::string::npos && missed.find("second open in one process") != std::string::npos) << missed;
+        expect(taken && automatic.empty()) << "so is the automatic entry where master_clock_rate asked for UHD's choice";
 
         // A product outside the table takes no clock.
         source._openTruth.model = "N210r4";
@@ -1495,101 +1475,147 @@ int main(int argc, char** argv) {
         source._openTruth = x310;
         source._deviceUp.store(true);
         expect(!source.setControl("MASTER_CLOCK", 30.72)) << "the replay is refused";
-        expect(!source._masterClockPinnedHz.has_value()) << "and pins nothing";
+        expect(capture::kwargsValue(source.openAddress().to_string(), "master_clock_rate").empty()) << "and the next open carries no clock";
         source._deviceUp.store(false);
     });
 
-    cases("controls.uhd-a-failed-open-clears-the-clock-pin", [] {
-        using gr::lifecycle::State;
-        expect(fatal(capture::uhd::test::uhdRefusesAddress())) << "UHD's parser refuses the address, so no device is asked for";
+    cases("controls.uhd-a-running-source-refuses-the-settings-it-runs-on", [] {
+        capture::uhd::Source source{};
+        const auto           apply = [&source](gr::property_map settings) {
+            return stderrOf([&] {
+                std::ignore = source.settings().setStaged(settings);
+                std::ignore = source.settings().applyStagedParameters();
+            });
+        };
+        const auto mapRate = [&source] {
+            const auto value = source.settings().get("sample_rate");
+            const auto* rate = value.has_value() ? value->get_if<double>() : nullptr;
+            return rate != nullptr ? *rate : 0.0;
+        };
 
-        /*| frame: a table pick on an X310 fails the open that carries it, as a clock the loaded
-                image or a TwinRX refuses does. The failed start stands for that open. */
-        capture::uhd::Source table{};
-        table.device_parameter = capture::uhd::test::kUnparsedAddress;
-        std::ignore            = table.changeStateTo(State::INITIALISED);
-        table._openTruth.model     = "X310";
-        table._openTruth.mclkMinHz = 200.0e6;
-        table._openTruth.mclkMaxHz = 200.0e6;
-        table._openTruth.mclkHz    = 200.0e6;
-        table._deviceUp.store(true);
-        std::ignore = stderrOf([&table] { expect(table.setControl("MASTER_CLOCK", 184.32)) << "the table pick is pinned"; });
-        table._deviceUp.store(false);
-        const auto tableStart = table.changeStateTo(State::RUNNING);
-        expect(fatal(!tableStart.has_value())) << "the start fails";
-        expect(tableStart.error().message.contains("the master clock pinned at 184.32 MHz is cleared")) << "and names the pin it clears: " << tableStart.error().message;
-        expect(!table._masterClockPinnedHz.has_value()) << "which is gone";
-        expect(!table._masterClockPinFromTable) << "and no longer marked as a table pick";
+        // Stopped: every write is taken, and the next start applies it.
+        std::ignore = apply({{"sample_rate", 4.0e6}, {"master_clock_rate", 16.0e6}, {"clock_source", std::string("gpsdo")}, {"time_source", std::string("gpsdo")}, {"wire_format", std::string("sc8")}, {"channels", std::vector<gr::Size_t>{1U}}});
+        expect(source.sample_rate == 4.0e6 && source.master_clock_rate == 16.0e6) << "a stopped block takes the rate and the clock";
+        expect(source.clock_source.value == "gpsdo" && source.time_source.value == "gpsdo" && source.wire_format.value == "sc8") << "the selections and the format";
+        expect(source.channels.value == std::vector<gr::Size_t>{1U}) << "and the channel list";
+        expect(source.openAddress().get("master_clock_rate", "") == std::string("16000000")) << "and the next open carries the clock";
 
-        /*| frame: a clock a live write put on a span radio, a B205mini at 30.72 MHz. The device
-                ran it, so a failed open is not its doing and the pin stays. */
-        capture::uhd::Source span{};
-        span.device_parameter = capture::uhd::test::kUnparsedAddress;
-        std::ignore           = span.changeStateTo(State::INITIALISED);
-        span._openTruth.model     = "B205mini";
-        span._openTruth.mclkMinHz = 220.0e3;
-        span._openTruth.mclkMaxHz = 61.44e6;
-        span._masterClockPinnedHz = 30.72e6;
-        const auto spanStart      = span.changeStateTo(State::RUNNING);
-        expect(fatal(!spanStart.has_value())) << "the start fails";
-        expect(!spanStart.error().message.contains("is cleared")) << "and names no pin: " << spanStart.error().message;
-        expect(span._masterClockPinnedHz == 30.72e6) << "the proven clock stays pinned";
-
-        // A pin of the automatic entry carried no clock.
-        capture::uhd::Source automatic{};
-        automatic._masterClockPinnedHz     = 0.0;
-        automatic._masterClockPinFromTable = true;
-        std::string cleared;
-        {
-            std::lock_guard lock(automatic._ctrlMutex);
-            cleared = automatic.clearClockPinAfterFailedOpenLocked();
+        // Running: the start copied the settings, and a write of any of them is refused.
+        source._heldForRun = capture::uhd::heldForRun(source);
+        source._deviceUp.store(true);
+        const std::string said = apply({{"sample_rate", 8.0e6}, {"master_clock_rate", 30.72e6}, {"clock_source", std::string("internal")}, {"time_source", std::string("internal")}, {"wire_format", std::string("sc16")}, {"channels", std::vector<gr::Size_t>{0U, 1U}}});
+        expect(source.sample_rate == 4.0e6 && source.master_clock_rate == 16.0e6) << "the rate and the clock keep their values";
+        expect(source.clock_source.value == "gpsdo" && source.time_source.value == "gpsdo" && source.wire_format.value == "sc8") << "so do the selections and the format";
+        expect(source.channels.value == std::vector<gr::Size_t>{1U}) << "and the channel list";
+        for (const char* name : {"sample_rate is fixed while the block runs and keeps 4000000 Hz", "master_clock_rate is fixed while the block runs and keeps 16000000 Hz", "clock_source is fixed while the block runs and keeps 'gpsdo'",
+                                 "time_source is fixed while the block runs and keeps 'gpsdo'", "wire_format is fixed while the block runs and keeps 'sc8'", "channels is fixed while the block runs and keeps {1}"}) {
+            expect(said.find(name) != std::string::npos) << "each refusal is named: " << name << " in " << said;
         }
-        expect(cleared.empty() && automatic._masterClockPinnedHz == 0.0) << "and stays";
+        std::ignore = apply({});
+        expect(mapRate() == 4.0e6) << "the next sweep publishes the value held";
+        expect(source.openAddress().get("master_clock_rate", "") == std::string("16000000")) << "and the next open carries the clock held";
+
+        // Every other setting stays live.
+        const std::string live = apply({{"tag_interval", 2.0f}});
+        expect(source.tag_interval == 2.0f && live.find("fixed while the block runs") == std::string::npos) << "a setting outside the six is taken";
+
+        // Stopped again: a write is taken for the next start.
+        source._deviceUp.store(false);
+        std::ignore = apply({{"sample_rate", 2.0e6}});
+        expect(source.sample_rate == 2.0e6) << "a write after the stop is taken";
     });
 
-    cases("controls.uhd-a-settings-write-clears-the-pins", [] {
-        capture::uhd::Source source{};
-        source.device_parameter = std::string("type=x300,addr=192.168.40.2");
-        const auto pinAll = [&source] {
-            std::lock_guard lock(source._ctrlMutex);
-            source._masterClockPinnedHz = 184.32e6;
-            source._wireFormatPinned    = std::string("sc8");
-            source._clockSourcePinned   = std::string("external");
-            source._timeSourcePinned    = std::string("external");
-        };
-        const auto apply = [&source](gr::property_map settings) {
-            std::ignore = source.settings().setStaged(settings);
-            std::ignore = source.settings().applyStagedParameters();
-        };
+    cases("controls.uhd-a-start-names-each-value-the-device-does-not-run", [] {
+        using capture::uhd::Direction;
+        using capture::uhd::RunValues;
+        using capture::uhd::runConflict;
+        const RunValues running{.clockSource = "internal", .timeSource = "internal", .masterClockHz = 32.0e6, .rateHz = 2.0e6};
 
-        pinAll();
-        apply({{"master_clock_rate", 200.0e6}});
-        expect(!source._masterClockPinnedHz.has_value()) << "a write of master_clock_rate clears the clock pin";
-        expect(source._wireFormatPinned.has_value() && source._clockSourcePinned.has_value() && source._timeSourcePinned.has_value()) << "and no other";
-        expect(source.openAddress().get("master_clock_rate", "") == std::string("200000000")) << "the setting reaches the next open";
-        apply({{"wire_format", std::string("sc8")}});
-        expect(!source._wireFormatPinned.has_value() && source._clockSourcePinned.has_value()) << "a write of wire_format clears the format pin alone";
-        apply({{"clock_source", std::string("internal")}});
-        expect(!source._clockSourcePinned.has_value() && source._timeSourcePinned.has_value()) << "one of clock_source the reference pin";
-        apply({{"time_source", std::string("internal")}});
-        expect(!source._timeSourcePinned.has_value()) << "and one of time_source the timing pin";
+        expect(runConflict(running, running, false, Direction::Receive).empty()) << "a device running every value asked is no conflict";
+        expect(runConflict(RunValues{}, running, true, Direction::Receive).empty()) << "nor is one where every value is automatic, whoever holds the device";
+        expect(runConflict({.rateHz = 2.0e6 + 0.9}, running, false, Direction::Receive).empty()) << "a rate within UHD's one sample per second is met";
 
-        /*| frame: the hook called directly, so the comparison with the device string held is
-                what decides. A settings pass through the core never carries an unchanged value.
-        */
-        pinAll();
-        gr::property_map forward;
-        const gr::property_map held{{"device_parameter", std::string("type=x300,addr=192.168.40.2")}};
-        gr::property_map       carried = held;
-        source.settingsChanged(held, carried, forward);
-        expect(source._masterClockPinnedHz == 184.32e6 && source._wireFormatPinned.has_value() && source._clockSourcePinned.has_value() && source._timeSourcePinned.has_value()) << "a pass whose device string was already held keeps the pins";
-        const gr::property_map before{{"device_parameter", std::string("type=b200")}};
-        source.settingsChanged(before, carried, forward);
-        expect(!source._masterClockPinnedHz.has_value() && !source._wireFormatPinned.has_value() && !source._clockSourcePinned.has_value() && !source._timeSourcePinned.has_value()) << "one that moved it clears every pin";
+        const std::string clock = runConflict({.clockSource = "gpsdo"}, running, true, Direction::Transmit);
+        expect(clock == "clock_source asked gpsdo, the device runs internal; another block in this process holds the device and runs its own selection") << clock;
+        const std::string time = runConflict({.timeSource = "gpsdo"}, running, false, Direction::Receive);
+        expect(time == "time_source asked gpsdo, the device runs internal; the device did not take the selection") << time;
 
-        pinAll();
-        apply({{"device_parameter", std::string("type=n3xx,addr=192.168.10.2")}});
-        expect(!source._masterClockPinnedHz.has_value() && !source._wireFormatPinned.has_value() && !source._clockSourcePinned.has_value() && !source._timeSourcePinned.has_value()) << "another device clears every pin";
+        const std::string mclk = runConflict({.masterClockHz = 30.72e6}, running, true, Direction::Receive);
+        expect(mclk == "master_clock_rate asked 30720000 Hz, the device runs 32000000 Hz; another block in this process holds the device and runs its own clock") << mclk;
+
+        const RunValues   snapped{.clockSource = "internal", .timeSource = "internal", .masterClockHz = 30.72e6, .rateHz = 1.92e6};
+        const std::string rate = runConflict({.masterClockHz = 30.72e6, .rateHz = 2.0e6}, snapped, false, Direction::Receive);
+        expect(rate == "sample_rate asked 2000000 Hz, the device runs 1920000 Hz; the device's own limit: no decimation of the 30720000 Hz master clock reaches it") << rate;
+        const std::string shared = runConflict({.rateHz = 7.68e6}, {.masterClockHz = 32.0e6, .rateHz = 8.0e6}, true, Direction::Transmit);
+        expect(shared == "sample_rate asked 7680000 Hz, the device runs 8000000 Hz; another block in this process holds the device and runs its own master clock of 32000000 Hz") << shared;
+
+        const std::string both = runConflict({.clockSource = "gpsdo", .rateHz = 4.0e6}, running, true, Direction::Receive);
+        expect(both.find("clock_source asked gpsdo") == 0UZ && both.find("; sample_rate asked 4000000 Hz") != std::string::npos) << "two values missed are named in one message: " << both;
+
+        expect(capture::uhd::automaticInForceLine({.masterClockHz = 0.0, .rateHz = 2.0e6}, running, "uhd::Source") == "[uhd::Source] the device runs clock source internal, time source internal, master clock 32000000 Hz")
+            << "the values left automatic are stated";
+        expect(capture::uhd::automaticInForceLine(running, running, "uhd::Source").empty()) << "and nothing where every value was asked for";
+    });
+
+    cases("controls.uhd-the-owner-count-is-read-on-a-b2xx-alone", [] {
+        using capture::uhd::heldElsewhere;
+        TreeStandIn usrp;
+        usrp.mboardName = "B210";
+        expect(!heldElsewhere(usrp)) << "a lone handle on a B210: the device object and the copy read";
+        const auto other = usrp.device; // a second owner, as a second open adds
+        expect(heldElsewhere(usrp)) << "a B210 another owner holds";
+        for (const char* model : {"B200mini", "B205mini"}) {
+            usrp.mboardName = model;
+            expect(heldElsewhere(usrp)) << model << " reads the count as a B210 does";
+        }
+        for (const char* model : {"X310", "N310", "X410", "N210r4"}) {
+            usrp.mboardName = model;
+            expect(!heldElsewhere(usrp)) << model << " is not read, whatever the count";
+        }
+        expect(usrp.get_device().use_count() > 2) << "the count those models were not read on stays above a lone handle's";
+    });
+
+    cases("controls.uhd-a-rate-pair-past-the-automatic-clock-is-refused", [] {
+        using capture::uhd::autoClockOverflow;
+        using capture::uhd::Direction;
+        using capture::uhd::DspRate;
+        constexpr std::array<std::size_t, 1> first{0UZ};
+        const double                          coerced = 61.44e6 / 31.0; // 2 MS/s on a 61.44 MHz clock, decimation 31
+        const auto                            lcm64   = [](std::uint64_t a, std::uint64_t b) { return std::lcm(a, b); };
+        expect(fatal(lcm64(1981935U, 7680000U) > std::numeric_limits<std::uint32_t>::max())) << "the pair overflows 32 bits";
+        expect(fatal(lcm64(2000000U, 7680000U) <= std::numeric_limits<std::uint32_t>::max())) << "and the request beside the same rate does not";
+
+        const std::vector<DspRate> sinkFirst{{.dir = Direction::Transmit, .channel = 0UZ, .hz = 7.68e6}, {.dir = Direction::Receive, .channel = 0UZ, .hz = coerced}};
+        expect(autoClockOverflow(2.0e6, 2.0e6, Direction::Receive, first, sinkFirst).empty()) << "the write of 2 MS/s beside 7.68 MS/s passes";
+        const std::string built = autoClockOverflow(2.0e6, coerced, Direction::Receive, first, sinkFirst);
+        expect(built == "sample_rate asked 2000000 Hz runs as 1981935 Hz beside the device's transmit rate of 7680000 Hz; their least common multiple passes the 32 bits UHD's automatic master clock computes it in, and UHD would end the process")
+            << built;
+
+        const std::vector<DspRate> sourceFirst{{.dir = Direction::Receive, .channel = 0UZ, .hz = coerced}};
+        const std::string          written = autoClockOverflow(7.68e6, 7.68e6, Direction::Transmit, first, sourceFirst);
+        expect(written == "sample_rate asked 7680000 Hz beside the device's receive rate of 1981935 Hz; their least common multiple passes the 32 bits UHD's automatic master clock computes it in, and UHD would end the process")
+            << written;
+        expect(autoClockOverflow(7.68e6, 7.68e6, Direction::Receive, first, sourceFirst).empty()) << "the block's own channel is the rate it replaces";
+        expect(!autoClockOverflow(7.68e6, 7.68e6, Direction::Receive, std::array<std::size_t, 1>{1UZ}, sourceFirst).empty()) << "and another channel of its direction is not";
+        expect(autoClockOverflow(2.5e6, 61.44e6 / 25.0, Direction::Receive, first, sinkFirst).empty()) << "2.5 MS/s coerced to 2.4576 MS/s beside 7.68 MS/s passes";
+        expect(autoClockOverflow(0.0, 0.0, Direction::Receive, first, sinkFirst).empty()) << "a rate nobody read back asks nothing";
+
+        TreeStandIn usrp;
+        usrp.mboardName = "B210";
+        auto tree       = usrp.device->tree;
+        expect(capture::uhd::autoClockRates(usrp).empty()) << "a tree without the automatic clock node";
+        tree->create<bool>("/mboards/0/auto_tick_rate").set(false);
+        for (const auto& [dsp, set, hz] : {std::tuple{"/mboards/0/rx_dsps/0", true, coerced}, std::tuple{"/mboards/0/rx_dsps/1", false, 1.0e6}, std::tuple{"/mboards/0/tx_dsps/0", true, 7.68e6}}) {
+            tree->create<bool>(std::string(dsp) + "/rate/set").set(set);
+            tree->create<double>(std::string(dsp) + "/rate/value").set(hz);
+        }
+        expect(capture::uhd::autoClockRates(usrp).empty()) << "a clock the open fixed";
+        tree->access<bool>("/mboards/0/auto_tick_rate").set(true);
+        const auto rates = capture::uhd::autoClockRates(usrp);
+        expect(fatal(rates.size() == 2UZ)) << "the two DSPs whose rates were written, of " << rates.size();
+        expect(rates[0].dir == Direction::Receive && rates[0].channel == 0UZ && rates[0].hz == coerced);
+        expect(rates[1].dir == Direction::Transmit && rates[1].channel == 0UZ && rates[1].hz == 7.68e6);
+        expect(autoClockOverflow(2.0e6, coerced, Direction::Receive, first, rates) == built) << "the tree read gives the same answer";
     });
 
     cases("controls.uhd-the-receive-depth-is-stated-in-time", [] {
@@ -2065,16 +2091,12 @@ int main(int argc, char** argv) {
 
     cases("controls.uhd-a-gap-marker-names-its-cause", [] {
         using capture::uhd::Source;
-        // Three things make a hole in this stream and a reader has to tell them apart: a
-        // buffer the radio ran over, a packet the link lost, and a rate change this block
-        // emptied the transport across. The marker carries the name of the one that made it.
+        // Two counted things make a hole in this stream and a reader has to tell them apart: a
+        // buffer the radio ran over and a packet the link lost. The marker carries the name of
+        // the one that made it.
         expect(std::string_view(Source::gapCauseName(Source::kGapLostPacket)) == std::string_view("lost packet")) << "a packet the link lost is named as one";
-        expect(std::string_view(Source::gapCauseName(Source::kGapRateChange)) == std::string_view("rate change")) << "and a rate change as one";
         expect(std::string_view(Source::gapCauseName(Source::kGapBufferOverrun)) == std::string_view("overflow")) << "and the radio's own overrun as one";
-
-        const std::string_view names[] = {Source::gapCauseName(Source::kGapBufferOverrun), Source::gapCauseName(Source::kGapLostPacket), Source::gapCauseName(Source::kGapRateChange)};
-        expect(names[0] != names[1] && names[1] != names[2] && names[0] != names[2]) << "the three names are three, so a reader can tell them apart";
-        expect(std::string_view(Source::gapCauseName(99)) == names[0]) << "a value naming none of the three reads as the radio's own overrun";
+        expect(std::string_view(Source::gapCauseName(99)) == std::string_view("overflow")) << "a value naming neither reads as the radio's own overrun";
     });
 
     cases("controls.uhd-a-retune-forwards-nothing-ahead-of-its-samples", [] {
@@ -2119,27 +2141,22 @@ int main(int argc, char** argv) {
         expect(std::string_view(Source::gapCauseName(Source::kGapMissingSamples)) == std::string_view("missing samples")) << "under the words missing samples";
         expect(Source::gapMarkerFor(false, Source::kGapBufferOverrun, 1068UL, true) == std::optional<int>(Source::kGapRetune)) << "and under retune where a tune is open";
         expect(Source::gapMarkerFor(true, Source::kGapLostPacket, 1068UL, false) == std::optional<int>(Source::kGapLostPacket)) << "a gap a counter recorded names its counted cause";
-        expect(Source::gapMarkerFor(true, Source::kGapRateChange, 0UL, false) == std::optional<int>(Source::kGapRateChange)) << "whether or not the stamps measure a shed";
+        expect(Source::gapMarkerFor(true, Source::kGapLostPacket, 0UL, false) == std::optional<int>(Source::kGapLostPacket)) << "whether or not the stamps measure a shed";
         expect(!Source::gapMarkerFor(false, Source::kGapBufferOverrun, 0UL, true).has_value()) << "a block that follows the last without a gap carries no marker";
     });
 
     cases("controls.uhd-stamps-off-the-sample-grid-count-only-lost-samples", [] {
         using Block = StampedStream::Block;
         using Spec  = ::uhd::time_spec_t;
-        /*| frame: the stamps a B205mini handed over across a live change from 1 MS/s to 8 MS/s
-                with its master clock at 32 MHz. At 1 MS/s the first sample of each block sat
-                14 of 32 ticks off that rate's grid, and at 8 MS/s 2 of 4 ticks, half a sample.
+        /*| frame: the 8 MS/s stamps a B205mini handed over with its master clock at 32 MHz. The
+                first sample of each block sat 2 of 4 ticks off that rate's grid, half a sample.
                 Each block holds 16384 samples and follows the one before it with none lost.
         */
         constexpr double    kClock = 32.0e6;
-        constexpr long long kSlow  = 176'993'358LL;
         constexpr long long kFast  = 226'929'306LL;
         constexpr long long kStep  = 16'384LL * 4;
         const auto          upTo   = [](long long fastBlocks) {
             std::vector<Block> blocks;
-            for (long long k = 0; k < 4; ++k) {
-                blocks.push_back({1.0e6, kSlow + k * 16'384LL * 32, 16'384UZ});
-            }
             for (long long k = 0; k < fastBlocks; ++k) {
                 blocks.push_back({8.0e6, kFast + k * kStep, 16'384UZ});
             }
@@ -2150,10 +2167,9 @@ int main(int argc, char** argv) {
         // UHD rounds each stamp to the 8 MS/s grid on its own, and the half goes both ways:
         // blocks 19 and 20 of the run, one straight after the other, round 16385 samples apart.
         expect(ticksAt(kFast + 20 * kStep) - ticksAt(kFast + 19 * kStep) == 16'385LL) << "the fixture's stamps round apart";
-        const auto clean = runStamped(kClock, 1.0e6, upTo(40));
+        const auto clean = runStamped(kClock, 8.0e6, upTo(40));
         expect(clean.shed == 0UL) << "forty blocks with no sample between them shed none, not" << std::to_string(clean.shed);
         expect(clean.missing == 0UZ) << "and carry no missing-samples marker";
-        expect(clean.rateChanges == 1UZ) << "the one marker names the rate change";
 
         // One sample lost after block 16, whose stamp UHD rounds up, before a block it rounds
         // down; and one lost after block 19, rounded down, before a block rounded up.
@@ -2163,12 +2179,12 @@ int main(int argc, char** argv) {
         expect(ticksAt(downThenUp) - ticksAt(kFast + 19 * kStep) == 16'386LL) << "and the second as two";
         auto early = upTo(17);
         early.push_back({8.0e6, upThenDown, 16'384UZ});
-        const auto first = runStamped(kClock, 1.0e6, std::move(early));
+        const auto first = runStamped(kClock, 8.0e6, std::move(early));
         expect(first.shed == 1UL) << "a sample lost between a stamp rounded up and one rounded down counts one, not" << std::to_string(first.shed);
         expect(first.missing == 1UZ) << "and carries one missing-samples marker";
         auto late = upTo(20);
         late.push_back({8.0e6, downThenUp, 16'384UZ});
-        const auto second = runStamped(kClock, 1.0e6, std::move(late));
+        const auto second = runStamped(kClock, 8.0e6, std::move(late));
         expect(second.shed == 1UL) << "a sample lost between a stamp rounded down and one rounded up counts one, not" << std::to_string(second.shed);
         expect(second.missing == 1UZ) << "and carries one missing-samples marker";
     });
@@ -2589,11 +2605,16 @@ int main(int argc, char** argv) {
         // A B205mini whose open address carried master_clock_rate: the clock is in force from
         // the first sample, and the source holds no device, so a write would reach no handle.
         capture::uhd::Source source{};
-        source._clockInForceHz = 30.72e6;
-        source._rateWrittenHz  = 1.92e6;
-        expect(source.applyMasterClockLocked(30.72 * 1e6)) << "a replay of the clock in force answers true";
-        expect(source._rateWrittenHz == 1.92e6 && !source._restageRate.load()) << "with no write, the rate cache kept and no restage of the rate";
-        expect(source._masterClockPinnedHz == 30.72 * 1e6) << "and the clock pinned";
+        source.master_clock_rate = 30.72e6;
+        source._openTruth.mclkHz = 30.72e6;
+        source._clockInForceHz   = 30.72e6;
+        source._rateWrittenHz    = 1.92e6;
+        source._heldForRun       = capture::uhd::heldForRun(source);
+        bool              taken  = false;
+        const std::string said   = stderrOf([&] { taken = source.masterClockWriteLocked(30.72 * 1e6); });
+        expect(taken && said.empty()) << "a replay of the clock in force answers true and says nothing: " << said;
+        expect(source._rateWrittenHz == 1.92e6) << "with no write and the rate cache kept";
+        expect(!source.masterClockWriteLocked(0.0)) << "the automatic entry is refused where the run asked for a clock";
     });
 
     cases("controls.uhd-a-bounded-gain-is-written-back", [] {
@@ -2699,20 +2720,19 @@ int main(int argc, char** argv) {
         source._openTruth.mclkHz       = 32.0e6;
         source._clockSources           = source._openTruth.clockSources;
         source._timeSources            = source._openTruth.timeSources;
+        source._heldForRun             = capture::uhd::heldForRun(source);
         source._deviceUp.store(true);
         const std::string replay = stderrOf([&source] {
-            expect(source.setControl("CLOCK_SOURCE", 0.0) && source.setControl("TIME_SOURCE", 0.0)) << "the reference and the timing selection are staged";
+            expect(source.setControl("CLOCK_SOURCE", 0.0) && source.setControl("TIME_SOURCE", 0.0)) << "the reference and the timing selection in force are taken";
             expect(source.setControl("WIRE_FORMAT", 0.0) && source.setControl("MASTER_CLOCK", 0.0)) << "and so are the format and the automatic clock";
         });
         expect(replay.empty()) << "a replay of what is in force prints nothing: " << replay;
-        const std::string change = stderrOf([&source] { std::ignore = source.setControl("CLOCK_SOURCE", 1.0); });
-        expect(change.find("the clock source external takes effect at the next start") != std::string::npos) << "a change is named";
-        const std::string again = stderrOf([&source] { std::ignore = source.setControl("CLOCK_SOURCE", 1.0); });
-        expect(again.empty()) << "once";
-        source._masterClockPinnedHz.reset();
-        source._clockInForceHz  = 30.72e6; // an open address that fixed the clock
-        const std::string clock = stderrOf([&source] { std::ignore = source.setControl("MASTER_CLOCK", 0.0); });
-        expect(clock.find("automatic master clock") != std::string::npos) << "and the automatic clock is named where the open fixed one";
+        bool              taken  = true;
+        const std::string change = stderrOf([&] { taken = source.setControl("CLOCK_SOURCE", 1.0); });
+        expect(!taken && change.find("clock_source is fixed while the block runs and keeps 'internal'") != std::string::npos) << "a change is refused and named: " << change;
+        const std::string format = stderrOf([&] { taken = source.setControl("WIRE_FORMAT", 1.0); });
+        expect(!taken && format.find("wire_format is fixed while the block runs and keeps 'sc16'") != std::string::npos) << "and so is a change of format: " << format;
+        expect(source.clock_source.value.empty() && source.wire_format.value == "sc16") << "the settings keep their values";
         source._deviceUp.store(false);
     });
 

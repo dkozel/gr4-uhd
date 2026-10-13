@@ -150,7 +150,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
     gr::Annotated<double, "send_frame_size", gr::Unit<"B">, gr::Doc<"transport frame bytes; 0 lets UHD choose">>      send_frame_size   = 0.0;
     gr::Annotated<double, "num_send_frames", gr::Doc<"transport frames; 0 lets UHD choose">>                          num_send_frames   = 0.0;
     gr::Annotated<double, "send_buff_size", gr::Unit<"B">, gr::Doc<"socket buffer bytes; 0 lets UHD choose">>         send_buff_size    = 0.0;
-    // The two below size the transmit queue at the start and at each rate change.
+    // The two below size the transmit queue at the start.
     gr::Annotated<double, "queue_duration", gr::Unit<"s">, gr::Doc<"transmit queue length in time">>                 queue_duration  = QueueBound{}.seconds;
     gr::Annotated<double, "queue_max_bytes", gr::Unit<"B">, gr::Doc<"most bytes the transmit queue takes">>          queue_max_bytes = QueueBound{}.maxBytes;
     /*| contract: where the drain thread runs, read by the start and the caller's to set. Unset,
@@ -180,18 +180,15 @@ channels one send carries both, so a burst tag on either input marks the burst o
     std::atomic<bool>           _drainDead{false}; // the drain met a send it could not place
     std::atomic<bool>           _bursting{false};  // a burst is open on the streamer
     std::atomic<bool>           _held{false};      // a pause ended the burst
-    /*| role: a rate change asking the drain to end the burst and stand off the ring, and the
-            drain's answer that it has.
-        why: the settings thread is the block's own worker, and every other block in its job
-            waits behind it. Taking the send mutex there puts that whole job behind a send
-            against a device that stopped consuming, which is kSendTimeoutS of it. A flag the
-            drain reads ends the burst on the one thread that sends and waits on no device.
+    /*| role: the drain's answer that it has ended the burst for a pause and stands off the
+            ring.
+        why: the end of burst is a send, and against a device that stopped consuming it runs
+            kSendTimeoutS. The flag keeps the parked drain from attempting it on every pass.
     */
-    std::atomic<bool> _rateBreak{false};
     std::atomic<bool> _drainParked{false};
     /*| role: the drain's one wait between sends. The work call rings it after each write
-            into the queue, and every writer of the pause, the rate break and the drain's stop
-            flag rings it after the write.
+            into the queue, and every writer of the pause and the drain's stop flag rings it
+            after the write.
     */
     RingDoorbell _drainBell;
     /*| role: the most samples one send carries at the rate in force, published beside the ring
@@ -225,6 +222,14 @@ channels one send carries both, so a burst tag on either input marks the burst o
     DeviceTruth _openTruth;
     double         _rateActualHz  = 0.0;
     double         _clockInForceHz = 0.0; // the clock the open address fixed, zero where UHD chooses
+    /*| frame: the rate the start was asked for, whether another handle in this process held the
+            device at the open, and the settings the run holds fixed, copied when the start has
+            finished and empty before the first. Written by start() before the device is marked
+            up.
+    */
+    double                              _askedRateHz = 0.0;
+    bool                                _joined      = false;
+    std::optional<HeldForRun<std::vector<gr::Size_t>>> _heldForRun;
     double         _appliedFreqHz = 0.0;
     /*| invariant: the caller's own request, beside the frequency the tuner reached. The
             commanded value is the request scaled by the reference correction, and at 100 ppm
@@ -240,10 +245,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
     std::size_t                            _maxSendSamples = 0UZ;
     std::size_t                            _deviceHeldBytes = kDeviceHeldBytes; // deviceHeldBytesFor the open address
     QueueBound                             _queueBound;                         // queue_duration and queue_max_bytes as the last sizing read them
-    /*| role: queue storage a resize takes or gives back under _ctrlMutex. A caller allocates
-            it before taking the mutex and frees what comes back after letting the mutex go.
-    */
-    RingStorage<std::complex<float>>       _queueSpare;
     mutable SensorNames                    _sensorNames;              // timed at the first sweep of a run
     mutable bool                           _sensorNamesTaken = false; // whether that sweep has kept them
     std::vector<std::size_t>               _channels{0UZ};          // the device channels in and in2 feed, written by start() before the device opens
@@ -265,19 +266,11 @@ channels one send carries both, so a burst tag on either input marks the burst o
             holds a single element no one reads.
     */
     SpscRing<std::complex<float>> _ring2{1UZ};
-    RingStorage<std::complex<float>> _queueSpare2; // the second channel's _queueSpare
-    /*| invariant: the ring's capacity, published where a reader can see it. A rate change
+    /*| invariant: the ring's capacity, published where a reader can see it. A start
             replaces the ring's storage, so a reading taken on a third thread asks this rather
             than asking the vector being reassigned how large it is.
     */
     std::atomic<std::size_t>         _ringCapacity{1UZ << 19};
-    /*| role: the capacity the rate in force asks for, in samples, published beside the ring's
-            own. The rate applier writes it whether or not the resize behind it landed.
-        invariant: the two are equal for a queue sized at the rate it is running at. A refused
-            park leaves the ring's own capacity above this one, which is the one state the
-            drain and the work call retry the resize from.
-    */
-    std::atomic<std::size_t>         _ringWantSamples{1UZ << 19};
     /*| role: a queued sample that carries a burst tag, by its ring index, and what one send
             takes from the queue and carries.
         frame: a ring index counts from the last time the queue was sized, as the ring's own
@@ -472,8 +465,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
             a positive number.
         why: the drain hands the streamer the whole contiguous span the queue holds, and UHD
             cuts it into frames itself. The block's own work then happens once per send rather
-            than once per frame. The cap bounds how long one send keeps the drain from a pause,
-            a rate break or a stop, and whole frames leave at most one short packet per send.
+            than once per frame. The cap bounds how long one send keeps the drain from a pause
+            or a stop, and whole frames leave at most one short packet per send.
         verified-by: sink.uhd-a-send-takes-the-span-up-to-the-cap
     */
     static std::size_t sendCapSamples(double rateHz, std::size_t maxSendSamples) {
@@ -569,17 +562,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
     */
     std::uint64_t discardedAtHoldSamples() const { return _counters.discardedAtHold.load(std::memory_order_relaxed); }
 
-    /*| contract: samples a rate change threw away, counted from the start of the current run.
-            They were handed over and never transmitted.
-        why: the queue is played out at the rate it was staged at before the new rate is
-            written, and the resize behind that play-out hands both ends fresh storage. What
-            the play-out could not place therefore goes nowhere, and the path that leaves
-            samples there is a device that stopped consuming, which is also a device with no
-            rate to send them at.
-        verified-by: sink.uhd-a-rate-change-counts-what-it-discards
-    */
-    std::uint64_t discardedAtRateChangeSamples() const { return _counters.discardedAtRateChange.load(std::memory_order_relaxed); }
-
     /*| contract: samples the last stop could not get out, from the queue it was still holding
             when its deadline expired. Zero for a stop that played the queue out.
         why: a burst that ended early and one that played whole leave the same silence behind
@@ -588,7 +570,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
     std::uint64_t unsentAtStopSamples() const { return _counters.unsentAtStop.load(std::memory_order_relaxed); }
 
     /*| contract: ends of burst the device acknowledged since the run started: one per burst whose
-            last sample left the radio, a pause, a rate change and a stop each ending one. With
+            last sample left the radio, a pause and a stop each ending one. With
             two channels an end counts once both chains have acknowledged it, and with one
             channel every acknowledgment counts, whichever chain it names.
         why: each transmit chain of a stream acknowledges an end of burst on its own.
@@ -632,7 +614,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
     std::uint64_t queuedSamples() const { return static_cast<std::uint64_t>(ringElements()); }
 
     // The queue's own fill, bounded by the capacity published beside the ring rather than by
-    // the storage a rate change replaces.
+    // the storage a start replaces.
     std::size_t ringElements() const { return ringFillBounded(_ring, _ringCapacity.load(std::memory_order_acquire)); }
 
     // Whether a pause has ended the burst and no resume has followed it.
@@ -640,9 +622,9 @@ channels one send carries both, so a burst tag on either input marks the burst o
 
     /*| frame: the status readers below take the control mutex with this deadline and answer the
             block-is-down value where they cannot get it. The blocking form waits for whatever
-            the mutex is held for, and a rate change holds it through a play-out of up to half
-            a second: a window that stops for half a second is worse than a reading that did
-            not arrive.
+            the mutex is held for, and a device call holds it for as long as the device takes
+            to answer: a window that stops for that long is worse than a reading that did not
+            arrive.
         contract: an empty answer means the reading did not arrive and is asked for again. It
             does not say the device has gone; deviceUp() says that, and it takes no lock.
         verified-by: ctrlguard.a-bounded-wait-gives-up-and-holds-no-lock
@@ -785,7 +767,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
         out.push_back({.id = "tx_underrun_events", .label = "Underruns", .value = std::format("{}", underrunEvents()), .good = true, .brief = true});
         out.push_back({.id = "tx_sequence_errors", .label = "Lost packets", .value = std::format("{}", sequenceErrors()), .good = true, .brief = false});
         out.push_back({.id = "tx_late_packets", .label = "Late packets", .value = std::format("{}", latePackets()), .good = true, .brief = false});
-        out.push_back({.id = "tx_discarded_at_rate_change", .label = "Dropped at a rate change", .value = std::format("{} samples", discardedAtRateChangeSamples()), .good = true, .brief = false});
         out.push_back({.id = "tx_unsent_at_stop", .label = "Unsent at stop", .value = std::format("{} samples", unsentAtStopSamples()), .good = true, .brief = false});
         out.push_back({.id = "tx_burst_acks", .label = "Bursts acknowledged", .value = std::format("{}", burstAcks()), .good = true, .brief = false});
         out.push_back({.id = "tx_queued_samples", .label = "Queued", .value = std::format("{} samples", queuedSamples()), .good = true, .brief = false});
@@ -853,7 +834,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
         dropBurstMarks();
         _burstTagReported = false;
         _held.store(false, std::memory_order_release);
-        _rateBreak.store(false, std::memory_order_release);
         _drainParked.store(false, std::memory_order_release);
         _refLockWaitMs.store(0.0, std::memory_order_release);
         for (auto& acks : _burstAcksOn) {
@@ -864,9 +844,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
         _endsPlaced.store(0, std::memory_order_release);
         _unconfirmedBound.store(0, std::memory_order_release);
         _stopBurstEnd.store(BurstEnd::NoneOpen, std::memory_order_release);
-        // The queue the previous run left is the queue this one starts from, so the two
-        // capacities agree until the streamer has stated its own maximum send.
-        _ringWantSamples.store(_ringCapacity.load(std::memory_order_acquire), std::memory_order_release);
         {
             std::lock_guard lock(_ctrlMutex);
             // A fresh multi_usrp holds none of the previous device's state.
@@ -888,6 +865,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
             _sensorNames      = {};
             _sensorNamesTaken = false;
             _wireFormat = validWireFormat(wire_format.value);
+            _askedRateHz = sample_rate.value;
         }
 
         if (const std::string why = startRefusal(sample_rate); !why.empty()) {
@@ -900,7 +878,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
         awaitReleases();
         try {
             std::lock_guard lock(_ctrlMutex);
-            _usrp = ::uhd::usrp::multi_usrp::make(openAddress());
+            _usrp   = ::uhd::usrp::multi_usrp::make(openAddress());
+            _joined = heldElsewhere(*_usrp);
         } catch (const std::exception& e) {
             {
                 std::lock_guard lock(_ctrlMutex);
@@ -940,6 +919,10 @@ channels one send carries both, so a burst tag on either input marks the burst o
             }
             publishSurfaceLocked();
             if (failure.empty()) {
+                takeClockInForceLocked();
+                failure = autoClockOverflowLocked(rateToWrite(_askedRateHz));
+            }
+            if (failure.empty()) {
                 failure = configureOpenDeviceLocked([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", _channels); });
             }
         }
@@ -976,18 +959,22 @@ channels one send carries both, so a burst tag on either input marks the burst o
         }
         if (!failure.empty()) {
             std::ignore = hardwareTeardown();
+            sample_rate = _askedRateHz; // the next start asks for the request again
             throwStartFailure("uhd::Sink", failure);
         }
         offerControlProperties(*this);
     }
 
     /*| contract: the start's steps behind the reference wait, the caller holding _startMutex:
-            nothing where a stop ended the wait or took the handle, and otherwise the streamer
+            nothing where a stop ended the wait or took the handle, the check of
+            autoClockOverflowLocked on the rate in force, and otherwise the streamer
             makeStream builds under _ctrlMutex, a retune where the build moved the master clock as
-            streamMovedClock states, the queue sized for its maximum send, deviceUp() raised,
+            streamMovedClock states, the comparison of runCheckLocked, the queue sized for its
+            maximum send, the settings the run holds fixed copied, deviceUp() raised,
             and the asynchronous thread and the drain started. makeStream answers no
-            streamer where the block holds no handle. Answers the failure the streamer build
-            met, or an empty string.
+            streamer where the block holds no handle. Answers a rate pair UHD's automatic
+            clock cannot take, the failure the streamer build met or the value the device does
+            not run, or an empty string.
         why: a stop that ended the wait has lowered referenceWaitLive() and waits on _startMutex
             behind this call. A start that went on would build a streamer and start two threads
             after that stop's joins, and they would run on a snapshot of the streamer, holding
@@ -1004,6 +991,9 @@ channels one send carries both, so a burst tag on either input marks the burst o
         std::size_t want = 0UZ;
         try {
             std::lock_guard      lock(_ctrlMutex);
+            if (const std::string overflow = autoClockOverflowLocked(_rateActualHz); !overflow.empty()) {
+                return overflow;
+            }
             ::uhd::stream_args_t args("fc32", _wireFormat);
             args.channels      = _channels;
             const double clock = _usrp == nullptr ? 0.0 : masterClockOf(*_usrp);
@@ -1015,11 +1005,13 @@ channels one send carries both, so a burst tag on either input marks the burst o
                 _freqWrittenHz.reset(); // the tune made at the earlier clock is off the center
                 std::ignore = applyFrequencyLocked();
             }
+            if (const std::string conflict = _usrp == nullptr ? std::string{} : runCheckLocked(); !conflict.empty()) {
+                return conflict;
+            }
             _maxSendSamples  = _stream->get_max_num_samps();
             _deviceHeldBytes = deviceHeldBytesFor(openAddress());
             takeQueueBoundLocked();
             want             = ringWantSamplesLocked();
-            _ringWantSamples.store(want, std::memory_order_release);
             publishSendCapLocked();
         } catch (const std::exception& e) {
             return std::format("uhd tx stream: {}", e.what());
@@ -1034,6 +1026,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
             return std::format("uhd tx queue of {} samples: {}", want, e.what());
         }
         _ringCapacity.store(_ring.buf.size(), std::memory_order_release);
+        _heldForRun = heldForRun(*this);
         _deviceUp.store(true, std::memory_order_release);
         _async.start([this] {
             nameStreamingThread("uhdtxev", this->name.value);
@@ -1045,6 +1038,39 @@ channels one send carries both, so a burst tag on either input marks the burst o
             drainLoop();
         });
         return {};
+    }
+
+    /*| contract: compare what the device runs, once the streamer exists, with what this block
+            asked for, and answer why the start fails, or an empty string. The record takes the
+            clock the device runs, and the values left automatic are named on standard error.
+            The caller holds _ctrlMutex and a live handle.
+        verified-by: uhd.device-settings-across-two-blocks
+    */
+    std::string runCheckLocked() {
+        const RunValues asked{.clockSource = clock_source.value, .timeSource = time_source.value, .masterClockHz = master_clock_rate.value, .rateHz = _askedRateHz};
+        const RunValues running = runValuesOf(*_usrp, Direction::Transmit, _channels.front());
+        if (running.masterClockHz > 0.0) {
+            _openTruth.mclkHz = running.masterClockHz;
+            publishSurfaceLocked();
+        }
+        std::string conflict = runConflict(asked, running, _joined, Direction::Transmit);
+        if (const std::string line = automaticInForceLine(asked, running, "uhd::Sink"); conflict.empty() && !line.empty()) {
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+        return conflict;
+    }
+
+    /*| contract: why the rate hz would overflow UHD's automatic master clock beside the rates
+            another handle set on the shared device, as autoClockOverflow states, or an empty
+            string. The start asks with the rate it is about to write, and again with the rate
+            the device read back before the streamer is built. A device no other handle holds
+            is not asked. The caller holds _ctrlMutex.
+    */
+    std::string autoClockOverflowLocked(double hz) {
+        if (!_joined || _usrp == nullptr) {
+            return {};
+        }
+        return autoClockOverflow(_askedRateHz, hz, Direction::Transmit, _channels, autoClockRates(*_usrp));
     }
 
     void stop() { std::ignore = hardwareTeardown(); }
@@ -1153,10 +1179,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
             this->requestStop();
             return {requestedWork, 0UZ, gr::work::Status::DONE};
         }
-        /*| why: here rather than in processBulk, because a work call is made whether or not the
-                input edge has samples, and the queue a refused park left oversized is owed a
-                resize whichever it is. This thread is the ring's producer either way. */
-        takeOwedQueueResize();
         return gr::Block<Sink>::work(requestedWork);
     }
 
@@ -1407,24 +1429,16 @@ channels one send carries both, so a burst tag on either input marks the burst o
         return take;
     }
 
-    /*| contract: frequency, gain and connector reach the device live; a rate change ends the
-            burst and rewrites the rate, and the next samples open a fresh burst at it.
+    /*| contract: frequency, gain and connector reach the device live. A write of a setting the
+            run holds fixed is refused, as refuseRunningWrites states.
     */
-    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& /*forwardSettings*/) {
+    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& forwardSettings) {
         const ControlSurfaceCheck<Sink> surfaceCheck{*this}; // sends a moved surface once the body has let go of its locks
         if (!_deviceUp.load(std::memory_order_acquire)) {
             return;
         }
-        /*| invariant: the queue a rate change asks for is allocated before _ctrlMutex is taken,
-                and the storage it replaces is freed after the mutex is let go. The size comes
-                from the rate the request snaps to, and a device that coerces the write to a
-                rate of another size makes the resize allocate under the mutex instead.
-        */
-        RingStorage<std::complex<float>> storage;
-        RingStorage<std::complex<float>> storage2;
-        if (newSettings.contains("sample_rate")) {
-            storage  = queueStorageFor(queueSamplesForRequest());
-            storage2 = secondQueueStorageFor(storage);
+        if (_heldForRun.has_value()) {
+            refuseRunningWrites(*this, *_heldForRun, newSettings, forwardSettings, "uhd::Sink");
         }
         std::lock_guard lock(_ctrlMutex);
         if (_usrp == nullptr) {
@@ -1432,13 +1446,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
         }
         if (newSettings.contains("frequency") || newSettings.contains("frequency_correction")) {
             std::ignore = applyFrequencyLocked();
-        }
-        if (newSettings.contains("sample_rate")) {
-            _queueSpare.swap(storage);
-            _queueSpare2.swap(storage2);
-            std::ignore = applyRateLocked();
-            _queueSpare.swap(storage);
-            _queueSpare2.swap(storage2);
         }
         if (newSettings.contains("tx_gains")) {
             applyGainLocked();
@@ -1458,10 +1465,11 @@ channels one send carries both, so a burst tag on either input marks the burst o
 
     /*| contract: put the device on the reference and the timing selection the settings name,
             before anything else this start configures, where applyReferenceSources says the
-            writes belong. An empty name leaves the device on its own selection.
+            writes belong. An empty name leaves the device on its own selection, and a device
+            another handle holds is written nothing, as heldElsewhere states.
     */
     void applyReferenceSourcesLocked() {
-        if (_usrp == nullptr) {
+        if (_usrp == nullptr || _joined) {
             return;
         }
         applyReferenceSources(*_usrp, clock_source.value, time_source.value, "uhd::Sink");
@@ -1511,79 +1519,25 @@ channels one send carries both, so a burst tag on either input marks the burst o
         return {};
     }
 
-    // The rate applier on this block's device. The caller holds _ctrlMutex.
-    bool applyRateLocked() {
-        if (_usrp == nullptr) {
-            return true;
-        }
-        return applyRateWith([this](double hz) { return writeRate(*_usrp, Direction::Transmit, hz, "uhd::Sink", _channels); });
-    }
-
     /*| contract: write the rate rateToWrite chooses for the request through write, which answers
             what the write left on the device, and behind it the analog filter the rate asks
-            for, and state the rate the device holds in sample_rate. False
-            where the device refused the write, which leaves the setting on the rate the device
-            still holds. A rate already in force is not written again. A new one plays the queue
-            out at the rate it was staged at, asks the drain to stand off the ring and resizes
-            the queue for the new rate, whether or not a burst is open; the next samples open a
-            fresh burst at it, and the drain ends the burst in flight where there is one.
-        verified-by: sink.uhd-a-rate-change-before-the-first-send-resizes-the-queue
-        frame: the wait is bounded by how long the queue takes to play out at the rate in
-            force. A device that has stopped draining leaves samples the bound could not place;
-            the resize throws those away and discardedAtRateChangeSamples() states how many.
-        trap: a drain that did not stand off the ring inside its own bound leaves the queue
-            where it is. The rate is written alone, the queue keeps the sample count the
-            previous rate gave it rather than its length of time, and the line says so. The
-            resize is owed from there: the drain asks for the park again at the head of its own
-            loop while the queue outsizes the rate in force, and the work call takes the resize
-            behind that answer, so the queue holds the wrong length of time for as long as the
-            drain stays inside that send. Every wait made in that window is bounded by
-            playOutBoundMs, which takes the capacity the rate in force asks for.
-        trap: a rate change made while the carrier is held discards the queue the pause kept.
-            The play-out returns at once under a hold, a parked drain placing nothing, so the
-            resize behind it throws the whole queue away and discardedAtRateChangeSamples()
-            carries it. This family's pause counts nothing, so the rate change's counter
-            carries the whole sequence.
-        why: the samples in the queue are the caller's, handed over and acknowledged, so they
-            are not the receive side's drop-and-mark case: that answer is for data a device
-            produced. Written under them, the new rate would transmit them at a rate they were
-            never sampled at, and carrying them to the new rate is no answer either — the
-            device that left them there is one that stopped consuming.
-        trap: the burst is ended by the drain and not here. This runs on the block's own worker
-            thread, so a send mutex taken here would put every other block in the job behind a
-            send against a device that stopped consuming.
-        verified-by: sink.uhd-a-rate-change-ends-the-burst
+            for, and state the rate the device holds in sample_rate. False where the device
+            refused the write, which leaves the setting on the rate the device still holds. A
+            rate already in force is not written again. Called by the start before the streamer
+            exists, which sizes the queue for the rate once the streamer states its maximum
+            send.
         verified-by: sink.uhd-a-start-configures-the-rate-first
     */
     template <typename WriteRate>
     bool applyRateWith(WriteRate&& write) {
-        const double     asked  = sample_rate;
-        const double     want   = rateToWrite(asked);
-        const RateChange change = rateChangeFor(want, _rateActualHz, _bursting.load(std::memory_order_acquire));
-        if (!change.write || !writeNeeded(_rateWrittenHz, want)) {
+        const double asked = sample_rate;
+        const double want  = rateToWrite(asked);
+        if (!(want > 0.0) || want == _rateActualHz || !writeNeeded(_rateWrittenHz, want)) {
             if (_rateActualHz > 0.0) {
                 sample_rate = _rateActualHz; // the rate in force, not the request a replay carried
             }
             refreshFreqRangesLocked();
             return true;
-        }
-        /*| why: the queue follows the rate whether or not a burst is open. _bursting rises only
-                inside a send, so a rate staged before the first samples flow would skip the
-                resize and leave the queue sized for the previous rate: 65536 samples after a
-                start at 250 kS/s, which at 61.44 MS/s is 1.07 ms against the scheduler's
-                100 ms park. The play-out returns at once for an empty queue and the drain's
-                park branch ends a burst only where one is open, so both are asked for
-                whenever the rate reaches the device.
-            frame: the start sizes the queue itself once the streamer has stated its maximum
-                send, so a rate written before the streamer exists leaves the queue to that
-                step. The fresh burst the next samples open is this family's restart: a
-                transmit streamer carries no stream command of its own.
-        */
-        const bool haveStreamer = _stream != nullptr;
-        bool       parked       = true;
-        if (haveStreamer) {
-            playOutLocked();
-            parked = parkDrainForRateChange();
         }
         const RateWrite written = write(want);
         if (rateWriteSettled(written)) {
@@ -1603,14 +1557,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
         */
         if (filterFollowsRate(written, _bwMinHz, _bwMaxHz)) {
             applyBandwidthLocked(bandwidthFor(_rateActualHz, _bwMinHz, _bwMaxHz));
-        }
-        if (haveStreamer) {
-            // A parked drain stands off the ring and the work call is this same thread, so the
-            // ring has neither a producer nor a consumer here.
-            takeQueueBoundLocked();
-            resizeQueueForRateLocked(parked);
-            _rateBreak.store(false, std::memory_order_release);
-            wakeDrain();
         }
         refreshFreqRangesLocked();
         return written.landed;
@@ -1633,69 +1579,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
         verified-by: sink.uhd-an-address-that-pins-the-clock-fixes-the-ladder
     */
     void takeClockInForceLocked() { _clockInForceHz = clockInForceAtOpen(openAddress(), _openTruth); }
-
-    /*| contract: ask the drain to end the burst and stand off the ring, and answer whether the
-            ring has a consumer left: true where the drain raised the parked flag, where it has
-            died and where no drain is running at all, and false where a live drain did not
-            answer inside bound. The caller holds _ctrlMutex and clears _rateBreak once the
-            rate is written.
-        invariant: the answer waited for is a fresh one. The flag is cleared before the break is
-            raised, because the drain raises it for a pause as well, and a flag left standing by
-            a pause would answer for a drain that took the resume and is already back in the
-            copy.
-        frame: bound is one send by default, kSendTimeoutS, read from the streamer's own send
-            timeout as the longest a send can hold the drain away from the top of its loop; an
-            idle drain wakes on the bell this rings and answers at once. A device that stopped consuming
-            is the case this bracket exists for, so that is the bound a rate change owes beside
-            the play-out's, and the settings thread holds _ctrlMutex through both.
-        why: a wait rather than a shorter deadline, because the resize behind it replaces the
-            ring's storage and a live drain reads that storage between its own availability test
-            and the end of the send that reads it in place.
-        verified-by: sink.uhd-a-rate-change-waits-for-a-fresh-park
-    */
-    bool parkDrainForRateChange(std::chrono::milliseconds bound = std::chrono::milliseconds(static_cast<long>(kSendTimeoutS * 1000.0))) {
-        _drainParked.store(false, std::memory_order_release);
-        _rateBreak.store(true, std::memory_order_release);
-        wakeDrain();
-        const auto deadline = std::chrono::steady_clock::now() + bound;
-        for (;;) {
-            if (_drainParked.load(std::memory_order_acquire) || _drainDead.load(std::memory_order_acquire) || !_drain.thread.joinable()) {
-                return true;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-
-    /*| contract: size the queue for the rate the device took, counting what the resize throws
-            away, or keep the queue where the drain did not stand off the ring. The caller
-            holds _ctrlMutex, has written the rate, and says whether the park arrived.
-        trap: a resize under a live drain reassigns the storage that drain indexes between its
-            own availability test and the end of the send that reads it in place. A queue left sized for the
-            previous rate holds the wrong length of time; a queue resized under a consumer is
-            a fault, so the refused park keeps the queue and says so. This body publishes the
-            capacity the rate in force asks for either way, and that publication leaves the
-            resize owed.
-        contract: storage of the size asked for stays in place. Other storage is replaced by
-            _queueSpare where it holds that size and by a fresh allocation otherwise, and the
-            storage replaced goes into _queueSpare for the caller to free outside the mutex.
-        verified-by: sink.uhd-a-refused-park-keeps-the-queue
-        verified-by: sink.uhd-a-rate-change-reuses-the-queue-that-fits
-        verified-by: sink.uhd-a-refused-park-is-retried-until-it-lands
-    */
-    void resizeQueueForRateLocked(bool parked) {
-        _ringWantSamples.store(ringWantSamplesLocked(), std::memory_order_release);
-        if (!parked) {
-            std::fprintf(stderr, "[uhd::Sink] the drain did not stand off the queue inside %.0f s; the rate is written and the queue stays as it is until the drain answers\n", kSendTimeoutS);
-            return;
-        }
-        _counters.discardedAtRateChange.fetch_add(static_cast<std::uint64_t>(resizeRingCountingDiscard(_ring, ringWantSamplesLocked(), _queueSpare)), std::memory_order_relaxed);
-        resizeRing(_ring2, secondQueueSamples(_ring.buf.size()), _queueSpare2);
-        _ringCapacity.store(_ring.buf.size(), std::memory_order_release);
-        dropBurstMarks();
-    }
 
     // The queue capacity the rate in force asks for, in samples. The caller holds _ctrlMutex.
     std::size_t ringWantSamplesLocked() const { return ringSamplesFor(_rateActualHz, ringFloorSamples(_maxSendSamples), _queueBound); }
@@ -1723,86 +1606,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
     // channels listed, and one element with one.
     std::size_t secondQueueSamples(std::size_t samples) const { return _channels.size() > 1UZ ? samples : 1UZ; }
 
-    // Storage for the second channel's queue beside storage for the first's, where two channels
-    // are listed. The caller holds no lock, as for queueStorageFor.
-    RingStorage<std::complex<float>> secondQueueStorageFor(const RingStorage<std::complex<float>>& first) const {
-        return _channels.size() > 1UZ && !first.empty() ? RingStorage<std::complex<float>>(first.size()) : RingStorage<std::complex<float>>{};
-    }
-
     // Publish the send cap of the rate in force for the drain. The caller holds _ctrlMutex.
     void publishSendCapLocked() { _sendCapSamples.store(sendCapSamples(_rateActualHz, _maxSendSamples), std::memory_order_release); }
-
-    /*| contract: storage for a queue of samples, the size a resize to that capacity takes, and
-            empty where the queue already holds that size or samples is zero. The caller holds no lock and hands
-            the answer to _queueSpare under _ctrlMutex.
-        verified-by: sink.uhd-a-rate-change-reuses-the-queue-that-fits
-    */
-    RingStorage<std::complex<float>> queueStorageFor(std::size_t samples) const {
-        const std::size_t size = ringCapacityFor(samples);
-        if (samples == 0UZ || size == _ringCapacity.load(std::memory_order_acquire)) {
-            return {};
-        }
-        return RingStorage<std::complex<float>>(size);
-    }
-
-    /*| contract: whether the queue holds more storage than the rate in force asks for, which is
-            what a refused park leaves behind. It takes no lock: both figures are published
-            beside the ring.
-        frame: the two are equal for a queue sized at the rate it runs at, the capacity asked
-            for already being rounded up to the power of two the ring indexes by.
-        verified-by: sink.uhd-a-refused-park-is-retried-until-it-lands
-    */
-    bool queueOutsizesRate() const {
-        const std::size_t want = _ringWantSamples.load(std::memory_order_acquire);
-        return want > 0UZ && _ringCapacity.load(std::memory_order_acquire) > want;
-    }
-
-    /*| contract: ask for the park again where the queue outsizes the rate in force, and say
-            whether the ask was made. The drain calls this at the head of its own loop, which is
-            the one place a break is answered, so the ask reaches a standing-off drain on the
-            pass after the send that refused the rate change's own park returned.
-        verified-by: sink.uhd-a-refused-park-is-retried-until-it-lands
-    */
-    bool askParkForOwedResize() {
-        if (!queueOutsizesRate()) {
-            return false;
-        }
-        _rateBreak.store(true, std::memory_order_release);
-        return true;
-    }
-
-    /*| contract: take the resize a refused park left owed, where the drain has since stood off
-            the ring. It counts what it throws away under the rate change's own counter and says
-            so once, that being the rate change the park was refused for. The caller is the
-            ring's producer and holds no lock.
-        why: the work call is the ring's one producer and the parked drain is its one consumer,
-            so this body is the same bracket the rate applier resizes in. The drain cannot
-            resize the ring itself: it is not the producer, and the storage it would replace is
-            the storage a work call indexes.
-        trap: the control mutex is taken with the status readers' own deadline. A rate change
-            holds it through a play-out, and the resize stays owed until a later work call
-            rather than putting this one behind that wait.
-        verified-by: sink.uhd-a-refused-park-is-retried-until-it-lands
-    */
-    void takeOwedQueueResize() {
-        if (!queueOutsizesRate() || !_drainParked.load(std::memory_order_acquire)) {
-            return;
-        }
-        RingStorage<std::complex<float>> storage  = queueStorageFor(_ringWantSamples.load(std::memory_order_acquire));
-        RingStorage<std::complex<float>> storage2 = secondQueueStorageFor(storage);
-        CtrlGuard                        guard(_ctrlMutex, _deviceUp, kStatusWait);
-        if (!guard || !queueOutsizesRate()) {
-            return;
-        }
-        std::fprintf(stderr, "[uhd::Sink] the queue the refused park left is sized for a faster rate than the %.0f S/s in force; what it holds is discarded\n", _rateActualHz);
-        _queueSpare.swap(storage);
-        _queueSpare2.swap(storage2);
-        resizeQueueForRateLocked(true);
-        _queueSpare.swap(storage);
-        _queueSpare2.swap(storage2);
-        _rateBreak.store(false, std::memory_order_release);
-        wakeDrain();
-    }
 
     // The shared filter write on this block's device. The caller holds _ctrlMutex.
     void applyBandwidthLocked(double hz) {
@@ -2099,8 +1904,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
             the pause lasts, and a stop then joins behind the attempt in flight. The timeout
             is kSendTimeoutS, read from the argument every send here carries; no case drives a
             device that stops consuming.
-        verified-by: sink.uhd-a-parked-drain-ends-the-burst-once, which pins the once-per-park
-            rule and the fresh park a rate change behind a pause makes.
+        verified-by: sink.uhd-a-parked-drain-ends-the-burst-once
     */
     static bool endBurstOnThisPass(bool alreadyParked) { return !alreadyParked; }
 
@@ -2151,8 +1955,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
             ends once burstAcks() reaches the count of ends placed in the run, or at
             burstAckBoundMs, and a stop that gave up says so on standard error.
         why: the device acknowledges the ends in the order they were placed, so the stop's own
-            acknowledgment is the one that brings the count up to the ends placed. A pause or a
-            rate change ends a burst on the drain, the device acknowledges it once that tail has
+            acknowledgment is the one that brings the count up to the ends placed. A pause ends
+            a burst on the drain, the device acknowledges it once that tail has
             played, and the next burst queues behind it: an acknowledgment counted after the stop
             began can be that earlier burst's.
         verified-by: sink.uhd-a-stop-waits-for-its-own-acknowledgment
@@ -2223,46 +2027,21 @@ channels one send carries both, so a burst tag on either input marks the burst o
             the rate in force. Called with no lock held, before the drain is joined.
     */
     void playOut() {
-        double      rateHz  = 0.0;
-        std::size_t maxSend = 0UZ;
-        QueueBound  bound;
+        double rateHz = 0.0;
         {
             std::lock_guard lock(_ctrlMutex);
-            rateHz  = _rateActualHz;
-            maxSend = _maxSendSamples;
-            bound   = _queueBound;
+            rateHz = _rateActualHz;
         }
-        playOutAt(rateHz, maxSend, bound);
-    }
-
-    // The same wait from a caller already holding _ctrlMutex.
-    void playOutLocked() { playOutAt(_rateActualHz, _maxSendSamples, _queueBound); }
-
-    /*| contract: the longest a play-out waits for a queue of queuedSamples at rateHz: the queue
-            bounded by the capacity that rate asks for, so the deadline is the length of time
-            the rate in force gives the queue's own capacity.
-        trap: a refused park keeps the queue's sample count rather than its length of time, so
-            the queue can hold a faster rate's capacity at a slower rate. Sized from the count
-            alone, a block taken from 61.44 MS/s to 250 kS/s with the park refused would set a
-            deadline of 67358 ms and hold _ctrlMutex and _teardownMutex for the whole of it
-            while every status reader answers empty.
-        frame: the bound is the same queue duration every other wait here is sized from, so a
-            queue the rate in force asks for is not shortened by it.
-        verified-by: sink.uhd-a-play-out-is-bounded-by-the-rate-in-force
-    */
-    static std::chrono::milliseconds playOutBoundMs(std::size_t queuedSamples, double rateHz, std::size_t maxSendSamples, QueueBound bound = {}) {
-        return playOutMs(static_cast<std::uint64_t>(std::min(queuedSamples, ringSamplesFor(rateHz, ringFloorSamples(maxSendSamples), bound))), rateHz);
+        playOutAt(rateHz);
     }
 
     /*| trap: a held carrier consumes nothing. The drain parks on _held and takes nothing out of
             the ring, so a wait here cannot end by the queue emptying: it runs its whole
             deadline and leaves the queue where it was. A stop made under a hold is a discard,
-            and the count it owes goes out through unsentAtStop; a rate change made under a
-            hold is a discard for the same reason, and the resize behind this counts it under
-            the rate change.
+            and the count it owes goes out through unsentAtStop.
         verified-by: sink.uhd-a-held-stop-ends-at-once
     */
-    void playOutAt(double rateHz, std::size_t maxSendSamples, QueueBound bound = {}) {
+    void playOutAt(double rateHz) {
         if (_held.load(std::memory_order_acquire)) {
             return;
         }
@@ -2270,7 +2049,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
         if (queued == 0UZ) {
             return;
         }
-        const auto deadline = std::chrono::steady_clock::now() + playOutBoundMs(queued, rateHz, maxSendSamples, bound);
+        const auto deadline = std::chrono::steady_clock::now() + playOutMs(static_cast<std::uint64_t>(queued), rateHz);
         while (ringElements() > 0UZ && !_drainDead.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
@@ -2288,7 +2067,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
             unsent count a stop reports holds only samples no send was handed.
         frame: the send's own timeout is the drain's one timed wait. An empty ring and a park
             both wait on _drainBell, which the work call rings after each write and which a
-            pause, a resume, the rate break and a stop ring after they change.
+            pause, a resume and a stop ring after they change.
         trap: a sleep of a fixed length on an empty ring can outlast the device's own buffer.
             A B205mini holds 16 frames of 2040 samples, 0.53 ms at 61.44 MS/s, against a 1 ms
             sleep.
@@ -2305,23 +2084,15 @@ channels one send carries both, so a burst tag on either input marks the burst o
             return;
         }
         while (!_drain.stopRequested()) {
-            /*| why: a park a rate change asked for and did not get leaves the queue holding the
-                    previous rate's capacity for the rest of the run at the rate in force. The
-                    break is raised again here, at the head of the one loop that can answer it,
-                    and the work call takes the resize behind that answer. */
-            std::ignore = askParkForOwedResize();
-            /*| frame: the two ways this loop stands off. A pause keeps the queue and waits for
-                    the resume. A rate change has already played the queue out and waits for
-                    the rate to be written; the parked flag says the ring has no consumer, so
-                    the settings thread can resize it. */
-            if (_held.load(std::memory_order_acquire) || _rateBreak.load(std::memory_order_acquire)) {
+            // A pause keeps the queue and waits for the resume.
+            if (_held.load(std::memory_order_acquire)) {
                 if (endBurstOnThisPass(_drainParked.load(std::memory_order_acquire))) {
                     std::ignore = endBurstWith(stream);
                     _endOwed.store(false, std::memory_order_release);
                     _drainParked.store(true, std::memory_order_release);
                 }
                 awaitBell([this] {
-                    return !_drain.stopRequested() && (_held.load(std::memory_order_acquire) || _rateBreak.load(std::memory_order_acquire)) && _drainParked.load(std::memory_order_acquire);
+                    return !_drain.stopRequested() && _held.load(std::memory_order_acquire) && _drainParked.load(std::memory_order_acquire);
                 });
                 continue;
             }
@@ -2337,7 +2108,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
             if (have == 0UZ) {
                 awaitBell([this] {
                     std::size_t at = 0;
-                    return !_drain.stopRequested() && !_held.load(std::memory_order_acquire) && !_rateBreak.load(std::memory_order_acquire) && !_endOwed.load(std::memory_order_acquire) && _ring.available(at) == 0UZ && !queueOutsizesRate();
+                    return !_drain.stopRequested() && !_held.load(std::memory_order_acquire) && !_endOwed.load(std::memory_order_acquire) && _ring.available(at) == 0UZ;
                 });
                 continue;
             }

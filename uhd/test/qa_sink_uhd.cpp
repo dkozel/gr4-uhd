@@ -844,7 +844,7 @@ int main(int argc, char** argv) {
         capture::uhd::Sink                  sink;
         std::vector<capture::SensorReading> tx;
         sink.appendReadings(tx);
-        expect(capture::test::readingIds(tx) == std::vector<std::string>{"tx_underrun_events", "tx_sequence_errors", "tx_late_packets", "tx_discarded_at_rate_change", "tx_unsent_at_stop", "tx_burst_acks", "tx_queued_samples"})
+        expect(capture::test::readingIds(tx) == std::vector<std::string>{"tx_underrun_events", "tx_sequence_errors", "tx_late_packets", "tx_unsent_at_stop", "tx_burst_acks", "tx_queued_samples"})
             << "what the transmit stream has lost and holds";
         expect(capture::test::briefLabels(tx) == std::vector<std::string>{"Underruns"}) << "the underruns on the glance row";
     });
@@ -939,29 +939,29 @@ int main(int argc, char** argv) {
         expect(capture::ringSamplesFor(20.0e6) > capture::ringSamplesFor(8.0e6)) << "a faster rate needs more room for the same time";
     });
 
-    cases("sink.uhd-a-rate-change-ends-the-burst", [] {
-        // A rate change ends the burst in flight and writes the rate; the next samples open a
-        // fresh burst at it. A replay of the rate already in force writes nothing, which is
-        // what keeps a running radio from being disturbed for a value it already holds.
-        const auto unchanged = capture::rateChangeFor(2.0e6, 2.0e6, true);
-        expect(!unchanged.write) << "the rate in force is not written again";
-        expect(!unchanged.endBurst) << "so the burst is left alone";
+    cases("sink.uhd-a-running-sink-refuses-the-settings-it-runs-on", [] {
+        capture::uhd::Sink sink{};
+        const auto         apply = [&sink](gr::property_map settings) {
+            std::ignore = sink.settings().setStaged(settings);
+            std::ignore = sink.settings().applyStagedParameters();
+        };
+        apply({{"sample_rate", 4.0e6}, {"master_clock_rate", 16.0e6}, {"clock_source", std::string("gpsdo")}, {"time_source", std::string("gpsdo")}, {"wire_format", std::string("sc8")}, {"channels", std::vector<gr::Size_t>{1U}}});
+        expect(sink.sample_rate == 4.0e6 && sink.master_clock_rate == 16.0e6 && sink.clock_source.value == "gpsdo" && sink.wire_format.value == "sc8") << "a stopped sink takes every write";
 
-        const auto midBurst = capture::rateChangeFor(4.0e6, 2.0e6, true);
-        expect(midBurst.write) << "a new rate reaches the device";
-        expect(midBurst.endBurst) << "and the burst in flight ends first, the samples staged at the old rate having gone out";
-
-        const auto beforeStart = capture::rateChangeFor(2.0e6, 0.0, false);
-        expect(beforeStart.write) << "the first rate of a run is written";
-        expect(!beforeStart.endBurst) << "with no burst to end";
-
-        expect(!capture::rateChangeFor(0.0, 2.0e6, true).write) << "a rate that is not positive asks for nothing";
-        expect(!capture::rateChangeFor(std::numeric_limits<double>::quiet_NaN(), 2.0e6, true).write) << "nor one that is not a number";
-
-        // The bound every wait is sized from grows with the queue and shrinks with the rate.
-        expect(capture::playOutMs(2097152U, 8.0e6).count() >= 262) << "a full queue at 8 MS/s covers the 262 ms it holds";
-        expect(capture::playOutMs(2097152U, 2.0e6).count() > capture::playOutMs(2097152U, 8.0e6).count()) << "a slower rate plays the same queue out over a longer time";
-        expect(capture::playOutMs(0U, 0.0).count() >= 250) << "and a sink with no rate still names a deadline";
+        // Running, with no handle: the start copied the settings, and a write of any is refused.
+        sink._heldForRun = capture::uhd::heldForRun(sink);
+        sink._deviceUp.store(true);
+        apply({{"sample_rate", 8.0e6}, {"master_clock_rate", 30.72e6}, {"clock_source", std::string("internal")}, {"time_source", std::string("internal")}, {"wire_format", std::string("sc16")}, {"channels", std::vector<gr::Size_t>{0U}}});
+        expect(sink.sample_rate == 4.0e6 && sink.master_clock_rate == 16.0e6) << "the rate and the clock keep their values";
+        expect(sink.clock_source.value == "gpsdo" && sink.time_source.value == "gpsdo" && sink.wire_format.value == "sc8") << "so do the selections and the format";
+        expect(sink.channels.value == std::vector<gr::Size_t>{1U}) << "and the channel list";
+        apply({});
+        const auto  mapped = sink.settings().get("sample_rate");
+        const auto* rate   = mapped.has_value() ? mapped->get_if<double>() : nullptr;
+        expect(rate != nullptr && *rate == 4.0e6) << "the next sweep publishes the rate held";
+        sink._deviceUp.store(false);
+        apply({{"sample_rate", 2.0e6}});
+        expect(sink.sample_rate == 2.0e6) << "a write after the stop is taken";
     });
 
     cases("sink.uhd-listing-pairs-are-the-sources", [] {
@@ -1351,31 +1351,6 @@ int main(int argc, char** argv) {
         sink._stream.reset();
     });
 
-    cases("sink.uhd-a-rate-change-reuses-the-queue-that-fits", [] {
-        using capture::uhd::Sink;
-        Sink sink{};
-        sink._maxSendSamples = 2040UZ;
-        sink._rateActualHz   = 8.0e6;
-        sink.resizeQueueForRateLocked(true);
-        const auto* const at8 = sink._ring.buf.data();
-        expect(sink._ring.buf.size() == (1UZ << 21)) << "a quarter second at 8 MS/s rounds up to 2^21 samples";
-
-        sink._rateActualHz = 6.0e6;
-        expect(sink.queueStorageFor(sink.ringWantSamplesLocked()).empty()) << "6 MS/s asks for the same size, so nothing is allocated ahead of the mutex";
-        sink.resizeQueueForRateLocked(true);
-        expect(sink._ring.buf.data() == at8) << "and the rate change keeps the storage it has";
-
-        auto ahead = sink.queueStorageFor(capture::ringSamplesFor(20.0e6, Sink::ringFloorSamples(2040UZ)));
-        expect(ahead.size() == (1UZ << 23)) << "20 MS/s asks for 2^23 samples, allocated before the mutex is taken";
-        const auto* const given = ahead.data();
-        sink._queueSpare.swap(ahead);
-        sink._rateActualHz = 20.0e6;
-        sink.resizeQueueForRateLocked(true);
-        expect(sink._ring.buf.data() == given) << "the rate change takes that storage";
-        expect(sink._queueSpare.data() == at8) << "and hands back the storage it replaced for a free outside the mutex";
-        expect(sink._ringCapacity.load() == (1UZ << 23)) << "with the capacity published beside it";
-    });
-
     cases("sink.uhd-the-queue-follows-its-settings", [] {
         using capture::uhd::Sink;
         Sink sink{};
@@ -1393,7 +1368,6 @@ int main(int argc, char** argv) {
         expect(sink.ringWantSamplesLocked() * sizeof(std::complex<float>) == (64UZ << 20)) << "the byte ceiling caps the queue at 2 GS/s";
         sink._rateActualHz = 8.0e6;
         expect(sink.ringWantSamplesLocked() == (1UZ << 19)) << "and the duration sets it where the ceiling does not bind";
-        expect(Sink::playOutBoundMs(1UZ << 24, 8.0e6, 2040UZ, sink._queueBound) == capture::playOutMs(1UZ << 19, 8.0e6)) << "every wait is sized from the queue the settings give";
     });
 
     cases("sink.uhd-the-stop-bound-reads-the-stated-buffer", [] {
@@ -1448,7 +1422,7 @@ int main(int argc, char** argv) {
     });
 
     cases("sink.uhd-a-queue-reading-reads-no-storage", [] {
-        // Three threads take this reading and a rate change replaces the ring's storage under
+        // Three threads take this reading and a start replaces the ring's storage under
         // them, so a reader that asked the vector how large it is would ask it while it is
         // being reassigned. The capacity is published beside the ring instead.
         capture::SpscRing<std::complex<float>>  ring(16UZ);
@@ -1473,8 +1447,8 @@ int main(int argc, char** argv) {
         using capture::uhd::Sink;
         // Every wait this block makes is sized from the queue, and the queue is a quarter of a
         // second at the rate in force. A floor of 2^19 samples is that quarter second at
-        // 2 MS/s and 2.62 s at the 250 kS/s a B205mini also runs, and a rate change and a
-        // stop would then cost that.
+        // 2 MS/s and 2.62 s at the 250 kS/s a B205mini also runs, and a stop would then cost
+        // that.
         constexpr std::size_t kUsbSend = 2040UZ; // a B205mini's streamer
         constexpr std::size_t kNetSend = 363UZ;  // an N210's
         expect(capture::uhd::Sink::ringFloorSamples(kUsbSend) == 8UZ * kUsbSend) << "the floor is eight of the streamer's own maximum send";
@@ -1508,7 +1482,7 @@ int main(int argc, char** argv) {
         const std::size_t slow = capture::ringSamplesFor(250000.0, capture::uhd::Sink::ringFloorSamples(kUsbSend));
         expect(1000.0 * static_cast<double>(slow) / 250000.0 < 400.0) << "a quarter of a second at 250 kS/s rather than the 2.6 s a fixed floor holds";
         expect(capture::ringSamplesFor(250000.0) > slow) << "which is the floor a radio running no slower than 2 MS/s keeps";
-        expect(capture::playOutMs(slow, 250000.0).count() < 800) << "so the play-out a rate change waits for stays inside eight hundred milliseconds";
+        expect(capture::playOutMs(slow, 250000.0).count() < 800) << "so the play-out a stop waits for stays inside eight hundred milliseconds";
     });
 
     cases("sink.uhd-a-stop-that-took-the-handle-calls-no-library", [] {
@@ -1523,7 +1497,6 @@ int main(int argc, char** argv) {
         expect(sink._usrp == nullptr) << "a block that opened nothing holds no handle";
 
         sink.applyReferenceSourcesLocked();
-        sink.applyRateLocked();
         sink.applyGainLocked();
         sink.applyAntennaLocked();
         sink.applyBandwidthLocked(2.0e6);
@@ -1532,29 +1505,6 @@ int main(int argc, char** argv) {
         expect(sink._rateActualHz == 0.0) << "and no applier states a value it never wrote";
         expect(sink._actualAntenna.empty());
         expect(sink._bwCurHz == 0.0);
-    });
-
-    cases("sink.uhd-a-rate-change-counts-what-it-discards", [] {
-        // The play-out before a rate change is bounded, so a device that stopped consuming
-        // leaves samples in the queue when the bound expires. The resize behind it hands both
-        // ends fresh storage, and those samples reach no air at either rate.
-        capture::SpscRing<std::complex<float>>  ring(64UZ);
-        const std::vector<std::complex<float>> staged(40, std::complex<float>{0.5f, 0.5f});
-        expect(capture::writeWhatFits(ring, staged.data(), staged.size()) == 40UZ) << "the queue holds what the play-out could not place";
-        expect(capture::resizeRingCountingDiscard(ring, 128UZ) == 40UZ) << "and the resize answers how many it threw away";
-        expect(capture::ringFill(ring) == 0UZ) << "leaving the queue empty";
-        expect(ring.buf.size() == 128UZ) << "at the capacity the new rate asked for";
-        expect(capture::resizeRingCountingDiscard(ring, 64UZ) == 0UZ) << "an empty queue discards nothing";
-
-        // The block states that count beside the one a pause keeps, which stays zero on this
-        // family: a USRP pause ends the burst and holds its queue.
-        capture::uhd::Sink sink{};
-        expect(sink.discardedAtRateChangeSamples() == 0UL) << "a block that has changed no rate has discarded nothing";
-        sink._counters.discardedAtRateChange.fetch_add(40UL);
-        expect(sink.discardedAtRateChangeSamples() == 40UL) << "the counter the applier adds to is the one the reader states";
-        expect(sink.discardedAtHoldSamples() == 0UL) << "and a pause on this family throws nothing away";
-        sink._counters.reset();
-        expect(sink.discardedAtRateChangeSamples() == 0UL) << "the start of a run clears it";
     });
 
     cases("sink.uhd-a-held-stop-ends-at-once", [] {
@@ -1569,14 +1519,14 @@ int main(int argc, char** argv) {
 
         sink._held.store(true);
         const auto began = std::chrono::steady_clock::now();
-        sink.playOutAt(1.0e6, 2040UZ);
+        sink.playOutAt(1.0e6);
         const auto heldMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began).count();
         expect(heldMs < 50) << "a stop made while the carrier is held waits for nothing";
         expect(capture::ringFill(sink._ring) == staged.size()) << "and leaves the queue for the stop to count as unsent";
 
         sink._held.store(false);
         const auto resumed = std::chrono::steady_clock::now();
-        sink.playOutAt(1.0e6, 2040UZ);
+        sink.playOutAt(1.0e6);
         const auto runningMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - resumed).count();
         expect(runningMs >= 250) << "while a running carrier is given the queue's own time to reach the air";
     });
@@ -1589,56 +1539,6 @@ int main(int argc, char** argv) {
         // lasts, and a stop then joins behind the attempt in flight.
         expect(capture::uhd::Sink::endBurstOnThisPass(false)) << "the pass that parks the drain ends the burst";
         expect(!capture::uhd::Sink::endBurstOnThisPass(true)) << "and the passes behind it do not attempt it again";
-
-        // A rate change clears the flag before it raises the break, so its own park is a fresh
-        // attempt rather than the one a pause already made.
-        capture::uhd::Sink sink{};
-        sink._held.store(true);
-        sink._drainParked.store(true);
-        sink.parkDrainForRateChange();
-        expect(capture::uhd::Sink::endBurstOnThisPass(sink._drainParked.load())) << "so a rate change behind a pause ends the burst again";
-        sink._rateBreak.store(false);
-        sink._held.store(false);
-    });
-
-    cases("sink.uhd-a-rate-change-waits-for-a-fresh-park", [] {
-        // The drain raises the parked flag for a pause as well as for a rate change. A flag
-        // left standing by a pause would answer at once for a drain that took the resume and
-        // is already back in the copy, and the resize behind that answer replaces the storage
-        // the drain is reading.
-        capture::uhd::Sink sink{};
-        sink._held.store(true);
-        sink._drainParked.store(true); // what a pause leaves behind
-        expect(sink.parkDrainForRateChange()) << "a block with no drain running has no consumer to stand off";
-        expect(sink._rateBreak.load()) << "and the drain is asked all the same";
-        expect(!sink._drainParked.load()) << "the answer waited for being a fresh one rather than the pause's";
-        sink._rateBreak.store(false);
-        sink._held.store(false);
-
-        /*| frame: the drain below is a thread of the block's own drain member, shaped like the
-                real loop's park branch: it watches the break and answers it late. A case that
-                starts no thread never reaches the wait at all.
-        */
-        capture::uhd::Sink answering{};
-        answering._drainParked.store(true); // again, what a pause leaves behind
-        answering._drain.start([&answering] {
-            while (!answering._drain.stopRequested()) {
-                if (answering._rateBreak.load()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(15));
-                    answering._drainParked.store(true);
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        });
-        const auto began  = std::chrono::steady_clock::now();
-        const bool parked = answering.parkDrainForRateChange(std::chrono::milliseconds(2000));
-        const auto tookMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began).count();
-        answering._drain.requestStop();
-        answering._drain.joinIfRunning();
-        expect(parked) << "a drain that stands off the ring answers the park";
-        expect(tookMs >= 10) << "and the wait waits for that answer rather than taking the flag a pause left";
-        answering._rateBreak.store(false);
     });
 
     cases("sink.uhd-a-resize-down-gives-the-storage-back", [] {
@@ -1661,186 +1561,6 @@ int main(int argc, char** argv) {
         constexpr std::size_t kMiB = 1024UZ * 1024UZ;
         expect(capture::ringSamplesFor(61.44e6, capture::uhd::Sink::ringFloorSamples(2040UZ)) * sizeof(std::complex<float>) == 128UZ * kMiB) << "a USRP queue at 61.44 MS/s is 128 MiB of CF32";
         expect(capture::ringSamplesFor(2.0e6, capture::uhd::Sink::ringFloorSamples(2040UZ)) * sizeof(std::complex<float>) == 4UZ * kMiB) << "and 4 MiB at 2 MS/s";
-    });
-
-    cases("sink.uhd-a-rate-change-before-the-first-send-resizes-the-queue", [] {
-        using capture::uhd::Sink;
-        // A burst opens on the first send, so a rate staged before any samples flow has no
-        // burst to end. Gated on that, the resize is skipped and the queue keeps the size the
-        // previous rate gave it: 65536 samples after a start at 250 kS/s, which at 61.44 MS/s
-        // is 1.07 ms of queue against the scheduler's hundred-millisecond park.
-        const auto beforeFirstSend = capture::rateChangeFor(61.44e6, 250000.0, false);
-        expect(beforeFirstSend.write) << "the new rate reaches the device";
-        expect(!beforeFirstSend.endBurst) << "with no burst in flight to end";
-        expect(capture::ringSamplesFor(250000.0, capture::uhd::Sink::ringFloorSamples(2040UZ)) == 65536UZ) << "the queue a start at 250 kS/s leaves behind";
-        expect(capture::ringSamplesFor(61.44e6, capture::uhd::Sink::ringFloorSamples(2040UZ)) == 16777216UZ) << "against the queue the new rate asks for";
-        expect(1000.0 * 65536.0 / 61.44e6 < 1.1) << "which is the 1.07 ms a queue left at the old size holds";
-        expect(1000.0 * 65536.0 / 61.44e6 < 100.0) << "far inside the park a scheduler takes on the progress counter";
-
-        // The block sizes the queue from the rate the device took, with no burst open.
-        capture::uhd::Sink sink{};
-        sink._maxSendSamples = 2040UZ;
-        sink._rateActualHz   = 250000.0;
-        sink.resizeQueueForRateLocked(true);
-        expect(!sink._bursting.load()) << "nothing has been sent, so no burst is open";
-        expect(sink._ring.buf.size() == 65536UZ) << "and the queue is the one the start's rate asked for";
-
-        sink._rateActualHz = 2.0e6;
-        sink.resizeQueueForRateLocked(true);
-        expect(sink._ring.buf.size() == 524288UZ) << "a rate change before the first send sizes the queue for the new rate all the same";
-        expect(sink._ringCapacity.load() == sink._ring.buf.size()) << "with the capacity published beside it";
-        expect(1000.0 * static_cast<double>(sink._ring.buf.size()) / 2.0e6 > 100.0) << "so the queue holds more than the scheduler's park at the rate in force";
-    });
-
-    cases("sink.uhd-a-refused-park-keeps-the-queue", [] {
-        using capture::uhd::Sink;
-        // The resize hands both ends of the queue fresh storage, and a drain that has not
-        // stood off the ring reads that storage between its own availability test and the two
-        // copies out of it. A queue kept at the previous rate's length is a wrong length of
-        // time; a queue reassigned under a live consumer is a fault.
-        capture::uhd::Sink sink{};
-        sink._rateActualHz                     = 2.0e6;
-        sink._maxSendSamples                   = 2040UZ;
-        const std::vector<std::complex<float>> staged(4096, std::complex<float>{0.25f, -0.25f});
-        expect(capture::writeWhatFits(sink._ring, staged.data(), staged.size()) == staged.size()) << "the queue holds what the play-out could not place";
-        const auto* const before = sink._ring.buf.data();
-        const std::size_t was    = sink._ring.buf.size();
-
-        sink.resizeQueueForRateLocked(false);
-        expect(sink._ring.buf.data() == before) << "a refused park leaves the storage where it is";
-        expect(sink._ring.buf.size() == was) << "at the size it had";
-        expect(capture::ringFill(sink._ring) == staged.size()) << "with the queue it was holding";
-        expect(sink.discardedAtRateChangeSamples() == 0UL) << "and nothing counted as thrown away";
-
-        sink.resizeQueueForRateLocked(true);
-        expect(sink._ring.buf.size() == capture::ringSamplesFor(2.0e6, capture::uhd::Sink::ringFloorSamples(2040UZ))) << "a park that arrived sizes the queue for the rate the device took";
-        expect(capture::ringFill(sink._ring) == 0UZ) << "leaving it empty";
-        expect(sink.discardedAtRateChangeSamples() == staged.size()) << "and counting what it threw away";
-
-        // A live drain that never answers is refused inside its own bound.
-        capture::uhd::Sink live{};
-        live._drain.start([&live] {
-            while (!live._drain.stopRequested()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        });
-        const auto began  = std::chrono::steady_clock::now();
-        const bool parked = live.parkDrainForRateChange(std::chrono::milliseconds(20));
-        const auto tookMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began).count();
-        live._drain.requestStop();
-        live._drain.joinIfRunning();
-        expect(!parked) << "a drain that does not stand off the ring inside the bound refuses the park";
-        expect(tookMs >= 20) << "the wait spending the whole of that bound";
-        expect(live._rateBreak.load()) << "with the break left for the applier to clear";
-        live._rateBreak.store(false);
-    });
-
-    cases("sink.uhd-a-play-out-is-bounded-by-the-rate-in-force", [] {
-        using capture::uhd::Sink;
-        // A refused park keeps the queue's sample count and not its length of time, so a block
-        // taken from 61.44 MS/s to 250 kS/s holds 16777216 samples at a rate that plays them
-        // out over 67 s. Sized from the count alone the next stop would hold the control mutex
-        // and the teardown mutex for the whole of that while every status reader answers empty.
-        constexpr std::size_t kFastQueue = 16777216UZ;
-        expect(capture::ringSamplesFor(61.44e6, capture::uhd::Sink::ringFloorSamples(2040UZ)) == kFastQueue) << "the queue 61.44 MS/s asks for";
-        expect(capture::playOutMs(kFastQueue, 250000.0).count() == 67358) << "which at 250 kS/s is a deadline of 67 s sized from the count alone";
-
-        const auto bounded = capture::uhd::Sink::playOutBoundMs(kFastQueue, 250000.0, 2040UZ);
-        expect(bounded.count() < 1000) << "the bound the rate in force gives is under a second";
-        expect(bounded == capture::playOutMs(capture::ringSamplesFor(250000.0, capture::uhd::Sink::ringFloorSamples(2040UZ)), 250000.0)) << "being the capacity that rate asks for";
-
-        // A queue no larger than the rate in force asks for is waited out whole.
-        expect(capture::uhd::Sink::playOutBoundMs(65536UZ, 250000.0, 2040UZ) == capture::playOutMs(65536UL, 250000.0)) << "a queue sized for the rate in force is not shortened";
-        expect(capture::uhd::Sink::playOutBoundMs(1000UZ, 2.0e6, 2040UZ) == capture::playOutMs(1000UL, 2.0e6)) << "nor is a queue below it";
-        for (const double rate : {250000.0, 2.0e6, 20.0e6, 61.44e6}) {
-            expect(capture::uhd::Sink::playOutBoundMs(kFastQueue, rate, 2040UZ).count() < 1000) << "no rate this family runs names a deadline of a second";
-        }
-
-        // The block itself, through the sequence that leaves the queue oversized.
-        capture::uhd::Sink sink{};
-        sink._maxSendSamples = 2040UZ;
-        sink._rateActualHz   = 61.44e6;
-        sink.resizeQueueForRateLocked(true);
-        expect(sink._ring.buf.size() == kFastQueue) << "the fast rate sizes the queue for itself";
-
-        sink._rateActualHz = 250000.0;
-        sink.resizeQueueForRateLocked(false);
-        expect(sink._ring.buf.size() == kFastQueue) << "and a refused park keeps that sample count";
-        expect(capture::uhd::Sink::playOutBoundMs(sink._ringCapacity.load(), sink._rateActualHz, sink._maxSendSamples).count() < 1000) << "while the wait sized from it stays under a second";
-
-        sink._rateActualHz = 250000.0;
-        sink.resizeQueueForRateLocked(true);
-        expect(sink._ring.buf.size() == 65536UZ) << "and the next park that arrives gives the storage back";
-    });
-
-    cases("sink.uhd-a-refused-park-is-retried-until-it-lands", [] {
-        using capture::uhd::Sink;
-        // Nothing asks the rate applier for the resize a second time: a rate already written is
-        // not written again. Left at that, a block taken from 61.44 MS/s to 250 kS/s with the
-        // park refused holds 16777216 samples for the rest of the run at that rate, 67 s of
-        // transmit latency, and the stop behind it abandons up to 16711680 of them.
-        constexpr std::size_t kFastQueue = 16777216UZ;
-        constexpr std::size_t kSlowQueue = 65536UZ;
-
-        capture::uhd::Sink sink{};
-        sink._maxSendSamples = 2040UZ;
-        sink._rateActualHz   = 61.44e6;
-        sink.resizeQueueForRateLocked(true);
-        expect(sink._ring.buf.size() == kFastQueue) << "the fast rate sizes the queue for itself";
-        expect(!sink.queueOutsizesRate()) << "and a queue sized at the rate it runs at asks for no resize";
-        expect(!sink.askParkForOwedResize()) << "so the drain asks for nothing at the head of its loop";
-
-        const std::vector<std::complex<float>> staged(4096, std::complex<float>{0.25f, -0.25f});
-        expect(capture::writeWhatFits(sink._ring, staged.data(), staged.size()) == staged.size()) << "the queue holds what the play-out could not place";
-
-        sink._rateActualHz = 250000.0;
-        sink.resizeQueueForRateLocked(false);
-        expect(sink._ring.buf.size() == kFastQueue) << "a refused park keeps that sample count";
-        expect(sink.queueOutsizesRate()) << "which is a queue holding more storage than the rate in force asks for";
-        expect(sink.discardedAtRateChangeSamples() == 0UL) << "with nothing counted as thrown away yet";
-
-        // The work call takes nothing while the drain still has the ring: the storage it would
-        // replace is the storage that drain indexes.
-        sink._deviceUp.store(true);
-        sink.takeOwedQueueResize();
-        expect(sink._ring.buf.size() == kFastQueue) << "a work call takes no resize while the drain is on the ring";
-        expect(capture::ringFill(sink._ring) == staged.size()) << "and the queue stays where the drain left it";
-
-        // The drain asks for the park again at the head of its own loop, and the pass behind
-        // that ask ends the burst and stands off the ring.
-        expect(sink.askParkForOwedResize()) << "the drain asks for the park again";
-        expect(sink._rateBreak.load()) << "through the same flag a rate change raises";
-        sink._drainParked.store(true); // the pass behind the ask
-
-        sink.takeOwedQueueResize();
-        expect(sink._ring.buf.size() == kSlowQueue) << "so the work call gives the storage back at the rate in force";
-        expect(sink._ringCapacity.load() == kSlowQueue) << "with the capacity published beside it";
-        expect(sink.discardedAtRateChangeSamples() == staged.size()) << "and what the queue still held counted under the rate change";
-        expect(!sink.queueOutsizesRate()) << "leaving nothing owed";
-        expect(!sink._rateBreak.load()) << "and the drain free to take the ring again";
-        expect(!sink.askParkForOwedResize()) << "which it is not asked to give up a second time";
-
-        sink.takeOwedQueueResize();
-        expect(sink.discardedAtRateChangeSamples() == staged.size()) << "a later work call takes nothing and counts nothing";
-        expect(capture::uhd::Sink::playOutBoundMs(sink._ringCapacity.load(), sink._rateActualHz, sink._maxSendSamples) == capture::playOutMs(kSlowQueue, 250000.0)) << "and every wait behind it is the rate's own quarter second";
-        sink._deviceUp.store(false);
-        sink._drainParked.store(false);
-    });
-
-    cases("sink.uhd-a-rate-change-does-not-wait-on-a-send", [] {
-        // The rate applier runs on the block's own worker thread, and every other block in the
-        // job waits behind it. It hands the burst end to the drain through a flag rather than
-        // taking the send mutex, which a device that stopped consuming would hold for the
-        // whole send timeout.
-        capture::uhd::Sink sink{};
-        const auto       began = std::chrono::steady_clock::now();
-        sink.parkDrainForRateChange();
-        const auto took = std::chrono::steady_clock::now() - began;
-        expect(sink._rateBreak.load()) << "the drain is asked to stand off the ring";
-        expect(std::chrono::duration_cast<std::chrono::milliseconds>(took).count() < 250) << "and a block with no drain running answers at once";
-        expect(std::chrono::duration_cast<std::chrono::milliseconds>(took).count() < static_cast<long>(capture::uhd::Sink::kSendTimeoutS * 1000.0))
-            << "far inside the send timeout the old path could wait";
-        sink._rateBreak.store(false);
     });
 
     cases("sink.uhd-a-stop-request-waits-for-the-control-mutex", [] {
@@ -2539,7 +2259,7 @@ int main(int argc, char** argv) {
         const auto refused = [](double) { return capture::uhd::RateWrite{.landed = false, .heldHz = 5.0e6}; };
         expect(sink.configureOpenDeviceLocked(refused) == "uhd: the sample rate was refused");
         expect(static_cast<double>(sink.sample_rate) == 8.0e6) << "the setting keeps the request rather than the rate a released device held";
-        expect(!sink.applyRateWith(refused) && static_cast<double>(sink.sample_rate) == 5.0e6) << "while a running block's refused change states the rate the device holds";
+        expect(!sink.applyRateWith(refused) && static_cast<double>(sink.sample_rate) == 5.0e6) << "while a refused write states the rate the device holds";
     });
 
     cases("sink.uhd-a-rate-nobody-read-back-is-written-again", [] {

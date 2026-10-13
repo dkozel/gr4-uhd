@@ -17,7 +17,7 @@ holds the headers the blocks build on, the discovery library's source, the
 case support and `cmake/capture.cmake`, the build logic `uhd/CMakeLists.txt`
 calls. `extract/uhd.imported` lists every file the copy placed; a change to
 one of them is made in libcapture. This copy is of libcapture as of
-2026-10-12, at "USRP comment cleanup: the retune after a clock move", its last
+2026-10-12, at "Remove the USRP source's rate-change gap cause", its last
 change to these files.
 
 ## Building

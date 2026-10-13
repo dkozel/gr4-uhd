@@ -152,14 +152,10 @@ private:
         output edge and publishes it, and a control thread of the block's own makes the control
         calls those settings ask for while the stream runs.
     invariant: the work thread never waits on a device call that another thread makes, apart
-        from a change of the device's clocking. A settings pass stages the tune, the gain, the
-        automatic gain mode and the antenna on the control thread, and its surface check reads
-        the surface values from a snapshot rather than under _ctrlMutex. The exceptions are
-        these: a rate change settles the control thread and writes the rate itself behind a
-        marked break; the rate a master-clock write restages takes _ctrlMutex; so does the
-        clock offset read once a device-clock set latches; and so does a pass carrying
-        device_parameter, master_clock_rate, wire_format, clock_source or time_source, which
-        clears the pins those settings shadow and waits behind a tune in progress.
+        from the clock offset read once a device-clock set latches, which takes _ctrlMutex. A
+        settings pass stages the tune, the gain, the automatic gain mode and the antenna on the
+        control thread, refuses the settings the run holds fixed, and its surface check reads
+        the surface values from a snapshot rather than under _ctrlMutex.
     verified-by: controls.uhd-a-settings-pass-never-waits-on-a-tune
     invariant: control calls are serialized by _ctrlMutex, which the sensor sweep deliberately
         does not hold across its device reads: one sweep takes the better part of a second on a
@@ -304,29 +300,22 @@ environment.)">;
     std::atomic<bool>           _streamDead{false}; // consumer saw a persistently dead stream
     std::atomic<std::uint64_t>  _overflows{0};
     std::atomic<std::uint64_t>  _seqErrors{0}; // gaps the link lost rather than the buffer overran
-    /*| frame: the holes this block made itself, by emptying the transport across a rate
-            change, and which kind the last hole was. A marker names the cause
-            so a reader can tell a radio that shed samples from a block that dropped them on
-            purpose.
+    /*| frame: the causes a gap marker names, and which kind the last counted hole was.
     */
-    std::atomic<std::uint64_t>  _rateBreaks{0};
     static constexpr int        kGapBufferOverrun = 0;
     static constexpr int        kGapLostPacket    = 1;
-    static constexpr int        kGapRateChange    = 2;
     static constexpr int        kGapRetune        = 3;
     static constexpr int        kGapMissingSamples = 4;
     std::atomic<int>            _lastGapCause{kGapBufferOverrun};
     /*| contract: the name a gap marker carries for one of the causes above, and "overflow" for
             a value naming none of them.
         frame: the words the marker's rx_overflow_cause key carries, so a reader tells a radio
-            that shed samples from a link that lost a packet and from a block that emptied the
-            transport itself.
+            that shed samples from a link that lost a packet.
         verified-by: controls.uhd-a-gap-marker-names-its-cause
     */
     static const char* gapCauseName(int cause) {
         switch (cause) {
         case kGapLostPacket: return "lost packet";
-        case kGapRateChange: return "rate change";
         case kGapRetune: return "retune";
         case kGapMissingSamples: return "missing samples";
         default: return "overflow";
@@ -422,39 +411,24 @@ environment.)">;
     std::optional<double>       _freqWrittenHz, _loOffsetWrittenHz, _rateWrittenHz, _gainWrittenDb, _bwWrittenHz;
     std::optional<bool>         _agcWritten;
     std::optional<std::vector<std::string>> _antennaWritten; // per streaming channel
-    /*| frame: the wire format and the master clock in force, and what a control pinned them
-            to. Both are read at open — the format when the streamer is built, the clock as a
-            device-address key — so a control write outlives the stream it was made during and
-            the next start takes it. Unpinned, the settings decide. Guarded by _ctrlMutex.
-    */
+    // The wire format the streamer in force was built with. Guarded by _ctrlMutex.
     std::string                 _wireFormat = "sc16";
-    std::optional<std::string>  _wireFormatPinned;
-    std::optional<double>       _masterClockPinnedHz;
-    /*| frame: whether the clock pin came from a product table's list, on a radio stating one
-            clock, and no device has taken that clock yet. A pin a live write put on the device
-            leaves it false. Guarded by _ctrlMutex.
-    */
-    bool                        _masterClockPinFromTable = false;
-    /*| frame: the converter clock an explicit write put on the device, empty until one was
-            made. It is not the same as the pinned value: selecting the automatic entry asks
-            the next open to choose, and UHD's own choice does not come back while the device
-            stays open, so the clock a write put there is still the one every rate is derived
-            from. Guarded by _ctrlMutex.
+    /*| frame: the converter clock the open address fixed, empty where the open left the
+            choice to UHD. Guarded by _ctrlMutex.
     */
     std::optional<double>       _clockInForceHz;
-    // A master-clock write moved every rate the radio reaches, so the consumer thread owes
-    // the settings a rate that clock does reach.
-    std::atomic<bool>           _restageRate{false};
-    /*| frame: the reference and the timing selection a control asked for, which the next
-            start writes before it configures anything else. Guarded by _ctrlMutex.
-    */
-    std::optional<std::string>  _clockSourcePinned, _timeSourcePinned;
     std::vector<std::pair<std::string, double>> _heldGains; // element gains asked for, guarded by _ctrlMutex
     std::uint64_t               _lastTagTimeNs = 0;
     std::vector<std::complex<float>> _recvBuf; // the drain's buffer, on the consumer thread
     std::vector<std::complex<float>> _recvBuf2; // the second channel's, where out2 takes nothing
     std::vector<std::size_t>         _channels{0UZ}; // the device channels streaming, written by start() before any thread runs
     bool                             _secondPublished = false; // out2 has a reader and a channel, on the consumer thread
+    /*| frame: the settings the run holds fixed, copied at the end of the start and empty
+            before the first, and whether another handle in this process held the device at the
+            open. Written by start() before the device is marked up.
+    */
+    std::optional<HeldForRun<std::vector<gr::Size_t>>> _heldForRun;
+    bool                        _joined = false;
     OutputState                   _outputState;
     ControlProperties     _controlProperties{this};
     Snapshot<SurfaceValues>       _surfaceValues; // what controlSurface() reads, published by publishSurfaceLocked()
@@ -711,9 +685,9 @@ environment.)">;
             nothing.
         frame: a USRP timestamps every packet, so the stamps say where a block belongs in the
             stream and the gap between two blocks measures what the radio shed between them.
-        why: the device takes a sample on every decimation-th tick of its master clock. After
-            a live rate change those ticks can sit a fraction of a sample off the grid of
-            whole sample periods counted from the device's epoch. A stamp rounded to that grid
+        why: the device takes a sample on every decimation-th tick of its master clock, and
+            those ticks can sit a fraction of a sample off the grid of whole sample periods
+            counted from the device's epoch. A stamp rounded to that grid
             on its own rounds a half up on one block and down on the next, and each return
             upward reads as one sample shed. Two stamps of one stream sit the same fraction
             off that grid, so their difference is a whole number of samples at any rate, the
@@ -726,9 +700,6 @@ environment.)">;
             differ from the rate the device holds by up to half a hertz, which moves a long
             block's difference by a small fraction of a sample either way, and the whole part
             of one sample less that fraction reads as none.
-        trap: a block arrives before the stamp expected of it after a rate change, because the
-            expectation was formed at the previous rate. An early arrival is not a negative
-            gap to subtract.
         verified-by: controls.uhd-counts-what-the-device-shed
         verified-by: controls.uhd-stamps-off-the-sample-grid-count-only-lost-samples
     */
@@ -1332,18 +1303,12 @@ environment.)">;
             clock and moves the timing tags onto it; WIRE_FORMAT, an index into the format
             list; MASTER_CLOCK in MHz, zero meaning the choice UHD makes. False for a control
             this device does not have.
-        frame: WIRE_FORMAT, CLOCK_SOURCE, TIME_SOURCE and the automatic MASTER_CLOCK entry
-            are stream and open-time arguments, so they are staged and take effect at the
-            next start.
-        contract: a staged value is named on standard error only where it moves what the
-            next start takes, the value pinned before or else the one in force. A caller
-            replays its stored controls after every start, and a replay prints nothing.
+        contract: WIRE_FORMAT, CLOCK_SOURCE, TIME_SOURCE and MASTER_CLOCK name settings the
+            run holds fixed. A write of the value in force answers true and writes nothing, and
+            any other value is refused: false, with the setting named on standard error. The
+            setting itself is written while the block is stopped and applies at the next start.
         verified-by: controls.uhd-a-replay-of-the-selection-in-force-says-nothing
-        trap: the reference and the timing selection are not written to a streaming device,
-            for the reason applyReferenceSources states. Writing a time source of external
-            while the clock source is already external throws as well, UHD refusing one
-            reference as both, and a throw at the next start leaves the device on the selection
-            it had.
+        verified-by: controls.uhd-a-running-source-refuses-the-settings-it-runs-on
     */
     bool setControl(const std::string& id, double value) {
         if (id == "ANTENNA") {
@@ -1391,20 +1356,10 @@ environment.)">;
                 if (!index.has_value()) {
                     return false;
                 }
-                /*| trap: the pinned format alone. _wireFormat is the format the running
-                        streamer was built with, and the rate ladder in force is that
-                        format's: moving it under the stream would offer a rate the link
-                        cannot carry in the packing it is actually sending. */
-                const std::string& format = wireFormats()[*index];
-                const bool         moves  = format != _wireFormatPinned.value_or(_wireFormat);
-                _wireFormatPinned         = format;
-                if (moves) {
-                    std::fprintf(stderr, "[uhd::Source] the wire format %s takes effect at the next start\n", format.c_str());
-                }
-                return true;
+                return keptForRun("wire_format", wireFormats()[*index], _wireFormat);
             }
             if (id == "MASTER_CLOCK") {
-                return applyMasterClockLocked(want * 1e6);
+                return masterClockWriteLocked(want * 1e6);
             }
             if (id == "CLOCK_SOURCE" || id == "TIME_SOURCE") {
                 const bool  clock = id == "CLOCK_SOURCE";
@@ -1413,14 +1368,7 @@ environment.)">;
                 if (!at.has_value()) {
                     return false;
                 }
-                auto&              pinned = clock ? _clockSourcePinned : _timeSourcePinned;
-                const std::string& name   = names[*at];
-                const bool         moves  = name != pinned.value_or(clock ? _openTruth.clockSource : _openTruth.timeSource);
-                pinned                    = name;
-                if (moves) {
-                    std::fprintf(stderr, "[uhd::Source] the %s source %s takes effect at the next start\n", clock ? "clock" : "time", name.c_str());
-                }
-                return true;
+                return keptForRun(clock ? "clock_source" : "time_source", names[*at], clock ? _openTruth.clockSource : _openTruth.timeSource);
             }
             if (id == "LO_OFFSET") {
                 const double offset  = boundedLoOffsetHz(want * 1e6, _rateActualHz);
@@ -1587,51 +1535,26 @@ environment.)">;
 
     // ---- lifecycle -------------------------------------------------------------------
 
-    // The address this block opens the device with, the settings and any pinned master
-    // clock folded into the caller's selector.
+    // The address this block opens the device with, the settings folded into the caller's
+    // selector.
     ::uhd::device_addr_t openAddress() const {
-        return ::uhd::device_addr_t(withDeviceArgs(device_parameter.value, _masterClockPinnedHz.value_or(master_clock_rate.value), Direction::Receive, recv_frame_size, num_recv_frames, recv_buff_size));
+        return ::uhd::device_addr_t(withDeviceArgs(device_parameter.value, master_clock_rate.value, Direction::Receive, recv_frame_size, num_recv_frames, recv_buff_size));
     }
 
-    /*| contract: the words a failed open adds for a clock pin a product table's list made, which
-            the open carried, with the pin cleared, so the next start opens with the
-            master_clock_rate setting. Empty, and nothing cleared, where the pin is none, the
-            automatic entry, or a clock a live write already put on the device. Called with
-            _ctrlMutex held.
-        why: a table clock the loaded image or the daughterboard refuses fails every open that
-            carries it, and a stopped block refuses every control write. A pin nothing clears
-            would keep the block from starting again. A clock the device already ran is not the
-            cause of a failed open, and an unplugged unit or one another process holds keeps it.
-        verified-by: controls.uhd-a-failed-open-clears-the-clock-pin
+    /*| contract: answer a control write of a setting the run holds fixed: true where the value
+            asked is the value in force, and false otherwise, with the setting named on
+            standard error. Nothing is written either way.
     */
-    std::string clearClockPinAfterFailedOpenLocked() {
-        if (!_masterClockPinFromTable || !_masterClockPinnedHz.has_value() || *_masterClockPinnedHz <= 0.0) {
-            return {};
+    static bool keptForRun(std::string_view setting, const std::string& asked, const std::string& inForce) {
+        if (asked == inForce) {
+            return true;
         }
-        const double pinned = *_masterClockPinnedHz;
-        _masterClockPinnedHz.reset();
-        _masterClockPinFromTable = false;
-        return std::format("; the master clock pinned at {:g} MHz is cleared, and the next start opens with the master_clock_rate setting", pinned / 1e6);
-    }
-
-    /*| contract: the line naming a pinned master clock the open did not put in force: the pin
-            above zero and the clock the device reads more than a hertz from it. Empty
-            otherwise, and where the device read no clock.
-        why: a difference has more than one cause. UHD hands a second open in one process the
-            device already open, with the first open's keys, so a pin reaches the radio only at
-            an open that opens it; and a driver can coerce a clock inside its range to the
-            nearest one it reaches.
-        verified-by: controls.uhd-a-table-clock-applies-at-the-next-open
-    */
-    static std::string clockPinMissedLine(double pinnedHz, double readHz) {
-        if (pinnedHz <= 0.0 || readHz <= 0.0 || std::abs(pinnedHz - readHz) <= 1.0) {
-            return {};
-        }
-        return std::format("[uhd::Source] the device runs a {:g} MHz master clock, not the pinned {:g} MHz; one cause: UHD hands a second open in one process the device already open, with the first open's keys", readHz / 1e6,
-                           pinnedHz / 1e6);
+        std::fprintf(stderr, "[uhd::Source] %s is fixed while the block runs and keeps '%s'; a write applies while the block is stopped\n", std::string(setting).c_str(), inForce.c_str());
+        return false;
     }
 
     void start() {
+        const double askedRateHz = sample_rate.value;
         if (const auto refusal = channelsRefusal(channels.value, out2.isConnected(), "out2"); refusal.has_value()) {
             throwStartFailure("uhd::Source", *refusal);
         }
@@ -1641,7 +1564,6 @@ environment.)">;
         _streamDead.store(false, std::memory_order_release);
         _overflows.store(0, std::memory_order_relaxed);
         _seqErrors.store(0, std::memory_order_relaxed);
-        _rateBreaks.store(0, std::memory_order_relaxed);
         _dropped.store(0, std::memory_order_relaxed);
         // A fresh multi_usrp holds none of the previous device's state, so nothing an
         // applier wrote before is still in force.
@@ -1664,7 +1586,6 @@ environment.)">;
         _clockSetPending.store(false, std::memory_order_release);
         _deviceClockSet.store(false, std::memory_order_release);
         _deviceToHostNs.store(0, std::memory_order_relaxed);
-        _restageRate.store(false, std::memory_order_release);
         _clockInForceHz.reset();
         publishSurfaceLocked();
         {
@@ -1674,24 +1595,20 @@ environment.)">;
         _tuneResultsPosted.store(0, std::memory_order_release);
         _tuneRequests = 0;
         _retunesOpen.store(0, std::memory_order_release);
-        _wireFormat           = validWireFormat(_wireFormatPinned.value_or(wire_format.value));
+        _wireFormat           = validWireFormat(wire_format.value);
         _surfaceAgc.store(gain_mode.value, std::memory_order_release);
         awaitReleases();
         try {
             _usrp = ::uhd::usrp::multi_usrp::make(openAddress());
         } catch (const std::exception& e) {
             _usrp.reset();
-            std::string cleared;
-            {
-                std::lock_guard lock(_ctrlMutex);
-                cleared = clearClockPinAfterFailedOpenLocked();
-            }
-            throwStartFailure("uhd::Source", std::format("uhd make({}): {}{}", device_parameter.value, e.what(), cleared));
+            throwStartFailure("uhd::Source", std::format("uhd make({}): {}", device_parameter.value, e.what()));
         }
         {
             // The address parsed for the open above, so it parses here.
             const ::uhd::device_addr_t address = openAddress();
             std::lock_guard            lock(_ctrlMutex);
+            _joined          = heldElsewhere(*_usrp);
             _recvFramesAsked = addressNumber(address, "num_recv_frames");
             _recvBuffAsked   = addressNumber(address, "recv_buff_size");
         }
@@ -1742,9 +1659,6 @@ environment.)">;
                 truthFailure = e.what();
                 _openTruth   = {};
             }
-            if (const std::string missed = clockPinMissedLine(_masterClockPinnedHz.value_or(0.0), _openTruth.mclkHz); !missed.empty()) {
-                std::fprintf(stderr, "%s\n", missed.c_str());
-            }
             _bwMinHz      = _openTruth.bwMinHz;
             _bwMaxHz      = _openTruth.bwMaxHz;
             _bwCurHz      = _openTruth.bwCurHz;
@@ -1771,6 +1685,9 @@ environment.)">;
         // enumerated once, and each tick reads the values alone.
         _sensorNames = sensorNamesOf(*_usrp, Direction::Receive, "uhd::Source", kBriefSensorLimitMs, AlwaysLive{}, _channels.front());
 
+        if (const std::string overflow = autoClockOverflowOf(askedRateHz, true); !overflow.empty()) {
+            failStartOnOpenDevice(overflow);
+        }
         applySampleRate();
         applyAntenna();
         applyFrequency();
@@ -1782,6 +1699,11 @@ environment.)">;
         }
         _refLockWaitMs = capture::uhd::waitForReference(*_usrp, "uhd::Source").waitedMs;
 
+        if (const std::string overflow = autoClockOverflowOf(askedRateHz, false); !overflow.empty()) {
+            sample_rate = askedRateHz; // the next start asks for the request again
+            failStartOnOpenDevice(overflow);
+        }
+        std::string conflict;
         try {
             ::uhd::stream_args_t streamArgs("fc32", _wireFormat);
             streamArgs.channels = _channels;
@@ -1793,6 +1715,10 @@ environment.)">;
                     _freqWrittenHz.reset(); // the tune made at the earlier clock is off the center
                     std::ignore = tuneLocked(_requestedFreqHz, _ppmApplied, true);
                 }
+                conflict = runCheckLocked(askedRateHz);
+            }
+            if (conflict.empty()) {
+                std::lock_guard lock(_ctrlMutex);
                 _maxRecvSamples = _stream->get_max_num_samps();
                 // The two clocks read beside each other, which carries every device
                 // timestamp into the host's epoch for as long as this stream runs.
@@ -1802,7 +1728,12 @@ environment.)">;
         } catch (const std::exception& e) {
             failStartOnOpenDevice(std::format("uhd rx stream: {}", e.what()));
         }
+        if (!conflict.empty()) {
+            sample_rate = askedRateHz; // the next start asks for the request again
+            failStartOnOpenDevice(conflict);
+        }
 
+        _heldForRun = heldForRun(*this);
         _deviceUp.store(true, std::memory_order_release);
         startThreads();
         /*| frame: the brief sweep the first sensors request answers with, made here on an
@@ -1842,17 +1773,17 @@ environment.)">;
         }
     }
 
-    /*| contract: put the device on the reference and the timing selection this block was
-            given — the choice a control pinned where one was made, the settings otherwise —
+    /*| contract: put the device on the reference and the timing selection the settings name,
             and read both back where either was asked for. An empty name leaves the device on
-            its own selection. Called with _ctrlMutex held, from start() alone, before the
+            its own selection, and a device another handle holds is written nothing, as
+            heldElsewhere states. Called with _ctrlMutex held, from start() alone, before the
             streamer exists and before the device time is set, where applyReferenceSources
             says the writes belong.
     */
     void applyReferenceSourcesLocked() {
-        const std::string wantClock = _clockSourcePinned.value_or(clock_source.value);
-        const std::string wantTime  = _timeSourcePinned.value_or(time_source.value);
-        if (wantClock.empty() && wantTime.empty()) {
+        const std::string& wantClock = clock_source.value;
+        const std::string& wantTime  = time_source.value;
+        if ((wantClock.empty() && wantTime.empty()) || _joined) {
             return;
         }
         applyReferenceSources(*_usrp, wantClock, wantTime, "uhd::Source");
@@ -1940,8 +1871,8 @@ environment.)">;
 
     /*| contract: runs on the consumer thread, which drains the staged settings. The frequency,
             the gain, the automatic gain mode and the antenna are copied out of the settings
-            here and staged on the control thread; a rate change runs here, after the control
-            thread has settled, because it stops the stream, drains it and starts it again.
+            here and staged on the control thread. A write of a setting the run holds fixed is
+            refused, as refuseRunningWrites states.
         contract: the gain is bounded here, and a gain the bound moved is written back into
             rx_gains here, before the control thread writes the bounded value to the device.
         invariant: nothing forwards the frequency from here. The consumer thread places the
@@ -1949,16 +1880,18 @@ environment.)">;
             hands back.
         verified-by: controls.uhd-a-retune-forwards-nothing-ahead-of-its-samples
     */
-    void settingsChanged(const gr::property_map& oldSettings, gr::property_map& newSettings, gr::property_map& forwardSettings) {
+    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& forwardSettings) {
         const ControlSurfaceCheck<Source> surfaceCheck{*this}; // sends a moved surface once the body has let go of its locks
         if (newSettings.contains("gain_mode")) {
             _surfaceAgc.store(gain_mode.value, std::memory_order_release);
         }
-        clearPinsFor(oldSettings, newSettings);
         // The atomic rather than the handle: the handle is written under the control mutex
         // this test does not hold, and reading it here races that write.
         if (!_deviceUp.load(std::memory_order_acquire)) {
             return;
+        }
+        if (_heldForRun.has_value()) {
+            refuseRunningWrites(*this, *_heldForRun, newSettings, forwardSettings, "uhd::Source");
         }
         if (newSettings.contains("frequency") || newSettings.contains("frequency_correction")) {
             forwardSettings.erase(std::pmr::string("frequency"));
@@ -1966,14 +1899,6 @@ environment.)">;
                 const std::uint64_t request = ++_tuneRequests;
                 _control.post(kControlFrequency, [this, request, want = frequency->front(), ppm = frequency_correction.value] { retune(request, want, ppm); });
             }
-        }
-        if (newSettings.contains("sample_rate")) {
-            // The writes given before this one reach the device first, within a bound.
-            if (!_control.settleFor(std::chrono::duration<double>(kControlSettleLimitS))) {
-                std::fprintf(stderr, "[uhd::Source] a control write still runs after %.1f s; the rate is written behind it\n", kControlSettleLimitS);
-            }
-            applySampleRate();
-            forwardSettings.insert_or_assign(std::pmr::string("sample_rate"), sample_rate.value);
         }
         if (newSettings.contains("rx_gains") && !rx_gains->empty()) {
             _control.post(kControlGain, [this, want = boundGainSetting()] { applyGainOf(want); });
@@ -1992,45 +1917,6 @@ environment.)">;
                 std::ignore = applyAntennasOf(names);
                 publishControlSurface(*this); // a landed write moves the surface's default
             });
-        }
-    }
-
-    /*| contract: drop the pins a settings write makes stale: every pin where device_parameter
-            moves to another value, and the pin a setting shadows where the settings pass
-            carries that setting, master_clock_rate, wire_format, clock_source or time_source.
-            Runs whether or not the device is up.
-        frame: the settings pass carries a setting whose staged value differs from the value
-            it holds; a write of the value held reaches no hook and clears nothing.
-        why: a pin outlives the stream it was made during and shadows its setting at the next
-            start. A pin made for one radio fails the open of another: 184.32 MHz fails on an
-            N310 and on a B2xx. A write of the setting states what the caller wants next.
-        verified-by: controls.uhd-a-settings-write-clears-the-pins
-    */
-    void clearPinsFor(const gr::property_map& oldSettings, const gr::property_map& newSettings) {
-        const auto deviceMoved = [&] {
-            if (!newSettings.contains("device_parameter")) {
-                return false;
-            }
-            const auto old = oldSettings.find("device_parameter");
-            return old == oldSettings.end() || old->second.value_or(std::string_view{}) != std::string_view(device_parameter.value);
-        }();
-        const auto shadowed = [&newSettings](std::string_view key) { return newSettings.contains(key); };
-        if (!deviceMoved && std::ranges::none_of(std::array<std::string_view, 4>{"master_clock_rate", "wire_format", "clock_source", "time_source"}, shadowed)) {
-            return; // the control mutex is taken only for a clear, so a pass of other settings never waits on a tune
-        }
-        std::lock_guard lock(_ctrlMutex);
-        if (deviceMoved || newSettings.contains("master_clock_rate")) {
-            _masterClockPinnedHz.reset();
-            _masterClockPinFromTable = false;
-        }
-        if (deviceMoved || newSettings.contains("wire_format")) {
-            _wireFormatPinned.reset();
-        }
-        if (deviceMoved || newSettings.contains("clock_source")) {
-            _clockSourcePinned.reset();
-        }
-        if (deviceMoved || newSettings.contains("time_source")) {
-            _timeSourcePinned.reset();
         }
     }
 
@@ -2159,111 +2045,55 @@ environment.)">;
         publishSurfaceLocked();
     }
 
-    /*| contract: put the converter clock on the rate asked for, in Hz, and re-derive
-            everything that hangs off it — the stated rate set, the clock in force, and the
-            rate the consumer thread is then owed. Zero pins the automatic choice, which the
-            next start restores. Called with _ctrlMutex held and a live device.
+    /*| contract: answer a MASTER_CLOCK write, in Hz, while the device is up. A write of the
+            clock the run holds answers true and writes nothing: zero where master_clock_rate
+            asked for UHD's choice, or a clock within a hertz of the clock the device runs. Any
+            other value is refused, with the setting named on standard error. Called with
+            _ctrlMutex held.
         why: every reachable rate is the clock over a decimation, so a clock written under a
-            running stream moves the rate as well.
-        trap: this runs on whichever thread called setControl, which in a receiver is the one
-            that serves the interface. It therefore writes the device and nothing else: the
-            rate setting is the block's, written by the appliers on the consumer thread, and
-            a second writer of it would be a race. The flag asks that thread for the write
-            and for the forward that carries the new rate downstream.
-        measured: a B205mini put on a 30.72 MHz clock reaches 7.68 MS/s exactly. UHD's own
-            choice does not come back while the device stays open: the explicit write clears
-            the automatic flag inside the driver and only a fresh open sets it again, which
-            is why the clock in force outlives a request for the automatic entry.
-        contract: a clock within a hertz of the clock in force is pinned and answers true with no
-            device write and no restage of the rate.
-        why: a caller replays its stored clock after every start, and a clock the open address
-            carried is in force from the first sample. Written again, it resets the rate cache
-            and restages the rate, and the consumer thread then stops the stream, marks a rate
-            break and names a rate move at every start for a rate that did not move.
+            running stream moves the rate of every block on the device.
         verified-by: controls.uhd-a-replay-of-the-clock-in-force-writes-nothing
     */
-    bool applyMasterClockLocked(double hz) {
-        if (hz <= 0.0) {
-            // No clock in force is UHD's own choice, which the open left automatic.
-            const bool moves         = _masterClockPinnedHz.value_or(_clockInForceHz.value_or(0.0)) != 0.0;
-            _masterClockPinnedHz     = 0.0;
-            _masterClockPinFromTable = false;
-            if (moves) {
-                std::fprintf(stderr, "[uhd::Source] the automatic master clock takes effect at the next start; this device keeps the clock it was given\n");
-            }
+    bool masterClockWriteLocked(double hz) const {
+        if (hz <= 0.0 ? !(_heldForRun.has_value() && _heldForRun->masterClockHz > 0.0) : std::abs(hz - _openTruth.mclkHz) <= kRunValueToleranceHz) {
             return true;
         }
-        /*| contract: on a radio stating one clock, a clock its product takes is pinned for the
-                next open and the device is not written. The bound has already refused a value
-                that is not an entry. A pin that moves the next open is named on standard error,
-                with the one case in which the next start does not apply it.
-            why: UHD's manual names these clocks as values of the master_clock_rate argument at
-                the open, and states that an X3xx and an X4xx keep the clock they were opened at
-                for the whole session.
-            trap: UHD hands a second open in one process the device already open, with the
-                first open's keys. A pin reaches the radio only at an open that opens it, and
-                the start compares the clock it reads with the pin.
-            verified-by: controls.uhd-a-table-clock-applies-at-the-next-open
-        */
-        if (offersOneClockRate(_openTruth)) {
-            const auto ladder = masterClockLadderMHz(_openTruth);
-            if (std::ranges::none_of(ladder, [hz](double mhz) { return mhz > 0.0 && std::abs(mhz * 1e6 - hz) < 1.0; })) {
-                return false;
-            }
-            const bool moves         = std::abs(hz - _masterClockPinnedHz.value_or(_openTruth.mclkMinHz)) >= 1.0;
-            _masterClockPinnedHz     = hz;
-            _masterClockPinFromTable = true;
-            if (moves) {
-                std::fprintf(stderr, "[uhd::Source] the master clock %g MHz takes effect at the next start that opens the device; a device another block of this process holds open keeps its clock\n", hz / 1e6);
-            }
-            return true;
-        }
-        if (_clockInForceHz.has_value() && std::abs(*_clockInForceHz - hz) < 1.0) {
-            _masterClockPinnedHz     = hz;
-            _masterClockPinFromTable = false;
-            return true;
-        }
-        try {
-            _usrp->set_master_clock_rate(hz, 0);
-            _masterClockPinnedHz     = hz;
-            _masterClockPinFromTable = false;
-            _openTruth.mclkHz    = _usrp->get_master_clock_rate(0);
-            _clockInForceHz      = _openTruth.mclkHz;
-            _openTruth.rates.clear();
-            for (const auto& r : _usrp->get_rx_rates(_channels.front())) {
-                _openTruth.rates.emplace_back(r.start(), r.stop());
-            }
-            publishSurfaceLocked();
-            _rateWrittenHz.reset(); // the clock moved under it, so the rate has to be written again
-            _restageRate.store(true, std::memory_order_release);
-            return true;
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "[uhd::Source] set_master_clock_rate(%.0f): %s (the clock stays where it is)\n", hz, e.what());
-            return false;
-        }
+        std::fprintf(stderr, "[uhd::Source] master_clock_rate is fixed while the block runs and keeps the %.0f Hz clock; a write applies while the block is stopped\n", _openTruth.mclkHz);
+        return false;
     }
 
-    /*| contract: ask the settings for the rate the clock now in force reaches nearest the
-            rate the radio was running, so that the consumer thread performs the write and
-            the settings machinery forwards the new rate downstream. Called on the consumer
-            thread, holding no lock while it stages.
-        trap: staged outside the control mutex. The settings drain takes the settings
-            machinery's mutex and then this block's control mutex, so staging under the
-            control mutex is the opposite order and the two deadlock.
-        verified-by: uhd.master-clock
+    /*| contract: compare what the device runs, once the streamer exists, with what this block
+            asked for, and answer why the start fails, or an empty string. The record takes the
+            clock the device runs, and the values left automatic are named on standard error.
+            Called with _ctrlMutex held, from start() alone.
+        verified-by: uhd.device-settings-across-two-blocks
     */
-    void restageRateForClock() {
-        double want = 0.0;
-        {
-            CtrlGuard guard(_ctrlMutex, _deviceUp);
-            if (!guard) {
-                return;
-            }
-            want = _rateActualHz > 0.0 ? rateToWrite(_rateActualHz) : 0.0;
+    std::string runCheckLocked(double askedRateHz) {
+        const RunValues asked{.clockSource = clock_source.value, .timeSource = time_source.value, .masterClockHz = master_clock_rate.value, .rateHz = askedRateHz};
+        const RunValues running = runValuesOf(*_usrp, Direction::Receive, _channels.front());
+        if (running.masterClockHz > 0.0) {
+            _openTruth.mclkHz = running.masterClockHz;
+            publishSurfaceLocked();
         }
-        if (want > 0.0) {
-            std::ignore = this->settings().setStaged({{"sample_rate", want}});
+        std::string conflict = runConflict(asked, running, _joined, Direction::Receive);
+        if (const std::string line = automaticInForceLine(asked, running, "uhd::Source"); conflict.empty() && !line.empty()) {
+            std::fprintf(stderr, "%s\n", line.c_str());
         }
+        return conflict;
+    }
+
+    /*| contract: why this block's rate would overflow UHD's automatic master clock beside the
+            rates another handle set on the shared device, as autoClockOverflow states, or an
+            empty string. beforeWrite takes the rate the block is about to write, and otherwise
+            the rate the device read back, which is checked before the streamer is built. A
+            device no other handle holds is not asked. Called from start() alone.
+    */
+    std::string autoClockOverflowOf(double askedRateHz, bool beforeWrite) {
+        std::lock_guard lock(_ctrlMutex);
+        if (!_joined || _usrp == nullptr) {
+            return {};
+        }
+        return autoClockOverflow(askedRateHz, beforeWrite ? rateToWrite(askedRateHz) : _rateActualHz, Direction::Receive, _channels, autoClockRates(*_usrp));
     }
 
     /*| contract: whether a time source disciplines the device clock with a pulse per second,
@@ -2445,20 +2275,11 @@ environment.)">;
         why: a duration holds at every rate. The drain takes every sample the transport holds
             that arrives within kDrainLimitS, 18.4 million at 61.44 MS/s and 600 million at
             2 GS/s, where a count of receives stops at the same number of samples at every
-            rate and at a faster rate leaves more of the old rate in the transport.
+            rate and at a faster rate leaves more of the stream in the transport.
         verified-by: controls.uhd-a-drain-ends-by-duration-at-any-rate
     */
     static constexpr double kDrainRecvS  = 0.05;
     static constexpr double kDrainLimitS = 0.3;
-
-    /*| contract: the longest a rate change waits for the control thread to finish the writes
-            given before it. Past it the rate is written behind them, the two serialized on
-            _ctrlMutex, and a line says so.
-        why: a duration, as the drain's bound is. One control write is a retune, a gain, an
-            automatic gain mode or an antenna, and a retune is the slowest of them.
-        verified-by: controlworker.a-settle-ends-by-its-bound
-    */
-    static constexpr double kControlSettleLimitS = 1.0;
 
     /*| frame: the samples the drain's own buffer holds, one receive's worth and no bound on the
             drain. The drain throws what it takes away, and so does a receive made while the
@@ -2509,7 +2330,7 @@ environment.)">;
         return out;
     }
 
-    /*| contract: the last drain of a stopped stream this block made, at a rate change or a
+    /*| contract: the last drain of a stopped stream this block made, at a
             teardown, and a default result before the first. A diagnostic.
         verified-by: uhd.a-drain-at-the-top-rate-ends-by-duration
     */
@@ -2519,14 +2340,10 @@ environment.)">;
     }
 
     /*| contract: stop the device stream and drain it through drainStopped into the drain's
-            buffer. Answers the samples taken. Called on the one thread that may call recv at
-            that moment: the consumer thread with _ctrlMutex held, or the teardown after it has
-            joined the consumer thread.
-        why: samples already in flight were taken at the old rate. Published behind the new
-            rate's tag they are labeled with a rate they were not taken at and timed by it as
-            well, which is a hole no marker names. At a teardown the device quiesces before the
-            streamer goes.
-        verified-by: uhd.rate-change-midstream
+            buffer. Answers the samples taken. Called by the teardown after it has joined the
+            consumer thread, which leaves it the one thread that may call recv.
+        why: the device quiesces before the streamer goes.
+        verified-by: uhd.a-drain-at-the-top-rate-ends-by-duration
     */
     DrainResult stopAndDrainStream() {
         DrainResult out;
@@ -2615,18 +2432,6 @@ environment.)">;
             }
             return;
         }
-        /*| invariant: a rate written to a streaming device is bracketed by a stop and a
-                start, with the transport emptied between them, and the discontinuity is
-                marked. Before the streamer exists there is nothing to bracket.
-        */
-        const bool streaming = _stream != nullptr && _deviceUp.load(std::memory_order_acquire);
-        if (streaming) {
-            const DrainResult drained = stopAndDrainStream();
-            _rateBreaks.fetch_add(1, std::memory_order_relaxed);
-            _lastGapCause.store(kGapRateChange, std::memory_order_relaxed);
-            std::fprintf(stderr, "[uhd::Source] the rate moves to %.0f S/s: %zu samples taken at the old rate were dropped%s and the discontinuity is marked\n", want, drained.samples,
-                         drained.end == DrainEnd::Deadline ? ", the drain ending at its bound with the transport still delivering," : "");
-        }
         /*| invariant: the setting states the rate the device holds afterwards, read back from
                 it whether or not the write went through.
         */
@@ -2644,18 +2449,11 @@ environment.)">;
         /*| invariant: the analog filter tracks the rate: UHD coerces a bandwidth to the nearest
                 valid value, so this asks for fs itself, clamped into the range the frontend
                 states.
-            trap: a manual BANDWIDTH write survives only until the next rate change, which
+            trap: a manual BANDWIDTH write survives only until the next start, whose rate write
                 re-derives it.
         */
         if (filterFollowsRate(written, _bwMinHz, _bwMaxHz)) {
             applyBandwidthLocked(bandwidthFor(_rateActualHz, _bwMinHz, _bwMaxHz));
-        }
-        if (streaming) {
-            try {
-                startStreamLocked();
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "[uhd::Source] restarting the stream after a rate change: %s\n", e.what());
-            }
         }
         refreshFreqRanges();
     }
@@ -2971,9 +2769,6 @@ environment.)">;
                 this->progress->incrementAndGet();
                 this->progress->notify_all();
             }
-            if (_restageRate.load(std::memory_order_relaxed) && _restageRate.exchange(false, std::memory_order_acq_rel)) {
-                restageRateForClock(); // a control moved the converter clock under every rate
-            }
             this->applyChangedSettings(); // settingsChanged() -> UHD control calls run on this thread
 
             /*| frame: a receive lands in a reservation on the output edge, and the samples
@@ -3043,10 +2838,9 @@ environment.)">;
                 continue;
             }
 
-            /*| invariant: the stamps are measured at the rate in force, so a rate change
-                    starts the measure again rather than reading the change as a gap; and no
-                    block is measured against an expectation formed before a device-clock set
-                    moved the clock the stamps come from.
+            /*| invariant: the stamps are measured at the rate in force, and no block is
+                    measured against an expectation formed before a device-clock set moved the
+                    clock the stamps come from.
             */
             const bool    clockPending = _clockSetPending.load(std::memory_order_acquire);
             std::uint64_t shedHere     = 0;
@@ -3067,12 +2861,11 @@ environment.)">;
             }
 
             /*| frame: one marker on the first delivered block after any gap, naming the latest
-                    cause: a buffer that ran over, a packet the link lost, a rate change this
-                    block emptied the transport across, or a shed the stamps measure that none
-                    of those counted. An overflow report carries no samples, so two gaps before
+                    cause: a buffer that ran over, a packet the link lost, or a shed the stamps
+                    measure that neither counted. An overflow report carries no samples, so two gaps before
                     one delivered block share its marker.
             */
-            const auto gaps    = _overflows.load(std::memory_order_relaxed) + _seqErrors.load(std::memory_order_relaxed) + _rateBreaks.load(std::memory_order_relaxed);
+            const auto gaps    = _overflows.load(std::memory_order_relaxed) + _seqErrors.load(std::memory_order_relaxed);
             const bool gapHere = gaps != gapsSeen || shedHere != 0UL;
             if (const auto cause = gapMarkerFor(gaps != gapsSeen, _lastGapCause.load(std::memory_order_relaxed), shedHere, _retunesOpen.load(std::memory_order_acquire) > 0)) {
                 emitOverflowTag(*this, gapCauseName(*cause));

@@ -570,6 +570,23 @@ bool withGraph(gr::property_map settings, Body&& body) {
     return true;
 }
 
+/*| role: start one block outside a graph, on the calling thread, and answer the start's
+        failure, or an empty string for a block that started, which is stopped again.
+*/
+template <typename Block>
+std::string startAlone(gr::property_map settings) {
+    Block block{};
+    std::ignore        = block.settings().setStaged(settings);
+    std::ignore        = block.settings().applyStagedParameters();
+    std::ignore        = block.changeStateTo(gr::lifecycle::State::INITIALISED);
+    const auto started = block.changeStateTo(gr::lifecycle::State::RUNNING);
+    if (started.has_value()) {
+        block.requestStop();
+        return {};
+    }
+    return started.error().message;
+}
+
 /*| role: what one port of a source took, kept apart from the other port's: the samples, their
         power since the last reset, the gap markers, and the stream index of each rate tag and
         the index and time of each timing tag.
@@ -1840,7 +1857,7 @@ int main(int argc, char** argv) {
             settle(200);
             afterWrite = readBw();
             record();
-            std::ignore = src.settings().setStaged({{"sample_rate", secondRate}});
+            std::ignore = src.settings().setStaged({{"sample_rate", secondRate}}); // refused while running
             settle(600);
             afterRate = readBw();
             record();
@@ -1851,7 +1868,7 @@ int main(int argc, char** argv) {
             overCeiling = readBw();
             record();
 
-            const capture::TruthContext ctx{.deviceParams = deviceArgs(), .sampleRate = secondRate, .centerFreq = defaultFreq()};
+            const capture::TruthContext ctx{.deviceParams = deviceArgs(), .sampleRate = firstRate, .centerFreq = defaultFreq()};
             for (const auto& c : capture::uhd::Source::describeControls(truth, ctx, src.analogBandwidthHz())) {
                 if (c.id == "BANDWIDTH") {
                     descriptorExists     = true;
@@ -1862,7 +1879,7 @@ int main(int argc, char** argv) {
         expect(ran) << "the graph ran";
 
         std::printf("bandwidth: the device states %.0f to %.0f Hz, which is %s\n", truth.bwMinHz, truth.bwMaxHz, movable ? "a filter the block programs" : "a filter fixed in the hardware");
-        std::printf("bandwidth: %.0f Hz at %.0f S/s, %.0f Hz after asking for %.3f MHz, %.0f Hz after the rate moved to %.0f S/s, %.0f Hz after asking for %.3f MHz\n", atRate, firstRate, afterWrite,
+        std::printf("bandwidth: %.0f Hz at %.0f S/s, %.0f Hz after asking for %.3f MHz, %.0f Hz after a refused write of %.0f S/s, %.0f Hz after asking for %.3f MHz\n", atRate, firstRate, afterWrite,
                     narrowMHz, afterRate, secondRate, overCeiling, wideMHz);
         for (const auto& [held, device] : heldAgainstDevice) {
             std::printf("bandwidth: the block holds %.0f Hz, the device answers %.0f Hz\n", held, device);
@@ -1876,7 +1893,7 @@ int main(int argc, char** argv) {
             expect(narrowTaken && wideTaken) << "a filter with room in it takes a write";
             expect(std::abs(atRate - firstRate) < 0.05e6) << "the filter follows the rate";
             expect(std::abs(afterWrite - narrowMHz * 1e6) < 0.05e6) << "a manual write lands";
-            expect(std::abs(afterRate - secondRate) < 0.1e6) << "and the next rate change re-derives it";
+            expect(std::abs(afterRate - afterWrite) < 1.0) << "and a rate write refused while the block runs leaves it there";
             expect(std::abs(overCeiling - truth.bwMaxHz) < 0.1e6) << "a request past the ceiling settles at the ceiling";
             expect(descriptorExists) << "and the filter is a control";
             expect(std::abs(descriptorDefaultMHz - truth.bwMaxHz / 1e6) < 0.1) << "whose default is the filter in force, not the rate-derived guess";
@@ -1884,7 +1901,7 @@ int main(int argc, char** argv) {
             expect(!narrowTaken && !wideTaken) << "a fixed filter refuses a write rather than pretending to take one";
             expect(std::abs(atRate - truth.bwMinHz) < 1.0) << "the width the device came up with is the one it states";
             expect(std::abs(afterWrite - atRate) < 1.0) << "a write leaves it alone";
-            expect(std::abs(afterRate - atRate) < 1.0) << "and so does a rate change";
+            expect(std::abs(afterRate - atRate) < 1.0) << "and so does a refused rate write";
             expect(std::abs(overCeiling - atRate) < 1.0);
             expect(heldAgainstDevice.front().first == truth.bwCurHz) << "and the block holds it from the first read rather than from the first write";
             expect(!descriptorExists) << "a filter with one width is not a control a caller can move";
@@ -2653,13 +2670,14 @@ int main(int argc, char** argv) {
         /*| frame: neither selection is written to a streaming device. UHD states that
                 reconfiguring the clock source affects the FPGA clocking and the timekeeping,
                 that there should be no streaming operation while it happens, and that a
-                device time set beforehand is most likely lost, so a control stages the
-                choice and the next start writes it before anything else. This measures all
-                three halves: the write is accepted, the streaming device does not move, and
-                a fresh start comes up on what was asked for.
+                device time set beforehand is most likely lost, so a control write of another
+                selection to a running source is refused, and the clock_source setting reaches
+                the device at the next start. This measures all three: the write is refused,
+                the streaming device does not move, and a fresh start comes up on what was
+                asked for.
         */
         std::string whileRunning, timeWhileRunning, readingWhileRunning;
-        bool        staged = false, refusedOutOfRange = true, everyTimeSourceStaged = true;
+        bool        refused = false, refusedOutOfRange = true, onlyTimeSourceInForceTaken = true;
 
         const bool ran = withGraph(sourceSettings(2.0e6, bandFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
             expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts";
@@ -2667,11 +2685,11 @@ int main(int argc, char** argv) {
                 return deviceRead(src, std::string{}, [which](uhd::usrp::multi_usrp& u) { return std::string(which) == "clock" ? u.get_clock_source(0) : u.get_time_source(0); });
             };
             for (std::size_t i = 0; i < truth.timeSources.size(); ++i) {
-                if (!src.setControl("TIME_SOURCE", static_cast<double>(i))) {
-                    everyTimeSourceStaged = false;
+                if (src.setControl("TIME_SOURCE", static_cast<double>(i)) != (truth.timeSources[i] == truth.timeSource)) {
+                    onlyTimeSourceInForceTaken = false;
                 }
             }
-            staged            = src.setControl("CLOCK_SOURCE", externalClock);
+            refused           = !src.setControl("CLOCK_SOURCE", externalClock);
             refusedOutOfRange = !src.setControl("CLOCK_SOURCE", static_cast<double>(truth.clockSources.size()));
             settle(400);
             whileRunning     = readback("clock");
@@ -2684,7 +2702,7 @@ int main(int argc, char** argv) {
         });
         expect(ran) << "the graph ran";
 
-        // A fresh start, which is where a staged selection reaches the device.
+        // A fresh start, which is where the clock_source setting reaches the device.
         std::string      onExternal, timeOnExternal, refOnExternal, readingOnExternal;
         gr::property_map external      = sourceSettings(2.0e6, bandFreq(), truth.gainMinDb, sourcePort());
         external["clock_source"]       = std::string("external");
@@ -2714,16 +2732,16 @@ int main(int argc, char** argv) {
         });
         expect(restored) << "the third graph ran";
 
-        std::printf("clock: with a staged external reference the streaming device still reads clock \"%s\", time \"%s\"; the reading says \"%s\"\n", whileRunning.c_str(), timeWhileRunning.c_str(),
+        std::printf("clock: with an external reference refused the streaming device still reads clock \"%s\", time \"%s\"; the reading says \"%s\"\n", whileRunning.c_str(), timeWhileRunning.c_str(),
                     readingWhileRunning.c_str());
-        std::printf("clock: a start on the staged selection reads clock \"%s\", time \"%s\", ref_locked \"%s\"; the reading says \"%s\"\n", onExternal.c_str(), timeOnExternal.c_str(),
+        std::printf("clock: a start asking for the external reference reads clock \"%s\", time \"%s\", ref_locked \"%s\"; the reading says \"%s\"\n", onExternal.c_str(), timeOnExternal.c_str(),
                     refOnExternal.c_str(), readingOnExternal.c_str());
         std::printf("clock: the radio is left on \"%s\", which reads back as \"%s\"\n", truth.clockSource.c_str(), onRestored.c_str());
 
-        expect(staged) << "a reference the device listed is accepted";
-        expect(everyTimeSourceStaged) << "and so is every timing source it listed";
+        expect(refused) << "a reference other than the one in force is refused while the source runs";
+        expect(onlyTimeSourceInForceTaken) << "and of the timing sources the device listed, only the one in force is taken";
         expect(refusedOutOfRange) << "an index past the device's own list is refused";
-        expect(whileRunning == truth.clockSource) << "the streaming device stays on the reference it came up on, the write being staged rather than made";
+        expect(whileRunning == truth.clockSource) << "the streaming device stays on the reference it came up on";
         expect(timeWhileRunning == truth.timeSource) << "and on its timing source";
         expect(readingWhileRunning == whileRunning) << "and the reading says what the device holds rather than what was asked for";
         expect(onExternal == std::string("external")) << "the next start takes the external reference";
@@ -3390,36 +3408,21 @@ int main(int argc, char** argv) {
     });
 
     cases("uhd.device-settings-across-two-blocks", [] {
-        /*| frame: a measurement. A source and a sink hold the radio in one process, and the
-                block that comes second asks for a device-wide setting other than the first's:
-                the reference, the timing source, the master clock, or a rate that needs another
-                clock. Each row prints what the second block's start or write did, what each
-                block then states, and what the device runs. The sink transmits on channel 0
-                into side A's terminated TX/RX at 0 dB and 915 MHz. Standard output is left
-                unbuffered, so each block's lines on standard error fall inside the row they
-                belong to.
+        /*| frame: a source and a sink on one radio in one process. UHD hands the second open
+                the device the first opened, which runs the first block's clock, reference and
+                timing selection. In each conflict row the two blocks ask for different values
+                of one of them, and the row runs in both start orders: the block started second
+                fails its start with a message naming the setting, the value asked, the value
+                in force and the other block as the cause, and the first block streams on. The
+                second block is started outside a graph, so its failure is read where it is
+                raised. In each live row both blocks run, and a write of a fixed setting to one
+                of them is refused. The sink transmits on channel 0 into side A's terminated
+                TX/RX at 0 dB and 915 MHz.
         */
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         constexpr double kRate = 2.0e6;
         const double     freq  = bandFreq();
-        const auto       controlsOf = [](const std::vector<capture::ControlDesc>& surface) {
-            std::string line;
-            for (const auto& c : surface) {
-                if (c.id == "CLOCK_SOURCE" || c.id == "TIME_SOURCE" || c.id == "MASTER_CLOCK") {
-                    const auto at = static_cast<std::size_t>(std::lround(c.defValue));
-                    line += std::format(" {}=\"{}\"[{}]", c.id, c.label, c.kind == 3 && at < c.options.size() ? c.options[at] : std::format("{:g}", c.defValue));
-                }
-            }
-            return line.empty() ? std::string(" none") : line;
-        };
-        struct Row {
-            std::string      name;
-            gr::property_map rx;
-            gr::property_map tx;
-            bool             sinkFirst = false;
-            std::function<void(capture::uhd::Source&, capture::uhd::Sink&)> live;
-        };
-        const auto rxWith = [&](gr::property_map extra) {
+        const auto       rxWith = [&](gr::property_map extra) {
             gr::property_map m = sourceSettings(kRate, freq, 38.0, sourcePort());
             for (auto& [k, v] : extra) {
                 m.insert_or_assign(k, v);
@@ -3433,85 +3436,136 @@ int main(int argc, char** argv) {
             }
             return m;
         };
-        const auto optionIndex = [](const std::vector<capture::ControlDesc>& surface, const std::string& id, const std::string& name) {
-            for (const auto& c : surface) {
-                if (c.id == id) {
-                    for (std::size_t i = 0UZ; i < c.options.size(); ++i) {
-                        if (c.options[i] == name) {
-                            return static_cast<double>(i);
-                        }
+        struct Conflict {
+            std::string      name;
+            gr::property_map rx;
+            gr::property_map tx;
+            std::string      setting;
+        };
+        const std::vector<Conflict> conflicts{
+            {"clock_source", rxWith({{"clock_source", std::string("internal")}}), txWith({{"clock_source", std::string("gpsdo")}}), "clock_source asked"},
+            {"time_source", rxWith({{"time_source", std::string("internal")}}), txWith({{"time_source", std::string("gpsdo")}}), "time_source asked"},
+            {"master_clock_rate", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 32.0e6}}), "master_clock_rate asked"},
+            {"a rate needing another clock", rxWith({{"sample_rate", 2.5e6}}), txWith({{"sample_rate", 7.68e6}}), "sample_rate asked"},
+        };
+        /*| frame: the rate row asks the source for 2.5 MS/s, which the shared clock coerces to
+                a rate whose least common multiple with 7.68 MS/s fits UHD's 32 bits. The pair
+                whose multiple does not is uhd.a-rate-pair-past-the-automatic-clock-fails-the-start.
+        */
+        const auto streams = [] {
+            const std::uint64_t before = g_samples.load();
+            settle(500);
+            return g_samples.load() > before;
+        };
+        for (const Conflict& row : conflicts) {
+            for (const bool sinkFirst : {false, true}) {
+                std::string failure;
+                bool        firstStreams = false, firstRan = false;
+                if (!sinkFirst) {
+                    firstRan = withGraph(row.rx, [&](capture::uhd::Source&, auto&) {
+                        expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
+                        failure      = startAlone<capture::uhd::Sink>(row.tx);
+                        firstStreams = streams();
+                    });
+                } else {
+                    firstRan = withTxGraph(row.tx, [&](capture::uhd::Sink& sink, auto&) {
+                        expect(waitForDeviceUp(sink, std::chrono::seconds(10))) << "the sink starts";
+                        failure      = startAlone<capture::uhd::Source>(row.rx);
+                        firstStreams = sink.deviceUp();
+                    });
+                }
+                capture::uhd::awaitReleases();
+                const char* second = sinkFirst ? "source" : "sink";
+                std::printf("row: %s, the %s second: its start failed with \"%s\"; the first block %s\n", row.name.c_str(), second, failure.c_str(), firstStreams ? "streams on" : "stopped");
+                expect(firstRan) << std::format("{}: the first block's graph ran", row.name);
+                expect(failure.contains(row.setting)) << std::format("{}: the {} started second fails, naming the setting: {}", row.name, second, failure);
+                expect(failure.contains("another block in this process holds the device")) << std::format("{}: and the other block as the cause", row.name);
+                expect(firstStreams) << std::format("{}: the first block streams on", row.name);
+            }
+        }
+
+        // Both blocks running on the same values, each refusing a write of a fixed setting.
+        double txRate = 0.0, txSetting = 0.0, clockAfter = 0.0;
+        bool   clockTaken = true, sourceTaken = true;
+        std::string referenceAfter;
+        const bool ran = withGraph(rxWith({}), [&](capture::uhd::Source& src, auto&) {
+            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
+            const bool sinkRan = withTxGraph(txWith({}), [&](capture::uhd::Sink& sink, auto&) {
+                expect(waitForDeviceUp(sink, std::chrono::seconds(10))) << "the sink starts beside the source";
+                const double clockBefore = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
+                std::ignore = sink.settings().setStaged({{"sample_rate", 7.68e6}});
+                clockTaken  = src.setControl("MASTER_CLOCK", clockBefore / 1e6 * 0.96);
+                double gpsdoAt = -1.0;
+                for (const auto& c : src.controlSurface()) {
+                    for (std::size_t i = 0UZ; c.id == "CLOCK_SOURCE" && i < c.options.size(); ++i) {
+                        gpsdoAt = c.options[i] == "gpsdo" ? static_cast<double>(i) : gpsdoAt;
                     }
                 }
-            }
-            return -1.0;
-        };
-        std::vector<Row> rows;
-        rows.push_back({"clock_source at the sink's start", rxWith({{"clock_source", std::string("internal")}}), txWith({{"clock_source", std::string("gpsdo")}}), false, {}});
-        rows.push_back({"time_source at the sink's start", rxWith({{"time_source", std::string("internal")}}), txWith({{"time_source", std::string("gpsdo")}}), false, {}});
-        rows.push_back({"master_clock_rate at the sink's start", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 30.72e6}}), false, {}});
-        rows.push_back({"master_clock_rate at the source's start", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 30.72e6}}), true, {}});
-        rows.push_back({"a rate needing another clock at the sink's start", rxWith({}), txWith({{"sample_rate", 7.68e6}}), false, {}});
-        rows.push_back({"a rate needing another clock written to the running sink", rxWith({}), txWith({}), false,
-                        [](capture::uhd::Source&, capture::uhd::Sink& sink) { std::ignore = sink.settings().setStaged({{"sample_rate", 7.68e6}}); }});
-        rows.push_back({"MASTER_CLOCK written to the running source", rxWith({}), txWith({}), false,
-                        [](capture::uhd::Source& src, capture::uhd::Sink&) { std::printf("  the source's setControl(MASTER_CLOCK, 30.72) answered %d\n", src.setControl("MASTER_CLOCK", 30.72) ? 1 : 0); }});
-        rows.push_back({"CLOCK_SOURCE written to the running source", rxWith({{"clock_source", std::string("internal")}}), txWith({}), false,
-                        [&](capture::uhd::Source& src, capture::uhd::Sink&) {
-                            const double at = optionIndex(src.controlSurface(), "CLOCK_SOURCE", "gpsdo");
-                            std::printf("  the source's setControl(CLOCK_SOURCE, %g) answered %d\n", at, at >= 0.0 && src.setControl("CLOCK_SOURCE", at) ? 1 : 0);
-                        }});
+                sourceTaken = gpsdoAt >= 0.0 && src.setControl("CLOCK_SOURCE", gpsdoAt);
+                settle(1500);
+                txRate         = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_tx_rate(0); });
+                txSetting      = sink.sample_rate.value;
+                clockAfter     = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); }) - clockBefore;
+                referenceAfter = deviceRead(src, std::string{}, [](uhd::usrp::multi_usrp& u) { return u.get_clock_source(0); });
+            });
+            expect(sinkRan) << "the sink's graph ran";
+        });
+        capture::uhd::awaitReleases();
+        std::printf("live: the running sink given 7680000 S/s states %.0f and the device sends %.0f S/s; the source's MASTER_CLOCK answered %d and the clock moved %.0f Hz; its CLOCK_SOURCE gpsdo answered %d and the device runs %s\n",
+                    txSetting, txRate, clockTaken ? 1 : 0, clockAfter, sourceTaken ? 1 : 0, referenceAfter.c_str());
+        expect(ran) << "the source's graph ran";
+        expect(std::abs(txSetting - kRate) < 1.0 && std::abs(txRate - kRate) < 1.0) << "a rate written to the running sink is refused";
+        expect(!clockTaken && clockAfter == 0.0) << "a master clock written to the running source is refused";
+        expect(!sourceTaken && referenceAfter != "gpsdo") << "and so is a reference";
+    });
 
-        for (Row& row : rows) {
-            std::printf("row: %s\n", row.name.c_str());
-            bool sinkRan = false;
-            bool sinkUp  = false;
-            const auto measure = [&](capture::uhd::Source& src, capture::uhd::Sink& sink) {
-                sinkUp = waitForDeviceUp(sink, std::chrono::seconds(10));
-                settle(600);
-                if (row.live) {
-                    row.live(src, sink);
-                    settle(1500);
-                }
-                const std::uint64_t before = g_samples.load();
-                const auto          t0     = Clock::now();
-                settle(1000);
-                const double streamed = static_cast<double>(g_samples.load() - before) / std::chrono::duration<double>(Clock::now() - t0).count();
-                const auto   dev      = [&](auto fn) { return deviceRead(src, std::string("?"), fn); };
-                std::printf("  device: tuned rx %s Hz, tx %s Hz\n", dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.0f}", u.get_rx_freq(0)); }).c_str(),
-                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.0f}", u.get_tx_freq(0)); }).c_str());
-                std::printf("  device: clock_source %s, time_source %s, master clock %s Hz, rx rate %s S/s, tx rate %s S/s\n",
-                            dev([](uhd::usrp::multi_usrp& u) { return u.get_clock_source(0); }).c_str(), dev([](uhd::usrp::multi_usrp& u) { return u.get_time_source(0); }).c_str(),
-                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.0f}", u.get_master_clock_rate(0)); }).c_str(),
-                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.1f}", u.get_rx_rate(0)); }).c_str(),
-                            dev([](uhd::usrp::multi_usrp& u) { return std::format("{:.1f}", u.get_tx_rate(0)); }).c_str());
-                std::printf("  source: settings clock_source \"%s\" time_source \"%s\" master_clock_rate %g sample_rate %g; streamed %.0f S/s; controls%s\n", src.clock_source.value.c_str(),
-                            src.time_source.value.c_str(), src.master_clock_rate.value, src.sample_rate.value, streamed, controlsOf(src.controlSurface()).c_str());
-                const capture::uhd::DeviceTruth st = src.deviceTruth();
-                std::printf("  source's record: clock_source %s, time_source %s, master clock %.0f Hz\n", st.clockSource.c_str(), st.timeSource.c_str(), st.mclkHz);
-                std::printf("  sink: up %d; settings clock_source \"%s\" time_source \"%s\" master_clock_rate %g sample_rate %g; controls%s\n", sinkUp ? 1 : 0, sink.clock_source.value.c_str(),
-                            sink.time_source.value.c_str(), sink.master_clock_rate.value, sink.sample_rate.value, controlsOf(sink.controlSurface()).c_str());
-                const capture::uhd::DeviceTruth kt = sink.deviceTruth();
-                std::printf("  sink's record: clock_source %s, time_source %s, master clock %.0f Hz; sink says \"%s\"\n", kt.clockSource.c_str(), kt.timeSource.c_str(), kt.mclkHz, sink.describe().c_str());
-            };
-            bool ran = false;
-            if (!row.sinkFirst) {
-                ran = withGraph(row.rx, [&](capture::uhd::Source& src, auto&) {
-                    expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
-                    sinkRan = withTxGraph(row.tx, [&](capture::uhd::Sink& sink, auto&) { measure(src, sink); });
-                });
-            } else {
-                // The sink opens the device first, and the source joins it.
-                sinkRan = withTxGraph(row.tx, [&](capture::uhd::Sink& sink, auto&) {
-                    std::ignore = waitForDeviceUp(sink, std::chrono::seconds(10));
-                    ran         = withGraph(row.rx, [&](capture::uhd::Source& src, auto&) {
-                        expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
-                        measure(src, sink);
-                    });
-                });
-            }
-            expect(ran && sinkRan) << std::format("{}: both graphs built and ran", row.name);
-            capture::uhd::awaitReleases();
-        }
+    cases("uhd.a-rate-pair-past-the-automatic-clock-fails-the-start", [] {
+        /*| frame: a source and a sink on one radio in one process, on UHD's automatic clock,
+                asking for rates whose least common multiple passes 32 bits. Sink first at
+                7.68 MS/s, the source's 2 MS/s is coerced to 1.981935 MS/s at the write, and the
+                source fails its start before its streamer is built. Source first at that
+                coerced rate, the sink fails its start before its rate is written. The process
+                outlives both starts, and the first block streams on. The sink transmits on
+                channel 0 into side A's terminated TX/RX at 0 dB and 915 MHz.
+        */
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        const double freq    = bandFreq();
+        const double coerced = 1981935.0;
+        const auto   streams = [] {
+            const std::uint64_t before = g_samples.load();
+            settle(500);
+            return g_samples.load() > before;
+        };
+
+        std::string built;
+        bool        sinkUp  = false;
+        const bool  sinkRan = withTxGraph(sinkSettings(7.68e6, freq, {}), [&](capture::uhd::Sink& sink, auto&) {
+            expect(waitForDeviceUp(sink, std::chrono::seconds(10))) << "the sink starts";
+            built  = startAlone<capture::uhd::Source>(sourceSettings(2.0e6, freq, 38.0, sourcePort()));
+            sinkUp = sink.deviceUp();
+        });
+        capture::uhd::awaitReleases();
+        std::printf("sink first: the source's start failed with \"%s\"; the sink %s\n", built.c_str(), sinkUp ? "streams on" : "stopped");
+        expect(sinkRan) << "the sink's graph ran";
+        expect(built.contains("sample_rate asked 2000000 Hz runs as 1981935 Hz beside the device's transmit rate of 7680000 Hz")) << "the source names both rates: " << built;
+        expect(built.contains("UHD would end the process")) << "and the overflow";
+        expect(sinkUp) << "the sink streams on";
+
+        std::string written;
+        double      sourceRate = 0.0;
+        bool        sourceOn   = false;
+        const bool  sourceRan  = withGraph(sourceSettings(coerced, freq, 38.0, sourcePort()), [&](capture::uhd::Source& src, auto&) {
+            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
+            sourceRate = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
+            written    = startAlone<capture::uhd::Sink>(sinkSettings(7.68e6, freq, {}));
+            sourceOn   = streams();
+        });
+        capture::uhd::awaitReleases();
+        std::printf("source first at %.3f S/s: the sink's start failed with \"%s\"; the source %s\n", sourceRate, written.c_str(), sourceOn ? "streams on" : "stopped");
+        expect(sourceRan) << "the source's graph ran";
+        expect(std::abs(sourceRate - coerced) < 1.0) << "the source runs the rate it asked for alone";
+        expect(written.contains("sample_rate asked 7680000 Hz beside the device's receive rate of 1981935 Hz")) << "the sink names both rates: " << written;
+        expect(sourceOn) << "the source streams on";
     });
 
     cases("uhd.tx-underrun", [] {
@@ -3758,30 +3812,33 @@ int main(int argc, char** argv) {
             expect(sc8Top == sc16Top) << "and the ladder is the same either way";
         }
 
-        /*| frame: a format written to a running block. The streamer was built for the format
-                in force and keeps it, so the rate ladder must keep it too: a rate reached in
-                the narrow format, asked for while the wide one is on the wire, would deliver
-                nothing at all and read as a dead stream.
+        /*| frame: a format and a rate written to a running block are refused. The streamer was
+                built for the format in force and keeps it, and the rate keeps the ladder of
+                that format: a rate reached in the narrow format, taken while the wide one is on
+                the wire, would deliver nothing at all and read as a dead stream.
         */
-        std::string formatInForce;
+        std::string formatInForce, formatSetting;
+        bool        formatTaken    = true;
         double      rateAfterWrite = 0.0;
         std::uint64_t arrivedAfter = 0;
         const bool    stillRuns    = withGraph(sourceSettings(sc16Top, defaultFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
             expect(waitForSamples(std::chrono::milliseconds(8000))) << "the stream starts at the top of the sc16 ladder";
-            expect(src.setControl("WIRE_FORMAT", 1.0)) << "the narrow format is accepted";
+            formatTaken   = src.setControl("WIRE_FORMAT", 1.0);
+            std::ignore   = src.settings().setStaged({{"wire_format", std::string("sc8")}, {"sample_rate", sc8Top}});
             formatInForce = src.wireFormatInForce();
-            std::ignore   = src.settings().setStaged({{"sample_rate", sc8Top}});
             settle(1500);
             const std::uint64_t at0 = g_samples.load();
             settle(2000);
             arrivedAfter   = g_samples.load() - at0;
             rateAfterWrite = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
+            formatSetting  = src.wire_format.value;
         });
         expect(stillRuns) << "the graph ran";
-        std::printf("wire format: after asking for sc8 and then for %.0f S/s mid-stream, the format in force is still \"%s\", the device runs %.0f S/s and %llu samples arrived over two seconds\n",
-                    sc8Top, formatInForce.c_str(), rateAfterWrite, static_cast<unsigned long long>(arrivedAfter));
-        expect(formatInForce == std::string("sc16")) << "the running streamer keeps the format it was built with";
-        expect(rateAfterWrite <= sc16Top + 1.0) << "so the rate asked for is snapped inside what that format's link carries";
+        std::printf("wire format: WIRE_FORMAT sc8 answered %d; after writing sc8 and %.0f S/s mid-stream, the format in force is \"%s\", the setting \"%s\", the device runs %.0f S/s and %llu samples arrived over two seconds\n",
+                    formatTaken ? 1 : 0, sc8Top, formatInForce.c_str(), formatSetting.c_str(), rateAfterWrite, static_cast<unsigned long long>(arrivedAfter));
+        expect(!formatTaken) << "the narrow format is refused while the block runs";
+        expect(formatInForce == std::string("sc16") && formatSetting == std::string("sc16")) << "the running streamer and the setting keep the format the start built";
+        expect(std::abs(rateAfterWrite - sc16Top) < 1.0) << "and the rate keeps the start's";
         expect(arrivedAfter > 0UL) << "and the stream keeps delivering rather than going dead";
 
         /*| frame: what the narrow format costs. The descriptor's label says sc8 costs the
@@ -3934,97 +3991,58 @@ int main(int argc, char** argv) {
     });
 
     cases("uhd.rate-change-midstream", [] {
-        /*| frame: a rate written to a streaming radio. The samples already in the transport
-                were taken at the old rate, so the block stops the stream, empties the
-                transport, writes the rate, starts it again and marks the discontinuity. A
-                reader then sees a marked hole and samples at the new rate after it, rather
-                than old-rate samples behind the new rate's tag.
-            trap: the tag residual is measured only over the tags after the change, at the
-                rate in force there. A pair spanning the change measures two rates.
+        /*| frame: a rate written to a streaming radio is refused. The stream keeps its rate,
+                with no hole and no rate tag, and the block keeps the setting. The next start
+                takes the rate written while the block is stopped.
         */
         const auto&  truth  = benchTruth();
         const auto   ladder = capture::uhd::reachableRatesFor(truth).empty() ? capture::uhd::Source::sampleRatesFor(truth) : capture::uhd::reachableRatesFor(truth);
         const double first  = capture::uhd::snapToLadder(2.0e6, ladder);
         const double second = capture::uhd::snapToLadder(8.0e6, ladder);
-        double       deviceRate = 0.0, settingRate = 0.0, tagRate = 0.0, refusedSetting = 0.0, refusedDevice = 0.0;
+        double       deviceRate = 0.0, settingRate = 0.0, nextStartRate = 0.0;
         std::uint64_t gapMarkers = 0, rateTags = 0, arrived = 0;
         double        seconds = 0.0;
-        std::vector<TagRecord> after;
 
-        gr::property_map settings = sourceSettings(first, defaultFreq(), truth.gainMinDb, sourcePort());
-        settings["tag_interval"]  = 0.25f;
-        const bool ran            = withGraph(std::move(settings), [&](capture::uhd::Source& src, auto&) {
+        const bool ran = withGraph(sourceSettings(first, defaultFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
             expect(waitForSamples(std::chrono::milliseconds(8000))) << "the stream starts";
             settle(1000);
             const std::uint64_t gaps0 = g_overflowTags.load();
             const std::uint64_t tags0 = g_rateTags.load();
-            {
-                std::lock_guard g(g_tagLock);
-                g_tagTimes.clear();
-            }
-            std::ignore = src.settings().setStaged({{"sample_rate", second}});
-            settle(500);
-            gapMarkers = g_overflowTags.load() - gaps0;
-            rateTags   = g_rateTags.load() - tags0;
-            tagRate    = g_lastRateTagHz.load();
-            {
-                // Only the tags taken after the change, which is where the new rate holds.
-                std::lock_guard g(g_tagLock);
-                g_tagTimes.clear();
-            }
-            const std::uint64_t at0 = g_samples.load();
-            const auto          t0  = Clock::now();
+            std::ignore               = src.settings().setStaged({{"sample_rate", second}});
+            const std::uint64_t at0   = g_samples.load();
+            const auto          t0    = Clock::now();
             settle(2000);
             arrived     = g_samples.load() - at0;
             seconds     = std::chrono::duration<double>(Clock::now() - t0).count();
+            gapMarkers  = g_overflowTags.load() - gaps0;
+            rateTags    = g_rateTags.load() - tags0;
             deviceRate  = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
             settingRate = src.sample_rate.value;
-            {
-                std::lock_guard g(g_tagLock);
-                after = g_tagTimes;
-            }
-
-            /*| frame: a rate no radio reaches. Whether the vendor library refuses it or
-                    coerces it, the setting the block states has to be the rate the device
-                    holds: the stream's ticks are counted at the stated rate, and a setting
-                    left on a request the radio never took reads as shed samples on every
-                    block.
-            */
-            std::ignore = src.settings().setStaged({{"sample_rate", 1.0}});
-            settle(800);
-            refusedDevice  = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
-            refusedSetting = src.sample_rate.value;
         });
         expect(ran) << "the graph ran";
+        const bool again = withGraph(sourceSettings(second, defaultFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
+            expect(waitForSamples(std::chrono::milliseconds(8000))) << "the stream starts again";
+            nextStartRate = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
+        });
+        expect(again) << "the second graph ran";
 
-        double worstResidualUs = 0.0;
-        for (std::size_t i = 1; i < after.size(); ++i) {
-            const double byTime    = (static_cast<double>(after[i].timeNs) - static_cast<double>(after[i - 1].timeNs)) / 1e9;
-            const double bySamples = static_cast<double>(after[i].index - after[i - 1].index) / deviceRate;
-            worstResidualUs        = std::max(worstResidualUs, std::abs((byTime - bySamples) * 1e6));
-        }
         const double delivered = seconds > 0.0 ? static_cast<double>(arrived) / seconds : 0.0;
-        std::printf("rate change: %.0f S/s to %.0f S/s mid-stream: the device runs %.0f, the block states %.0f, the forwarded tag carries %.0f, %llu gap marker(s) and %llu rate tag(s) went out\n",
-                    first, second, deviceRate, settingRate, tagRate, static_cast<unsigned long long>(gapMarkers), static_cast<unsigned long long>(rateTags));
-        std::printf("rate change: %.0f S/s delivered over %.2f s after the change, %zu tags there with a worst residual of %.1f us\n", delivered, seconds, after.size(), worstResidualUs);
-        std::printf("rate change: after asking for 1 S/s the device holds %.0f S/s and the block states %.0f S/s\n", refusedDevice, refusedSetting);
+        std::printf("rate change: %.0f S/s written to a source streaming %.0f S/s: the device runs %.0f, the block states %.0f, %llu gap marker(s) and %llu rate tag(s) went out, %.0f S/s delivered\n",
+                    second, first, deviceRate, settingRate, static_cast<unsigned long long>(gapMarkers), static_cast<unsigned long long>(rateTags), delivered);
+        std::printf("rate change: a start at %.0f S/s runs %.0f S/s\n", second, nextStartRate);
 
-        expect(std::abs(deviceRate - second) <= 0.01 * second) << "the device runs the rate that was asked for";
-        expect(std::abs(settingRate - deviceRate) < 1.0) << "and the block states the rate the device runs";
-        expect(rateTags >= 1UL && std::abs(tagRate - deviceRate) < 1.0) << "the new rate is forwarded downstream";
-        expect(gapMarkers >= 1UL) << "the transport was emptied across the change and the hole is marked";
-        expect(std::abs(delivered - deviceRate) <= 0.05 * deviceRate) << "the stream runs at the new rate afterwards";
-        if (after.size() >= 2UZ) {
-            expect(worstResidualUs < 2000.0) << "and the tags after the change are the samples between them apart, so no old-rate samples were published behind the new rate's tag";
-        }
-        expect(std::abs(refusedSetting - refusedDevice) <= 0.01 * std::max(refusedDevice, 1.0)) << "a rate the radio cannot take leaves the setting on the rate it does hold";
+        expect(std::abs(deviceRate - first) < 1.0) << "the running device keeps its rate";
+        expect(std::abs(settingRate - first) < 1.0) << "and the block keeps the setting";
+        expect(gapMarkers == 0UL && rateTags == 0UL) << "with no hole marked and no rate forwarded";
+        expect(std::abs(delivered - first) <= 0.05 * first) << "the stream runs on at the rate it had";
+        expect(std::abs(nextStartRate - second) < 1.0) << "a start takes the rate asked for";
     });
 
     cases("uhd.a-drain-at-the-top-rate-ends-by-duration", [] {
-        /*| frame: the radio streams at the top of the rate offer its truth states, and the rate
-                then moves to the nearest rate under half of it. The rate change stops the
-                stream and drains it, and so does the teardown. Each drain states its samples,
-                its time and what ended it.
+        /*| frame: the radio streams at the top of the rate offer its truth states, and then, in
+                a second graph, at the nearest rate under half of it. Each teardown stops the
+                stream and drains it, and each drain states its samples, its time and what
+                ended it.
             contract: a drain of a radio that stopped ends on the end-of-burst marker or on a
                 receive that finds nothing, within its duration bound, at the top rate too.
         */
@@ -4034,7 +4052,7 @@ int main(int argc, char** argv) {
         const auto  ladder = capture::uhd::reachableRatesFor(truth).empty() ? offer : capture::uhd::reachableRatesFor(truth);
         const double top   = offer.back();
         const double half  = capture::uhd::snapToLadder(top / 2.0, ladder);
-        Source::DrainResult atChange, atTeardown;
+        Source::DrainResult atTop, atHalf;
         std::string         depthAtTop, depthAtHalf;
         std::uint64_t       overflows = 0;
         const auto          depthOf = [](Source& src) {
@@ -4047,19 +4065,18 @@ int main(int argc, char** argv) {
             }
             return std::string();
         };
-        const bool ran = withGraph(sourceSettings(top, defaultFreq(), truth.gainMinDb, sourcePort()), [&](Source& src, auto&) {
-            expect(waitForSamples(std::chrono::milliseconds(8000))) << "the stream starts";
-            settle(2000);
-            depthAtTop  = depthOf(src);
-            std::ignore = src.settings().setStaged({{"sample_rate", half}});
-            settle(1000);
-            atChange    = src.lastDrain();
-            depthAtHalf = depthOf(src);
-            overflows   = src.overflowEvents();
-            std::ignore = src.hardwareTeardown();
-            atTeardown  = src.lastDrain();
-        });
-        expect(ran) << "the graph ran";
+        const auto drainAt = [&](double rate, Source::DrainResult& drain, std::string& depth) {
+            return withGraph(sourceSettings(rate, defaultFreq(), truth.gainMinDb, sourcePort()), [&](Source& src, auto&) {
+                expect(waitForSamples(std::chrono::milliseconds(8000))) << "the stream starts";
+                settle(2000);
+                depth = depthOf(src);
+                overflows += src.overflowEvents();
+                std::ignore = src.hardwareTeardown();
+                drain       = src.lastDrain();
+            });
+        };
+        expect(drainAt(top, atTop, depthAtTop)) << "the graph at the top rate ran";
+        expect(drainAt(half, atHalf, depthAtHalf)) << "the graph at half of it ran";
         const auto endName = [](Source::DrainEnd e) {
             switch (e) {
             case Source::DrainEnd::EndOfBurst: return "the end-of-burst marker";
@@ -4068,11 +4085,11 @@ int main(int argc, char** argv) {
             default: return "a failed receive";
             }
         };
-        std::printf("drain: %.0f S/s to %.0f S/s: the rate change drained %zu samples in %.2f ms, ended by %s\n", top, half, atChange.samples, atChange.seconds * 1e3, endName(atChange.end));
-        std::printf("drain: the teardown at %.0f S/s drained %zu samples in %.2f ms, ended by %s; %llu overflow event(s) in the run\n", half, atTeardown.samples, atTeardown.seconds * 1e3,
-                    endName(atTeardown.end), static_cast<unsigned long long>(overflows));
+        std::printf("drain: the teardown at %.0f S/s drained %zu samples in %.2f ms, ended by %s\n", top, atTop.samples, atTop.seconds * 1e3, endName(atTop.end));
+        std::printf("drain: the teardown at %.0f S/s drained %zu samples in %.2f ms, ended by %s; %llu overflow event(s) in the runs\n", half, atHalf.samples, atHalf.seconds * 1e3,
+                    endName(atHalf.end), static_cast<unsigned long long>(overflows));
         std::printf("drain: the receive transport at %.0f S/s: %s; at %.0f S/s: %s\n", top, depthAtTop.c_str(), half, depthAtHalf.c_str());
-        for (const auto& d : {atChange, atTeardown}) {
+        for (const auto& d : {atTop, atHalf}) {
             expect(d.end == Source::DrainEnd::EndOfBurst || d.end == Source::DrainEnd::Empty) << "a stopped radio empties before the bound";
             expect(d.seconds < Source::kDrainLimitS) << "within the duration bound";
         }
@@ -4366,40 +4383,31 @@ int main(int argc, char** argv) {
 
     cases("uhd.master-clock", [] {
         /*| frame: the converter clock on a radio that lets one be picked. Every reachable
-                rate is that clock over a decimation, so a clock chosen by hand fixes the
-                whole ladder. A radio stating one clock whose product the table names is
-                offered the table's clocks, and a pick is pinned for the next open. Any other
-                radio whose clock is fixed offers no such control, and the case says so and
-                stops.
+                rate is that clock over a decimation, so the clock is asked for at the start, as
+                master_clock_rate, and fixes the whole ladder. A write of another clock to a
+                running source is refused. A radio stating one clock whose product the table
+                names is offered the table's clocks for the next start. Any other radio whose
+                clock is fixed offers no such control, and the case says so and stops.
         */
         const auto& truth  = benchTruth();
         const auto  ladder = capture::uhd::masterClockLadderMHz(truth);
         std::printf("master clock: the device states %.0f to %.0f Hz and is running at %.0f Hz\n", truth.mclkMinHz, truth.mclkMaxHz, truth.mclkHz);
         if (capture::uhd::offersOneClockRate(truth) && !ladder.empty()) {
-            /*| frame: the pick is the first table clock other than the one in force, or the
-                    clock in force where the table offers it alone. The case reads the pin,
-                    the open address and the clock the device still runs, and does not open
-                    the radio at the picked clock.
-            */
             const auto   other      = std::ranges::find_if(ladder, [&truth](double mhz) { return mhz > 0.0 && std::abs(mhz * 1e6 - truth.mclkMinHz) >= 1.0; });
             const double pickMHz    = other != ladder.end() ? *other : ladder.back();
-            double       pinnedHz   = 0.0;
+            bool         taken      = true;
             double       clockAfter = 0.0;
             std::string  addressKey;
             const bool   ran = withGraph(sourceSettings(2.0e6, defaultFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
                 expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts";
-                expect(src.setControl("MASTER_CLOCK", pickMHz)) << "a table clock is accepted";
-                {
-                    std::lock_guard lock(src._ctrlMutex);
-                    pinnedHz = src._masterClockPinnedHz.value_or(0.0);
-                }
+                taken      = src.setControl("MASTER_CLOCK", pickMHz);
                 addressKey = src.openAddress().get("master_clock_rate", "");
                 clockAfter = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
             });
             expect(ran) << "the graph ran";
-            std::printf("master clock: picked %.2f MHz from the table; pinned %.0f Hz, the open address carries %s, the device still runs %.0f Hz\n", pickMHz, pinnedHz, addressKey.c_str(), clockAfter);
-            expect(std::abs(pinnedHz - pickMHz * 1e6) < 1.0) << "the pick is pinned";
-            expect(addressKey == std::format("{:.0f}", pickMHz * 1e6)) << "the next open carries it";
+            std::printf("master clock: %.2f MHz from the table written to the running source answered %d; the open address carries '%s', the device runs %.0f Hz\n", pickMHz, taken ? 1 : 0, addressKey.c_str(), clockAfter);
+            expect(taken == (std::abs(pickMHz * 1e6 - truth.mclkMinHz) < 1.0)) << "a clock other than the one in force is refused";
+            expect(addressKey.empty()) << "the next open carries no clock it was not given";
             expect(std::abs(clockAfter - truth.mclkMinHz) < 1.0) << "and the running device keeps its clock";
             return;
         }
@@ -4413,79 +4421,53 @@ int main(int argc, char** argv) {
 
         // 30.72 MHz, which 7.68 MS/s divides exactly, where the device reaches it.
         const double pickMHz  = std::ranges::find(ladder, 30.72) != ladder.end() ? 30.72 : ladder.back();
+        const double otherMHz = std::ranges::find(ladder, 16.0) != ladder.end() ? 16.0 : ladder.front();
         const double wantRate = pickMHz * 1e6 / 4.0;
-        double       clockAfterWrite = 0.0, rateAfterWrite = 0.0;
-        double       clockAutomatic  = 0.0, rateAutomatic  = 0.0;
-        double       clockNextStart  = 0.0;
-        // The pin alone, before any rate was asked for: the rate the block moved the radio
-        // to, the setting it states, and the tag it forwarded for it.
-        double        rateAfterPin = 0.0, settingAfterPin = 0.0, tagAfterPin = 0.0;
-        std::uint64_t rateTagsForPin = 0;
+        double       clockAtStart = 0.0, rateAtStart = 0.0, clockAfterWrites = 0.0, rateAfterWrites = 0.0, settingAfterWrites = 0.0;
+        bool         replayTaken = false, otherTaken = true, automaticTaken = true;
+        std::uint64_t rateTags = 0;
 
-        const bool first = withGraph(sourceSettings(2.0e6, defaultFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
+        gr::property_map pinned       = sourceSettings(wantRate, defaultFreq(), truth.gainMinDb, sourcePort());
+        pinned["master_clock_rate"]   = pickMHz * 1e6;
+        const bool first = withGraph(pinned, [&](capture::uhd::Source& src, auto&) {
             expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts";
+            clockAtStart = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
+            rateAtStart  = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
             const std::uint64_t tagsBefore = g_rateTags.load();
-            expect(src.setControl("MASTER_CLOCK", pickMHz)) << "a clock the device states is accepted";
+            replayTaken    = src.setControl("MASTER_CLOCK", pickMHz);
+            otherTaken     = src.setControl("MASTER_CLOCK", otherMHz);
+            automaticTaken = src.setControl("MASTER_CLOCK", 0.0);
+            std::ignore    = src.settings().setStaged({{"master_clock_rate", otherMHz * 1e6}});
             settle(1200);
-            rateAfterPin    = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
-            settingAfterPin = src.sample_rate.value;
-            rateTagsForPin  = g_rateTags.load() - tagsBefore;
-            tagAfterPin     = g_lastRateTagHz.load();
-
-            std::ignore = src.settings().setStaged({{"sample_rate", wantRate}});
-            settle(600);
-            clockAfterWrite = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
-            rateAfterWrite  = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
-
-            /*| frame: whether UHD's own choice comes back while the device stays open. An
-                    explicit write clears the automatic flag inside the driver, so a rate
-                    that needs another clock is reached by decimation instead. */
-            expect(src.setControl("MASTER_CLOCK", 0.0)) << "the automatic entry is accepted";
-            std::ignore = src.settings().setStaged({{"sample_rate", 2.0e6}});
-            settle(600);
-            clockAutomatic = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
-            rateAutomatic  = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
+            clockAfterWrites   = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
+            rateAfterWrites    = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_rate(0); });
+            settingAfterWrites = src.master_clock_rate.value;
+            rateTags           = g_rateTags.load() - tagsBefore;
         });
         expect(first) << "the first graph ran";
 
-        const bool second = withGraph(sourceSettings(2.0e6, defaultFreq(), truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
-            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts again";
-            clockNextStart = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
-        });
-        expect(second) << "the second graph ran";
-
-        const double pinDecimation = rateAfterPin > 0.0 ? std::round(pickMHz * 1e6 / rateAfterPin) : 0.0;
-        std::printf("master clock: the pin alone moved the radio to %.0f S/s, decimation %.0f of the pinned clock; the block states %.0f S/s and forwarded %llu rate tag(s), the last carrying %.0f\n",
-                    rateAfterPin, pinDecimation, settingAfterPin, static_cast<unsigned long long>(rateTagsForPin), tagAfterPin);
-        std::printf("master clock: written %.2f MHz, the device reads %.0f Hz and the rate %.0f S/s for a request of %.0f\n", pickMHz, clockAfterWrite, rateAfterWrite, wantRate);
-        std::printf("master clock: with the automatic entry and a 2 MS/s request the device reads %.0f Hz and %.0f S/s, still open\n", clockAutomatic, rateAutomatic);
-        std::printf("master clock: the next start reads %.0f Hz, which is what restores UHD's own choice\n", clockNextStart);
-
-        /*| frame: a clock written by hand does not move again while the device stays open,
-                so the radio is a fixed-clock radio from that write on: the rate it is put on
-                is one of that clock's even decimations, and the block states and forwards
-                it, because a caller's span, decimator and recorder hear a rate change only
-                as a forwarded setting.
+        /*| frame: 2 MS/s on a 30.72 MHz clock is a decimation of 15.36, which no radio
+                runs. The block snaps the request to 1.92 MS/s, decimation 16, and a snap is a
+                rate the start did not meet, so the source's own start fails. The case starts
+                the source outside a graph, so the failure is read where it is raised.
         */
-        expect(pinDecimation > 0.0 && std::fmod(pinDecimation, 2.0) == 0.0) << "the pin lands the radio on an even decimation of the pinned clock, not on the odd one UHD would pick";
-        expect(std::abs(settingAfterPin - rateAfterPin) < 1.0) << "the block states the rate the radio is running";
-        expect(rateTagsForPin >= 1UL) << "and forwards it downstream, which a write from a caller's own thread cannot do for itself";
-        expect(std::abs(tagAfterPin - rateAfterPin) < 1.0) << "the tag carries that same rate";
-        expect(std::abs(clockAfterWrite - pickMHz * 1e6) < 1.0) << "the device runs on the clock that was written";
-        expect(std::abs(rateAfterWrite - wantRate) < 1.0) << "and reaches a rate that clock divides exactly";
-        /*| measured: the automatic entry does not move the clock while the device stays
-                open. An explicit write clears UHD's own choice inside the driver, and only a
-                fresh open sets it again, so a later rate is reached by decimating the clock
-                that was written. The block knows that, and snaps such a request to an even
-                decimation of the clock in force rather than letting UHD land it on an odd
-                one: 2 MS/s on a pinned 30.72 MHz clock reaches 1.92 MS/s, decimation 16,
-                where UHD alone would give 2.048 MS/s, decimation 15.
-        */
-        const double automaticDecimation = rateAutomatic > 0.0 ? std::round(clockAutomatic / rateAutomatic) : 0.0;
-        expect(std::abs(clockAutomatic - pickMHz * 1e6) < 1.0) << "the automatic entry leaves the clock where the write put it, for as long as the device stays open";
-        expect(std::abs(rateAutomatic - 2.0e6) / 2.0e6 < 0.05) << "and a later rate is reached by decimating that clock, near the request rather than on it";
-        expect(automaticDecimation > 0.0 && std::fmod(automaticDecimation, 2.0) == 0.0) << "by an even decimation, so the halfband filter is in the chain";
-        expect(std::abs(clockNextStart - truth.mclkHz) < 1.0) << "the next start comes up on the clock UHD chooses for itself, which is what restores the automatic choice";
+        gr::property_map unmet     = sourceSettings(2.0e6, defaultFreq(), truth.gainMinDb, sourcePort());
+        unmet["master_clock_rate"] = pickMHz * 1e6;
+        const std::string failure  = startAlone<capture::uhd::Source>(std::move(unmet));
+
+        std::printf("master clock: a start asking %.2f MHz and %.0f S/s runs %.0f Hz and %.0f S/s\n", pickMHz, wantRate, clockAtStart, rateAtStart);
+        std::printf("master clock: on the running source, MASTER_CLOCK %.2f answered %d, %.2f answered %d, the automatic entry answered %d; the device then runs %.0f Hz and %.0f S/s, master_clock_rate reads %.0f, %llu rate tag(s)\n",
+                    pickMHz, replayTaken ? 1 : 0, otherMHz, otherTaken ? 1 : 0, automaticTaken ? 1 : 0, clockAfterWrites, rateAfterWrites, settingAfterWrites, static_cast<unsigned long long>(rateTags));
+        std::printf("master clock: a start asking %.2f MHz and 2000000 S/s failed with \"%s\"\n", pickMHz, failure.c_str());
+
+        expect(std::abs(clockAtStart - pickMHz * 1e6) < 1.0) << "the device runs the clock the start asked for";
+        expect(std::abs(rateAtStart - wantRate) < 1.0) << "and the rate that clock divides exactly";
+        expect(replayTaken) << "a write of the clock in force is taken";
+        expect(!otherTaken && !automaticTaken) << "another clock and the automatic entry are refused while the clock was asked for";
+        expect(std::abs(clockAfterWrites - pickMHz * 1e6) < 1.0 && std::abs(rateAfterWrites - wantRate) < 1.0) << "the running device keeps its clock and its rate";
+        expect(std::abs(settingAfterWrites - pickMHz * 1e6) < 1.0 && rateTags == 0UL) << "the setting keeps its value and no rate is forwarded";
+        expect(failure.contains("sample_rate asked 2000000 Hz, the device runs 1920000 Hz")) << "a rate the clock does not divide fails the start: " << failure;
+        expect(failure.contains("the device's own limit")) << "and names the limit as the cause";
     });
 
     const int rc     = cases.report();

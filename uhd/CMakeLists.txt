@@ -83,9 +83,12 @@ if(CAPTURE_UHD_FOUND)
           controls.uhd-the-truth-is-read-on-the-channel-named controls.uhd-two-channels-reach-both-ports
           controls.uhd-a-radio-stating-clocks-above-the-converter-picks
           controls.uhd-a-product-table-offers-the-clocks-of-a-fixed-clock-radio
-          controls.uhd-a-table-clock-applies-at-the-next-open
-          controls.uhd-a-list-takes-its-entries-alone controls.uhd-a-failed-open-clears-the-clock-pin
-          controls.uhd-a-settings-write-clears-the-pins
+          controls.uhd-a-running-source-refuses-a-clock-it-does-not-run
+          controls.uhd-a-list-takes-its-entries-alone
+          controls.uhd-a-running-source-refuses-the-settings-it-runs-on
+          controls.uhd-a-start-names-each-value-the-device-does-not-run
+          controls.uhd-the-owner-count-is-read-on-a-b2xx-alone
+          controls.uhd-a-rate-pair-past-the-automatic-clock-is-refused
           controls.uhd-the-receive-depth-is-stated-in-time controls.uhd-a-drain-ends-by-duration-at-any-rate
           controls.uhd-thread-placement-is-the-callers
           controls.uhd-states-its-filter-and-its-gain-mode
@@ -103,9 +106,9 @@ if(CAPTURE_UHD_FOUND)
           sink.uhd-a-full-ring-consumes-nothing sink.uhd-a-send-reads-the-queue-in-place
           sink.uhd-a-work-call-clips-into-the-queue
           sink.uhd-a-send-takes-the-span-up-to-the-cap sink.uhd-a-write-wakes-the-waiting-drain
-          sink.uhd-a-rate-change-reuses-the-queue-that-fits sink.uhd-the-stop-bound-reads-the-stated-buffer
+          sink.uhd-the-stop-bound-reads-the-stated-buffer
           sink.uhd-the-queue-follows-its-settings
-          sink.uhd-a-rate-change-ends-the-burst
+          sink.uhd-a-running-sink-refuses-the-settings-it-runs-on
           sink.uhd-listing-pairs-are-the-sources
           sink.uhd-refuses-a-rate-that-is-not-a-positive-number
           sink.uhd-bounds-the-transmit-gain-at-the-device
@@ -115,16 +118,9 @@ if(CAPTURE_UHD_FOUND)
           sink.uhd-a-queue-reading-reads-no-storage
           sink.uhd-the-queue-follows-the-rate
           sink.uhd-a-stop-that-took-the-handle-calls-no-library
-          sink.uhd-a-rate-change-counts-what-it-discards
           sink.uhd-a-held-stop-ends-at-once
           sink.uhd-a-parked-drain-ends-the-burst-once
-          sink.uhd-a-rate-change-waits-for-a-fresh-park
-          sink.uhd-a-refused-park-keeps-the-queue
-          sink.uhd-a-rate-change-before-the-first-send-resizes-the-queue
           sink.uhd-a-resize-down-gives-the-storage-back
-          sink.uhd-a-play-out-is-bounded-by-the-rate-in-force
-          sink.uhd-a-refused-park-is-retried-until-it-lands
-          sink.uhd-a-rate-change-does-not-wait-on-a-send
           sink.uhd-a-stop-request-waits-for-the-control-mutex
           sink.uhd-a-start-that-cannot-parse-its-address-returns sink.uhd-a-failed-start-throws sink.uhd-a-failed-start-ends-the-run sink.uhd-a-failed-source-start-ends-the-run sink.uhd-a-release-runs-behind-the-stop
           sink.uhd-a-destroyed-block-leaves-the-release-running sink.uhd-the-release-ends-before-the-library-at-exit
@@ -203,7 +199,8 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
       uhd.wire-format uhd.transport-sizing uhd.master-clock uhd.tx-burst uhd.tx-loopback
       uhd.tx-underrun uhd.tx-tagged-bursts uhd.transmit-side uhd.two-channels-align
       uhd.two-channels-follow-their-antennas uhd.one-channel-on-side-b uhd.two-channel-clean-rate
-      uhd.tx-two-channels uhd.tx-channel-one-alone uhd.device-settings-across-two-blocks)
+      uhd.tx-two-channels uhd.tx-channel-one-alone uhd.device-settings-across-two-blocks
+      uhd.a-rate-pair-past-the-automatic-clock-fails-the-start)
   capture_test(
     hw_uhd
     DIR test
