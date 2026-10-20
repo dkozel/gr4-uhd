@@ -19,11 +19,8 @@
         of the device, and the vocabulary its counters are stated in.
     frame: a sink takes CF32 on its input port, stages it in a ring and lets its own drain hand
         that ring to the device. The work call never waits: what does not fit stays on the input
-        edge and the scheduler offers it again.
-    why: the ring comes from capture/common/Ring.hpp, which carries no GNU Radio 4 either, so a
-        caller that wants the full-scale contract alone takes the two headers and nothing more.
-        The queue sizing here names a rate rather than a ring, which is why it sits beside the
-        contract and not with the ring.
+        edge for the next call.
+    frame: this header and capture/common/Ring.hpp include no GNU Radio 4 header.
 */
 namespace capture {
 

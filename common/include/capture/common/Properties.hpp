@@ -27,10 +27,7 @@
 
 /*| role: the four message properties every device block answers, and the property maps
         a control descriptor, a sensor reading and a device listing travel in.
-    frame: a GNU Radio 4 property is a named endpoint on a block's built-in message port. A
-        caller outside the graph reaches it through the scheduler's message input, naming the
-        block as the message's service, and reads the reply on the scheduler's message output.
-        The keys of every map here are stated once, in this directory's knowledge file, and
+    frame: the keys of every map here are stated once, in this directory's knowledge file, and
         the conversions below are their one spelling.
     contract: controls answers Get with the surface the block states for the device it holds,
         and Subscribe with the same surface; a subscriber then receives it again, as a
@@ -44,14 +41,12 @@
         selector, the rate, the frequency, the gain mode and the wire format the block holds
         staged or set, control stages a SAMPLE_RATE, FREQUENCY or GAIN_MODE write and refuses
         every other id, and sensors answers the stream state alone.
-    frame: a caller holding the block's model reaches an unstarted block without a scheduler:
-        it connects a port of its own to each of the block's two message ports, writes the
-        request, and calls processScheduledMessages() on the model from its own thread while no
-        scheduler runs the block.
-    trap: every answer runs on the thread that serves the block's messages, which is a
-        scheduler worker, so a reply costs that worker what the block's own call costs.
-        A full sensor sweep can wait on a slow link to the unit for most of a second, so a
-        sensors Get takes the brief sweep unless it asks for the full one.
+    contract: each block states controlSurface(), the surface of the device it holds at the
+        rate and the frequency in force, computed from a Snapshot without the block's control
+        mutex. Its controlProperty() forwards to answerControlProperty.
+    trap: every answer runs on the scheduler worker that runs the block, and holds the
+        block's stream while it is made. A full sensor sweep can take most of a second. A
+        sensors Get therefore takes the brief sweep unless it asks for the full one.
 */
 namespace capture {
 
@@ -303,15 +298,9 @@ inline std::vector<std::pair<std::string, std::string>> devicesFromReply(const g
 /*| role: what one block keeps for its properties: who subscribed to controls and sensors, and
         the surface last sent to the controls subscribers.
     invariant: a member of every device block, declared before the teardown guard and built
-        from the block's own pointer, which registers the four properties on the block. The
-        callback is the block's own controlProperty member, the framework's table holding member
-        pointers of its base.
-    why: its own mutex, because the block's settings drain notes a changed surface on the
-        block's own thread while the scheduler's worker adds and removes subscribers. The
-        framework's subscription table is read and written on the worker alone and cannot
-        serve the drain.
-    why: registered when the block is built rather than when it starts, so a program asks a
-        block for its listing and its surface before it opens anything.
+        from the block's own pointer, which registers the four properties on the block.
+    why: its own mutex, because the settings drain sends a changed surface on the block's own
+        thread while the scheduler's worker adds and removes subscribers.
 */
 struct ControlProperties {
     ControlProperties() = default;
@@ -337,10 +326,8 @@ struct ControlProperties {
         controlSurface() computes the surface from read().
     invariant: the mutex is held for the copy alone and never across a device call, so a read
         waits at most as long as a copy takes.
-    why: a settings hook reads the surface on the thread that drains the device, and a device
-        block's control mutex is held across device calls. A tune can hold it for as long as
-        the device takes to settle, and a drain that read the surface under that mutex would
-        leave the device undrained for as long.
+    why: a settings hook reads the surface on the thread that drains the device, and the
+        block's control mutex is held across device calls as long as a tune.
 */
 template <typename T>
 class Snapshot {

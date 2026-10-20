@@ -70,10 +70,8 @@ namespace capture::uhd {
     invariant: no sweep runs inside answer(). The held set moves in and out under the mutex of a
         Snapshot, which no sweep holds. One fill runs at a time, so the sweeps merge in the order
         they ran.
-    why: the framework answers a property message on the worker that runs the block, between
-        two of its work calls, and nothing reaches the output while the answer is made. A whole
-        sweep there holds the stream for as long as a disciplined oscillator's epoch-time
-        sensor waits for its next serial sentence, up to a second.
+    why: a sensors answer holds the block's stream while it is made, and a whole sweep waits
+        up to a second for a disciplined oscillator's epoch-time sensor.
     trap: a whole answer that kept the whole sweep's rows apart would carry lock readings one
         whole sweep old over a brief sweep's newer ones, and a reader comparing successive
         answers would see a lock lost and found again.
@@ -142,40 +140,37 @@ private:
     ControlWorker    _worker;
 };
 
-/*| role: the USRP source for Ettus radios, over libuhd.
-    contract: the settings below, receives made into the output edge itself, and a
-        device-truth control surface, probed from the device rather than read from a static
-        table, because USRP models differ in gain elements, antennas and coverage.
-    frame: UHD's rx_streamer::recv() is a pull API and multi_usrp control calls are safe from
-        another thread while recv() runs, so this block needs no callback-and-ring split: one
-        consumer thread drains staged settings, receives whole frames into a reservation on the
-        output edge and publishes it, and a control thread of the block's own makes the control
-        calls those settings ask for while the stream runs.
-    invariant: the work thread never waits on a device call that another thread makes, apart
-        from the clock offset read once a device-clock set latches, which takes _ctrlMutex. A
-        settings pass stages the tune, the gain, the automatic gain mode and the antenna on the
-        control thread, refuses the settings the run holds fixed, and its surface check reads
-        the surface values from a snapshot rather than under _ctrlMutex.
+/*| role: the receive block for Ettus USRP radios over libuhd, at the head of a chain. It
+        streams one or two device channels and states a control surface read from the open
+        unit.
+    contract: out carries the first channel the channels setting lists and out2 the second.
+        The first block of a stream carries sample_rate. A block carries the timing tag named
+        trigger_name where tag_interval has passed, stamped with the time the device stamped
+        its first sample. The first block after a gap carries rx_overflow with the cause in
+        rx_overflow_cause. The first sample a retune reaches carries the new frequency.
+    contract: frequency, frequency_correction, rx_gains, gain_mode and rx_antennae reach a
+        streaming device on the block's control thread, one write at a time in the order
+        given. sample_rate, channels, wire_format, master_clock_rate, clock_source and
+        time_source are fixed while the block runs, and a write of one is refused. subdev, the
+        three transport sizes and the thread placement are read by start() alone, and a write
+        applies at the next start. The three tag settings apply from the next block.
+    contract: droppedSamples() counts the samples the radio shed, from the stream's own
+        stamps. overflowEvents() counts the overflow reports, sequenceErrors() the packets the
+        link lost, and droppedTags() the tags the output port refused. Each counts from the
+        start of the stream.
+    trap: a control call that fails is a line on standard error, and the stream goes on. A
+        start failure ends the run. A stream that delivers nothing for at least 5 s ends the
+        block with an error.
+    invariant: the consumer thread receives into the output edge and never waits on a device
+        call another thread makes, apart from the clock offset read once a device-clock set
+        latches. _ctrlMutex serializes the control calls. A sensor sweep does not hold it
+        across its device reads.
+    invariant: start() owns the device handle alone, and _deviceUp stays false until its last
+        line. Every holder after that line takes _ctrlMutex and tests _deviceUp under it.
+    why: a USRP has no fractional-ppm register. frequency_correction is therefore applied as a
+        scaled tune through capture::correctedTuneHz. A positive setting says the reference
+        runs fast.
     verified-by: controls.uhd-a-settings-pass-never-waits-on-a-tune
-    invariant: control calls are serialized by _ctrlMutex, which the sensor sweep deliberately
-        does not hold across its device reads: one sweep takes the better part of a second on a
-        GPSDO, and a mutex held that long on a repeating timer leaves every tune and gain write
-        waiting for it.
-    invariant: start() owns the device handle alone and reads it without that mutex. The
-        framework holds one mutex across a block's whole start sweep and the same one across its
-        stop sweep, so the two hooks never run together, and _deviceUp stays false until the
-        last line of start(), which keeps every other holder out. Every holder after that
-        line takes the mutex and re-tests _deviceUp under it.
-    trap: UHD throws on errors and every call here is wrapped. A transient control failure logs
-        and continues, because emitErrorMessage() from a settings handler kills the graph; only
-        a start() failure is fatal, and a dead stream surfaces through the work() liveness check
-        after at least 5 s of receives that delivered nothing, whatever each one's error arm
-        said. At least, rather than about: the recv timeout applies to every single call inside
-        recv() and not to the whole of it, so fifty receives at 0.1 s each is the floor and the
-        real deadline is longer.
-    why: USRPs have no fractional-ppm register, carrying a TCXO or a GPSDO instead, so ppm is
-        applied as a scaled tune through capture::correctedTuneHz, which states the convention.
-        The sign is verified over the air: a positive setting says the reference runs fast.
 */
 struct Source : gr::Block<Source> {
     using Description = gr::Doc<R"(USRP source via libuhd.
@@ -210,16 +205,15 @@ environment.)">;
     gr::Annotated<bool, "emit_timing_tags", gr::Doc<"emit wall-clock timing tags">>                               emit_timing_tags = true;
     gr::Annotated<float, "tag_interval", gr::Unit<"s">, gr::Doc<"minimum interval between timing tags">>          tag_interval     = 1.0f;
     gr::Annotated<std::string, "trigger_name", gr::Doc<"tag trigger_name">>                                       trigger_name     = std::string("SDR_WALLCLOCK");
-    /*| contract: read by start() alone, which writes it before it reads the control surface and
-            builds the streamer. A write while streaming applies at the next start.
+    /*| contract: start() writes it before it reads the control surface and builds the streamer.
         verified-by: uhd.receive-side
     */
     gr::Annotated<std::string, "subdev", gr::Doc<"receive frontend as a subdevice spec, 'A:B'; empty keeps the device's">> subdev;
-    /*| contract: read by start() alone. One streamer carries the device channels listed, the
-            first on out and the second on out2, and both start at one device time. A start
-            refuses, before it opens the device, a list of no channel or of three, a channel
-            listed twice, and a connected out2 with one channel listed. It refuses after the
-            open a channel the device does not offer under the subdevice spec in force.
+    /*| contract: one streamer carries the device channels listed, the first on out and the
+            second on out2, and both start at one device time. A start refuses, before it opens
+            the device, a list of no channel or of three, a channel listed twice, and a
+            connected out2 with one channel listed. It refuses after the open a channel the
+            device does not offer under the subdevice spec in force.
         contract: the sample rate, the frequency, the gain, the automatic gain mode, the
             filter and the two corrections apply to every listed channel alike, and the first
             channel answers every read-back and the surface. rx_antennae names a connector per
@@ -231,24 +225,21 @@ environment.)">;
         verified-by: controls.uhd-a-channel-list-is-checked-before-the-open
     */
     gr::Annotated<std::vector<gr::Size_t>, "channels", gr::Doc<"device channels streamed on out and out2">> channels = std::vector<gr::Size_t>{0U};
-    // The nine settings below are read by start() alone; withDeviceArgs states why.
     gr::Annotated<std::string, "wire_format", gr::Doc<"'sc16' or 'sc8'">>                                         wire_format       = std::string("sc16");
     gr::Annotated<std::string, "clock_source", gr::Doc<"reference to discipline the device by; empty keeps its own">> clock_source;
     gr::Annotated<std::string, "time_source", gr::Doc<"source of the timing edge; empty keeps its own">>              time_source;
     gr::Annotated<double, "master_clock_rate", gr::Unit<"Hz">, gr::Doc<"0 lets UHD choose">>                      master_clock_rate = 0.0;
     gr::Annotated<double, "recv_frame_size", gr::Unit<"B">, gr::Doc<"0 lets UHD choose">>                         recv_frame_size   = 0.0;
-    /*| contract: the transport's depth is the caller's to set, and zero leaves it to UHD. The
-            frames hold num_recv_frames x the streamer's frame over the rate: UHD's default on a
-            B2xx is 16 frames of 2040 samples in sc16, 0.53 ms at 61.44 MS/s and 16 ms at
-            2 MS/s. An N2xx takes 32 frames and a socket buffer of recv_buff_size bytes, which
-            UHD asks as 50e6 on Linux, 0.5 s at 25 MS/s in sc16. The reading rx_transport_depth
-            states the depth in use at the rate in force.
+    /*| contract: zero leaves the transport's depth to UHD. The depth is num_recv_frames times
+            the streamer's frame, over the rate, and the reading rx_transport_depth states it at
+            the rate in force.
+        trap: UHD's own 16 frames on a B2xx cover 0.53 ms at 61.44 MS/s.
     */
     gr::Annotated<double, "num_recv_frames", gr::Doc<"receive frames; 0 lets UHD choose (B2xx 16, N2xx 32)">>      num_recv_frames   = 0.0;
     gr::Annotated<double, "recv_buff_size", gr::Unit<"B">, gr::Doc<"socket buffer bytes; 0 lets UHD choose (N2xx 50e6)">> recv_buff_size = 0.0;
-    /*| contract: where the receive thread runs, the caller's to set as the transport is. Unset,
-            the thread keeps what the system gives it. placeOwnThread states the scale, and a
-            placement the system refuses is a line on standard error, never a failed start.
+    /*| contract: where the receive thread runs. Unset, the thread keeps what the system gives
+            it. capture::threading::placeOwnThread states the scale; a placement the system
+            refuses is a line on standard error.
         verified-by: threading.an-asked-placement-is-applied-or-named
         verified-by: controls.uhd-thread-placement-is-the-callers
     */
@@ -259,17 +250,16 @@ environment.)">;
 
     ::uhd::usrp::multi_usrp::sptr _usrp;
     ::uhd::rx_streamer::sptr      _stream;
-    mutable std::mutex          _ctrlMutex; // serializes every UHD control call, control thread against consumer thread; mutable so the const read-back path can lock too
-    std::mutex                  _teardownMutex; // one hardwareTeardown() owner at a time — see its doc
-    mutable std::mutex          _sensorMutex;   // one sensor sweep at a time, and the lifetime bound on the handle a sweep snapshots — see readSensors
+    mutable std::mutex          _ctrlMutex; // serializes every UHD control call
+    std::mutex                  _teardownMutex; // one hardwareTeardown() owner at a time
+    mutable std::mutex          _sensorMutex;   // one sensor sweep at a time; teardown takes it before it releases the device
     std::atomic<bool>           _deviceUp{false};
-    ConsumerThread              _consumer; // recv + publish; RAII-joined: a stop can land while a B2xx loads firmware in multi_usrp::make
+    ConsumerThread              _consumer; // receives from the streamer and publishes the samples
     /*| frame: the thread the frequency, the gain, the automatic gain mode and the antenna reach
             a streaming device on, one write at a time in the order the settings gave them. The
             consumer thread stages each write here and goes back to its receive.
-        why: a B205mini retune takes about 100 ms. Made on the consumer thread, the call left
-            the device undrained for that long, the device overflowed on most retunes, and 59
-            tunes at 2 MS/s shed 2.8 s of signal behind 14 markers.
+        measured: a B205mini retune takes about 100 ms. Made on the consumer thread, 59 tunes at
+            2 MS/s shed 2.8 s of signal behind 14 markers.
     */
     ControlWorker               _control;
     /*| frame: the readings the sensors property answers with, and the thread that sweeps the
@@ -299,7 +289,7 @@ environment.)">;
     std::atomic<int>            _retunesOpen{0};   // tunes begun whose frequency tag is not yet placed
     std::atomic<bool>           _streamDead{false}; // consumer saw a persistently dead stream
     std::atomic<std::uint64_t>  _overflows{0};
-    std::atomic<std::uint64_t>  _seqErrors{0}; // gaps the link lost rather than the buffer overran
+    std::atomic<std::uint64_t>  _seqErrors{0}; // packets the link lost, the overflows UHD marks out of sequence
     /*| frame: the causes a gap marker names, and which kind the last counted hole was.
     */
     static constexpr int        kGapBufferOverrun = 0;
@@ -360,10 +350,10 @@ environment.)">;
     std::vector<std::pair<double, double>> _freqRanges;         // tuner coverage at the rate in force
     double                      _appliedFreqHz = 0.0;           // the frequency the tuner holds, in the frame a caller asks in
     /*| frame: the request and the correction the frequency applier last worked from, guarded
-            by _ctrlMutex. A control path retunes from these rather than from the settings
-            members, which the settings drain rewrites on the consumer thread under a mutex no
-            control path holds — and for a vector setting the read can follow the reassignment
-            that freed the buffer.
+            by _ctrlMutex. A control path retunes from these.
+        trap: the settings drain rewrites the settings members on the consumer thread, under a
+            mutex no control path holds. A control path that reads frequency can read a vector
+            buffer the drain has freed.
     */
     double                      _requestedFreqHz = 0.0;
     double                      _ppmApplied      = 0.0;
@@ -378,7 +368,7 @@ environment.)">;
     mutable std::mutex          _drainMutex; // guards _lastDrain, written by the consumer thread or the teardown
     double                      _recvFramesAsked = 0.0; // num_recv_frames in the open address, zero for UHD's own; guarded by _ctrlMutex
     double                      _recvBuffAsked   = 0.0; // recv_buff_size in the open address, zero for UHD's own; guarded by _ctrlMutex
-    std::atomic<bool>           _deviceTime{false};    // tag from the device clock rather than the host's
+    std::atomic<bool>           _deviceTime{false};    // DEVICE_TIME in force: timing tags come from the device clock
     /*| frame: what the block knows about the device clock. A set takes effect on the next
             pulse-per-second edge where the time source carries one, up to a second later, and
             at once where none does, so between the write and the effect the device clock
@@ -395,15 +385,13 @@ environment.)">;
     std::atomic<std::uint64_t>  _clockLatchDeadlineNs{0};
     /*| frame: the host clock minus the device clock in nanoseconds, measured when the stream
             starts and again whenever a device-clock set takes effect. It carries a device
-            timestamp into the host's epoch, so a tag names the sample the device stamped
-            rather than the moment the host drained it.
+            timestamp into the host's epoch.
     */
     std::atomic<std::int64_t>   _deviceToHostNs{0};
     bool                        _agcSupported = false; // whether the frontend carries an AGC at all
-    bool                        _agcUnavailableLogged = false; // one line per open, not one per write
+    bool                        _agcUnavailableLogged = false; // the missing-AGC line, logged once per open
     bool                        _agcOn        = false; // guarded by _ctrlMutex; gates manual gain writes
-    // The gain_mode the block holds, as its start and its settings drain took it, for
-    // controlSurface(), which takes no lock.
+    // The gain_mode the block holds, as its start and its settings drain took it.
     std::atomic<bool>           _surfaceAgc{false};
     /*| frame: what each applier last put on the device, emptied by start() because a fresh
             multi_usrp holds none of the previous device state. Guarded by _ctrlMutex.
@@ -431,23 +419,17 @@ environment.)">;
     bool                        _joined = false;
     OutputState                   _outputState;
     ControlProperties     _controlProperties{this};
-    Snapshot<SurfaceValues>       _surfaceValues; // what controlSurface() reads, published by publishSurfaceLocked()
+    Snapshot<SurfaceValues>       _surfaceValues;
     TeardownGuard<Source>         _teardown{this}; // the last member, so its teardown runs first
-
-    // ---- the controls, control and sensors properties -----------------------------------
 
     std::optional<gr::Message> controlProperty(std::string_view name, gr::Message message) { return answerControlProperty(*this, name, std::move(message)); }
 
-    /*| contract: the control surface of the device this block holds, at the rate and the
-            frequency in force. The controls property answers with it, and the settings pass
-            reads it without _ctrlMutex. */
     std::vector<ControlDesc> controlSurface() {
         const SurfaceValues v = _surfaceValues.read();
         return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0, .gainMode = _surfaceAgc.load(std::memory_order_acquire)}, v.filterHz, v.clockHz, v.wireFormat, v.channelCount);
     }
 
-    // Hand the values controlSurface() reads to the snapshot. Called with _ctrlMutex held, or
-    // by start() before the device is up.
+    /*| contract: called with _ctrlMutex held, or by start() before the device is up. */
     void publishSurfaceLocked() { _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz.value_or(0.0), .wireFormat = _wireFormat, .channelCount = _channels.size()}); }
 
     /*| contract: the value one non-gain control holds, in the unit its descriptor states: the
@@ -597,20 +579,17 @@ environment.)">;
         verified-by: controls.uhd-counts-what-the-device-shed
     */
     std::uint64_t droppedSamples() const { return _dropped.load(std::memory_order_relaxed); }
-    // Markers the output port had no room for, each a gap the stream never reported.
     std::size_t droppedTags() const { return droppedTagCount(*this); }
 
 
     // UHD overflow events since the stream started. The samples they cost are
-    // droppedSamples(); an overflow event carries no count of its own.
+    // droppedSamples().
     std::uint64_t overflowEvents() const { return _overflows.load(std::memory_order_relaxed); }
 
     /*| contract: gaps whose packet never arrived, since the stream started, counted apart
             from the gaps a full buffer caused.
-        frame: UHD marks both as an overflow and sets out_of_sequence on the second. They
-            have different causes and different answers: a buffer runs over when the host
-            stops draining, and a packet goes missing on the link between the radio and the
-            host, which no amount of host attention fixes.
+        frame: a buffer runs over when the host stops draining. A packet goes missing on the
+            link between the radio and the host, which no host attention fixes.
         measured: a stalled consumer on a B205mini moves the overflow counter and leaves this
             one at zero; the same stall on an N210 over Ethernet moves this one.
         verified-by: uhd.overflow-under-a-stalled-consumer
@@ -642,12 +621,10 @@ environment.)">;
     }
 
     /*| contract: the analog filter width the last device this block opened settled on, in
-            Hz, read from it at the open and after every write. Zero before the first open.
-            It survives a stop, unlike the rest of the record, because a caller drawing the
-            control surface of a stopped radio has nowhere else to read the filter it holds.
-        why: UHD coerces a bandwidth to the nearest valid value rather than to the next value
-            at or above the request, so on a frontend with a stepped filter the value a
-            descriptor would state from the request disagrees with the hardware.
+            Hz, read from it at the open and after every write. Zero before the first open. It
+            survives a stop, for a caller drawing the control surface of a stopped radio.
+        why: UHD coerces a bandwidth to the nearest width the frontend has, which can sit
+            below the request.
         verified-by: uhd.accessors-after-a-stop
     */
     double analogBandwidthHz() const {
@@ -800,14 +777,12 @@ environment.)">;
         }
     }
 
-    /*| contract: the timestamp to tag a block with, from the device's own stamp for its first
-            sample. With deviceEpoch the stamp stands, which is the device clock a caller
-            asked for; without it the stamp is carried into the host's epoch by toHostNs.
-            Nothing where the block carried no stamp, or where the carried value is not a
-            time.
-        why: the device stamps the sample rather than the delivery, so a tag taken this way
-            carries neither the transport's backlog nor the host's scheduling jitter. The
-            toggle then chooses whose epoch the tag names and nothing else.
+    /*| contract: the timestamp to tag a block with, from the device's stamp on its first
+            sample. With deviceEpoch the stamp stands. Without it, toHostNs carries the stamp
+            into the host's epoch. Nothing where the block carried no stamp, or where the
+            carried value is at or below zero.
+        why: the device stamps each sample as it takes it. A tag from that stamp carries
+            neither the transport's backlog nor the host's scheduling jitter.
         verified-by: controls.uhd-tag-time-comes-from-the-device
     */
     static std::optional<std::int64_t> deviceStampNs(std::optional<std::int64_t> deviceNs, bool deviceEpoch, std::int64_t toHostNs) {
@@ -857,11 +832,9 @@ environment.)">;
         return nowNs >= deadlineNs ? ClockLatch::Abandoned : ClockLatch::Pending;
     }
 
-    /*| frame: the receives with no samples in them that mean the stream is dead. At the
-            0.1 s timeout each one carries, that is five seconds of silence — long enough to
-            cover a B2xx spinning its stream path up at the first start.
-        trap: at least five seconds, not about five: the timeout applies to every internal
-            call inside recv rather than to the whole of it, so the real deadline is longer.
+    /*| frame: the receives with no samples in them that mean the stream is dead: at least
+            five seconds of silence at kRecvTimeoutS each, which covers a B2xx starting its
+            stream path at the first start.
     */
     static constexpr int    kDeadReceives  = 50;
     static constexpr double kRecvTimeoutS  = 0.1;
@@ -869,34 +842,27 @@ environment.)">;
     /*| contract: the samples one receive asks for: the room the output edge has, capped at
             a quarter of the edge (kRecvEdgeShares) and at kRecvWindowS of the rate in force,
             in whole frames, and never below one frame. Zero where the room holds less than
-            one frame or the frame is zero, and the consumer loop then waits for the graph to
-            move, bounded by roomWaitBound, and asks again.
-        frame: UHD fills a receive from as many frames as it needs, and a frame holds 2040
-            samples on a B205mini and 363 on an N210 at the transport sizes this block
-            accepts. A request of whole frames ends every receive on a frame boundary, so
-            each receive starts at a frame's first sample and carries that frame's stamp.
-        frame: the receive lands in the output edge itself. The room is the space the edge's
-            writer can reserve, and a reservation is all or nothing, so the request never
-            exceeds it. The window bounds how long one receive holds the reservation before
-            its samples reach the graph.
-        why: a receive that fills the whole edge leaves no room for the next one until the
-            reader has taken everything, and the device's transport overflows during that
-            wait. A quarter of the edge lets receives land while the reader takes the rest,
-            and the consumer thread seldom waits for room, which is time spent away from the
-            transport.
-        measured: on a B205mini at 8 MS/s into a 64 Ki-sample edge, receives that filled the
-            edge lost 23.4 million of 40 million samples in 5 s over 31 overflows; receives of
-            half the edge lost none.
-        measured: on a B205mini at 61.44 MS/s into a 64 Ki-sample edge, receives of a
-            quarter of the edge waited for room 0 times a second, and receives of half the
-            edge 160 times a second. The overflows, 5.8 and 7.8 per 20 s run over twelve and
-            nine runs, differ by less than their spread from run to run. A quarter costs
-            1 percent more user cycles per sample.
-        measured: on a B205mini into an edge of 50 ms of the rate, a receive held 9, 78 and
-            294 frames at 1, 8 and 30 MS/s, and the receives per second were 54, 50 and 50,
-            against 61, 488 and 1830 for 16384-sample receives. The consumer thread spent
-            15.6, 5.9 and 5.5 million user cycles per million samples against 16.1, 6.2 and
-            6.4 million, the best of three to six 20 s runs of each.
+            one frame or the frame is zero. The consumer loop then waits for the graph to move
+            and asks again.
+        frame: whole frames end every receive on a frame boundary. Each receive therefore
+            starts at a frame's first sample and carries that frame's stamp.
+        why: a receive lands in a reservation on the output edge and holds it until it returns.
+            A receive that fills the edge leaves no room for the next until the reader has
+            taken everything, and the transport overflows meanwhile. A receive of a quarter of
+            the edge leaves room for the next while the reader takes the rest. The window
+            bounds how long a receive holds its samples back from the graph.
+        measured: recvFrameSamples() reads 2040 on a B205mini and 363 on an N210.
+        measured: B205mini, 64 Ki-sample edge, 5 s at 8 MS/s: receives of the whole edge
+            lost 23.4 million of 40 million samples over 31 overflows. Receives of half lost
+            none.
+        measured: B205mini, 64 Ki-sample edge, 20 s runs at 61.44 MS/s: receives of a
+            quarter waited for room 0 times a second and receives of half 160 times, at 1
+            percent more user cycles per sample. The overflows differed by less than their
+            spread from run to run.
+        measured: B205mini, an edge of 50 ms of the rate, the best of three to six 20 s runs
+            at 1, 8 and 30 MS/s: 54, 50 and 50 receives a second against 61, 488 and 1830 for
+            16384-sample receives, at 15.6, 5.9 and 5.5 million user cycles per million
+            samples against 16.1, 6.2 and 6.4 million.
         verified-by: controls.uhd-a-receive-asks-for-whole-frames
         verified-by: uhd.transport-sizing
     */
@@ -1093,30 +1059,26 @@ environment.)">;
         wire.isGain    = false;
         wire.appliesAt = AppliesAt::Start;
         out.push_back(std::move(wire));
-        /*| frame: the converter clock, in MHz, on a radio that lets one be picked, with a
-                first entry of zero meaning the choice UHD makes for itself. Every reachable
-                rate is that clock over a decimation, so the clock decides the whole ladder.
-            trap: an explicit write turns UHD's own choice off for as long as the device
-                stays open, and only the next open restores it, which is why the automatic
-                entry takes effect at the next start rather than at once.
-            contract: the descriptor states the start. The next open is the one point at which
-                every entry is in force, the automatic one included. On a radio stating a span
-                or separate clocks, an explicit clock also reaches a running device at once and
-                moves the rate with it.
+        /*| frame: the converter clock, in MHz, on a radio that lets one be picked. A first
+                entry of zero is the choice UHD makes for itself. Every rate is that clock over
+                a decimation. The clock therefore decides the whole ladder.
+            contract: a radio whose clock range is one continuous span takes any clock in it.
+                The descriptor is then anyInRange, and min and max state the span. Otherwise
+                min and max are the ends of the list, and only its entries are offered.
+            contract: the descriptor applies at the start. On a radio stating a span or
+                separate clocks, an explicit clock also reaches a running device at once and
+                moves the rate with it. The automatic entry applies only at the next open.
+            contract: a radio stating one clock is offered the clocks its product takes, and
+                the label names the clock in force. A clock picked there applies at the next
+                open alone, through the master_clock_rate device argument. The rate offer
+                stays the ladder of the clock in force until that open.
+            trap: an explicit write turns UHD's own choice off until the device is opened
+                again.
+            why: UHD states the rates of a fixed-clock radio for the clock it runs. The ladder
+                of any other clock would be a guess at the decimations the image carries.
             measured: a B205mini states 220 kHz to 61.44 MHz and runs 16 or 32 MHz when it
                 chooses for itself.
-            contract: a device whose clock range is one continuous span takes any clock in
-                it, so the descriptor is anyInRange and min and max state that span in MHz.
-                Otherwise min and max are the ends of the list and only its entries are
-                offered.
             verified-by: controls.uhd-a-clock-span-takes-any-clock-in-it
-            contract: a radio stating one clock is offered the clocks its product takes at
-                the open, and the label names the clock in force. A clock picked there applies
-                at the next open alone, through the master_clock_rate device argument.
-            why: the rate offer of such a radio stays the ladder of the clock in force until
-                that open, which reads the rates of the picked clock. UHD states the rates of a
-                fixed-clock radio for the clock it runs, and the ladder of any other clock
-                would be a guess at the decimations the image carries.
             verified-by: controls.uhd-a-product-table-offers-the-clocks-of-a-fixed-clock-radio
         */
         {
@@ -1220,10 +1182,8 @@ environment.)">;
 
     // The gain one element holds, or the overall gain for an empty name.
     double elementGain(const std::string& element) const {
-        /*| trap: unlike the other sources this reads back from the device instead of a cached
-                atomic, so it needs the same guard as the setters: teardown resets _usrp under
-                _ctrlMutex, and an unsynchronized shared_ptr read against that reset races the
-                refcount control block and not merely the pointer.
+        /*| trap: this reads back from the device and takes the setters' guard. Teardown resets
+                _usrp under _ctrlMutex.
         */
         CtrlGuard guard(_ctrlMutex, _deviceUp);
         if (!guard) {
@@ -1405,30 +1365,19 @@ environment.)">;
     // The sweep kinds, named on the block the way a caller asks for them.
     using SensorSweep = capture::uhd::SensorSweep;
 
-    /*| contract: read the sensors the open device publishes, plus the reference and timing
-            state that is not a sensor but belongs beside them, on the calling thread. False,
-            publishing nothing, when no device is up or the device goes down mid-sweep. The
-            sensors property answers from cachedSensors instead. Full is every sensor; Brief is
-            the ones start() measured as cheap, and the default is Full so a caller that says
-            nothing gets what it always got.
-        frame: these are control-plane reads over the same transport the settings appliers use,
-            so they are safe beside a running stream. They are also slow: a GPSDO answers its
-            GPS sensors from the oscillator's 1 Hz serial link, where the epoch-time sensor
-            waits for the next NMEA sentence by construction, so one full sweep costs the
-            better part of a second.
-        measured: on an N210 with a GPSDO a full sweep is about 700 ms and a brief one about
-            4 ms; on a B205mini the two are the same 4 ms, every sensor there being cheap.
-        trap: holding the control mutex across that, on a sweep a timer repeats, would put the
-            mutex in a caller's way for a large fraction of all wall-clock time, and every tune,
-            gain write and gain read-back landing in that window would wait out the rest of the
-            sweep.
-        why: so the control mutex is taken only to snapshot the device handle and the sensor
-            names, and every blocking read runs outside it. The snapshot is a shared handle, so
-            the device cannot be destroyed while a read is in flight; _sensorMutex bounds how
-            long that snapshot can exist, because teardown takes it before releasing the device
-            and so cannot return while a sweep still holds one. Clearing _deviceUp is teardown's
-            other half of that handshake: it is the sweep's abort signal, checked between reads,
-            so teardown waits for one sensor rather than a whole sweep.
+    /*| contract: read the sensors the open device publishes, and the reference and timing
+            state beside them, on the calling thread. False, publishing nothing, where no
+            device is up or the device goes down mid-sweep. Full is every sensor and Brief the
+            ones start() measured as cheap. The sensors property answers from the sensor cache.
+        invariant: _ctrlMutex is taken only to snapshot the device handle and the sensor
+            names, and every read runs outside it. The snapshot is a shared handle. Teardown
+            clears _deviceUp first, which aborts a sweep at its next read, and takes
+            _sensorMutex before it releases the device.
+        why: a GPSDO answers its GPS sensors over a 1 Hz serial link, and one full sweep there
+            takes most of a second. A tune or a gain write would wait out that sweep under the
+            control mutex.
+        measured: on an N210 with a GPSDO a full sweep takes about 700 ms and a brief one
+            about 4 ms. On a B205mini both take 4 ms.
     */
     bool readSensors(std::vector<SensorReading>& out, SensorSweep sweepKind = SensorSweep::Full) const {
         if (!sweepDevice(out, sweepKind)) {
@@ -1652,9 +1601,8 @@ environment.)">;
             try {
                 readTruthInto(*_usrp, _openTruth, _channels.front());
             } catch (const std::exception& e) {
-                /*| invariant: caught here rather than left to escape, so the device is
-                        handed off and the record cleared before the start throws. A block
-                        whose start threw is never given stop().
+                /*| invariant: the device is handed off and the record cleared before the start
+                        throws.
                 */
                 truthFailure = e.what();
                 _openTruth   = {};
@@ -1806,22 +1754,14 @@ environment.)">;
         }
     }
 
-    /*| contract: idempotent and serialized. It returns true to exactly one caller per open
-            device — the one that released it — so exactly one end-of-stream tag follows.
-        why: also run by _teardown's destructor when stop() never fired. Serialized because two
-            threads can request a stop at once, a liveness-detected failure on the scheduler
-            thread and an external stop on a caller's, and unserialized they would double-join
-            one thread.
-        measured: the caller waits about half a second in the worst case and a few
-            milliseconds in the ordinary one — the consumer's receive in flight, at most
-            0.1 s, and then the drain, at most 0.3 s. A receiver reaches stop() from the
-            thread that serves its interface, so that wait is the interface's.
-        trap: longer where one receive overruns its own timeout, which the vendor allows: the
-            timeout applies to every internal call inside recv rather than to the whole of it.
-            Longer also by the sensor read in flight on the sensor cache's thread, which the
-            cache's stop waits for: a GPSDO's gps_time read waits up to about a second for its
-            next sentence. The wait stays because that read holds the device handle, and the
-            device is released only after it.
+    /*| contract: ends the receive and releases the device. It runs once per open device and
+            is safe to call twice: it returns true to the caller that released the device and
+            false after. It waits for the receive in flight, up to kRecvTimeoutS, and for the
+            drain, up to kDrainLimitS: a few milliseconds in the ordinary case and about half a
+            second at worst.
+        trap: a stop waits longer where one receive overruns its timeout, and by the sensor
+            read in flight, which holds the device handle. A GPSDO's gps_time read waits up to
+            about a second for its next sentence.
         verified-by: uhd.stop-latency
     */
     bool hardwareTeardown() {
@@ -1850,10 +1790,7 @@ environment.)">;
         /*| invariant: the accessors answer what they promise for a block that is down. The
                 record, the frame the streamer chose and the frequency the tuner reached all
                 belong to a device this block has released.
-            frame: the analog filter width is the exception and is kept on purpose: a caller
-                drawing a control surface for a stopped radio has to state the width the
-                last device settled on, and has nowhere else to read it. The accessor says
-                so.
+            frame: the analog filter width stays, as analogBandwidthHz states.
         */
         _openTruth      = {};
         _maxRecvSamples = 0UZ;
@@ -1876,10 +1813,8 @@ environment.)">;
 
     // ---- staged settings (drained on the consumer thread) ----------------------------
 
-    /*| contract: runs on the consumer thread, which drains the staged settings. The frequency,
-            the gain, the automatic gain mode and the antenna are copied out of the settings
-            here and staged on the control thread. A write of a setting the run holds fixed is
-            refused, as refuseRunningWrites states.
+    /*| contract: runs on the consumer thread, which copies the live settings out and stages
+            them on the control thread.
         contract: the gain is bounded here, and a gain the bound moved is written back into
             rx_gains here, before the control thread writes the bounded value to the device.
         invariant: nothing forwards the frequency from here. The consumer thread places the
@@ -1946,32 +1881,17 @@ environment.)">;
     }
 
     /*| contract: tune to the request given, under the correction given and the LO offset in
-            force, and with forwardSetting, put the frequency the tuner holds into the
-            frequency setting. Called with _ctrlMutex held and a live device.
-        contract: true where the tuner was written and took the write.
-        why: forwardSetting is false for a write from any thread but the one that drains the
-            settings: a control written from a caller's own thread, and a retune on the control
-            thread. The setting is the block's, written by the thread that drains the settings,
-            and a second writer of it would be a race. The request and the correction are
-            arguments for the same reason: those threads pass the mirrors the applier left or
-            the values the drain copied, never the settings members themselves.
-        trap: an LO offset of zero is tuned without one rather than with an offset of zero.
-            The two are different requests: tune_request_t(f, 0) pins the RF frontend at f
-            and leaves the residue to the digital mixer, where tune_request_t(f) lets UHD
-            place the frontend where it likes.
-        why: the reference correction scales the center and not the offset. The two-argument
-            tune request pins the frontend at the center plus the offset and lets the digital
-            down-converter take the rest, and that converter's oscillator runs at the tick rate
-            the same reference sets. Both stages are therefore realized a factor of one plus
-            the fraction away from the value they were commanded at, and the offset the mixer
-            removes moves with the frontend that carries it: the net center lands on the
-            request whatever the offset is. An offset scaled here would move the net center by
-            the offset times the fraction instead.
-        trap: the correction fixes the center and nothing else. The sample rate carries the
-            same error and the block does not scale the rate it states, so a caller reading its
-            axis from the nominal rate places a component of true offset b at b divided by one
-            plus the fraction: 100 Hz low at an offset of 1 MHz and 100 ppm. See
-            tuneFrequencyFor.
+            force, and answer true where the tuner took the write. With forwardSetting the
+            frequency the tuner holds goes into the frequency setting. Called with _ctrlMutex
+            held and a live device.
+        why: forwardSetting is true only on the thread that drains the settings, which owns
+            the setting. A control written from a caller's thread and a retune on the control
+            thread pass false, and pass the request and the correction as copies.
+        trap: an LO offset of zero tunes without one. An offset of zero would pin the RF
+            frontend at the center, and a request without one lets UHD place the frontend.
+        frame: the correction scales the center and not the offset. The digital mixer that
+            takes the offset runs on the clock the same reference sets. The offset therefore
+            moves with the frontend and the net center lands on the request.
     */
     bool tuneLocked(double requested, double ppm, bool forwardSetting) {
         const auto f = tuneFrequencyFor(requested, ppm, _freqRanges, _loOffsetHz);
@@ -2611,17 +2531,11 @@ environment.)">;
     /*| contract: put the frontend's automatic gain control into the mode the setting asks
             for, on a model that has one. On a model without one the mode is logged once per
             open and nothing is written.
-        why: whether the frontend carries an AGC is read from its property tree when the
-            device is opened, not inferred from a failed write: UHD takes the write on a model
-            without one, warns and changes nothing, so a write is no test at all and a caller
-            would see the mode reported on while the gain stayed manual.
-        trap: the vendor header states that a device implementing no automatic gain control
-            throws on this call. The catch below stays for the version that does, and for the
-            model this bench has none of.
+        why: the open reads from the frontend's property tree whether it carries an AGC. UHD
+            takes the write on a model without one and changes nothing.
         measured: a B205mini carries one and lifts a -72 dBFS signal to -16 dBFS with zero
-            commanded. An N210 with a WBX carries none: on UHD 4.9.0.1 the call returns
-            without throwing there and the gain does not move, which is the behavior this
-            comment describes rather than the one the header documents.
+            commanded. An N210 with a WBX carries none: on UHD 4.9.0.1 the call returns there
+            and the gain does not move.
         verified-by: uhd.agc
     */
     void applyAgc() { applyAgcOf(gain_mode.value); }

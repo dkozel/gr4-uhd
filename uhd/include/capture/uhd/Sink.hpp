@@ -48,32 +48,29 @@
 
 namespace capture::uhd {
 
-/*| role: the USRP transmit sink for Ettus radios, over libuhd.
-    contract: the peer of Source. It takes the source's setting names, with the tx_ prefix
-        for what a transmitter has, the same device and device_parameter selection, the same
-        static device listing, and a control surface probed from the device rather than read
-        from a table. The work call stages samples in a ring and the block's own drain thread
-        hands them to a tx_streamer.
-    frame: UHD's tx_streamer::send() blocks at the sample rate, so the drain paces itself and
-        the work call only keeps the ring fed. Beside it a second thread reads the device's
-        asynchronous channel and counts the transmit gaps and the burst acknowledgments the
-        radio reports.
-    invariant: the asynchronous thread is started after the streamer and joined before it goes,
-        so it never reads a streamer that has been released.
+/*| role: the transmit block for Ettus USRP radios over libuhd, at the end of a chain. It
+        feeds one or two device channels and states a control surface read from the open unit.
+    contract: in feeds the first channel the channels setting lists and in2 the second. The
+        work call stages samples in a queue, and the block's drain thread hands them to the
+        streamer at the rate. The Description states the burst tags.
+    contract: the settings carry the source's names, with tx_ where a transmitter has the
+        thing. frequency, frequency_correction, tx_gains and tx_antennae reach the device live.
+        The settings the source holds fixed while it runs are fixed here as well. subdev, the
+        transport sizes, the queue sizes and the thread placement are read by start() alone.
+    contract: a second thread reads the device's asynchronous channel and counts what it
+        reports: underrunEvents(), sequenceErrors(), latePackets() and burstAcks().
+        unsentAtStopSamples() counts what the last stop could not get out.
+    contract: a control call that fails is a line on standard error and the stream goes on; a
+        start failure ends the run. frequency_correction scales the tune through
+        capture::correctedTuneHz, and a positive setting says the reference runs fast.
+    trap: a drain that has ended ends the block with an error.
+    invariant: the asynchronous thread is started after the streamer and joined before it goes.
     invariant: one thread sends at a time. The drain snapshots the streamer once and sends
-        under _sendMutex; a burst ended from a settings change or from a teardown takes that
-        same mutex, because two sends on one streamer are not safe together.
-    trap: UHD throws on errors and every call here is wrapped. A transient control failure logs
-        and continues, because emitErrorMessage() from a settings handler kills the graph; only
-        a start() failure is fatal, and a drain that has ended surfaces through the work()
-        liveness check.
-    why: USRPs have no fractional-ppm register, carrying a TCXO or a GPSDO instead, so ppm is
-        applied as a scaled tune through capture::correctedTuneHz, which states the convention,
-        in the sign Source applies.
-    frame: the drain's send() and the asynchronous thread's recv_async_msg() sit beside each
-        other on one tx_streamer, which is the arrangement UHD's own transmit examples use. The
-        vendor header states the serialization rule for send() alone and says nothing about the
-        pair.
+        under _sendMutex, and a burst ended from a settings change or a teardown takes the same
+        mutex.
+    frame: the vendor header states the serialization rule for send() alone and says nothing
+        on send() beside recv_async_msg() on the same streamer. The block serializes its sends
+        with _sendMutex and reads the asynchronous channel without it.
 */
 struct Sink : gr::Block<Sink> {
     using Description = gr::Doc<R"(USRP sink via libuhd.
@@ -105,10 +102,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
     static constexpr bool        kListingOpens = false; // the listing asks libuhd, which opens no unit
     static constexpr double      kDefaultRateHz      = 2'000'000.0;
     static constexpr double      kDefaultFrequencyHz = 100'000'000.0;
-    /*| why: the clock_source and time_source settings take a 10 MHz reference and a PPS from
-            outside the unit. The block declares ingests/time for them. It leaves the unit's
-            reference and PPS outputs as the unit sets them, and declares no emits/time.
-    */
+    /*| why: ingests/time, for the reference and PPS inputs, as on the source. */
 #ifdef CAPTURE_BLOCK_LABELS
     static constexpr auto attributes = gr::block::describe(1U, gr::block::labels::family(kDevice, "USRP radios driven through libuhd."),
         gr::block::labels::role::sink, gr::block::labels::holds::device, gr::block::labels::emits::rf, gr::block::labels::ingests::time);
@@ -120,17 +114,17 @@ channels one send carries both, so a burst tag on either input marks the burst o
     gr::Annotated<std::vector<double>, "tx_gains", gr::Unit<"dB">, gr::Visible, gr::Doc<"overall transmit gain">>     tx_gains  = std::vector<double>{0.0};
     gr::Annotated<double, "frequency_correction", gr::Unit<"ppm">, gr::Doc<"reference error in parts per million">>   frequency_correction = 0.0;
     gr::Annotated<std::vector<std::string>, "tx_antennae", gr::Doc<"transmit connector per listed channel, or one for all">> tx_antennae;
-    /*| contract: read by start() alone, which writes it before it reads the transmit surface
-            and builds the streamer. A write while streaming applies at the next start.
+    /*| contract: start() writes it before it reads the transmit surface and builds the
+            streamer.
         verified-by: uhd.transmit-side
     */
     gr::Annotated<std::string, "subdev", gr::Doc<"transmit frontend as a subdevice spec, 'A:A'; empty keeps the device's">> subdev;
-    /*| contract: read by start() alone. One streamer carries the device channels listed, the
-            first fed from in and the second from in2. A start refuses, before it opens the
-            device, a list of no channel or of three, a channel listed twice, a connected in2
-            with one channel listed and two channels with in2 unconnected. It refuses after the
-            open a channel the device does not offer under the subdevice spec in force, before
-            any stream is built.
+    /*| contract: one streamer carries the device channels listed, the first fed from in and
+            the second from in2. A start refuses, before it opens the device, a list of no
+            channel or of three, a channel listed twice, a connected in2 with one channel
+            listed and two channels with in2 unconnected. It refuses after the open a channel
+            the device does not offer under the subdevice spec in force, before any stream is
+            built.
         contract: the sample rate, the frequency, the overall and element gain and the filter
             apply to every listed channel alike, as the source applies them, and the first
             channel answers every read-back and the surface. tx_antennae names a connector per
@@ -142,7 +136,6 @@ channels one send carries both, so a burst tag on either input marks the burst o
         verified-by: uhd.tx-two-channels
     */
     gr::Annotated<std::vector<gr::Size_t>, "channels", gr::Doc<"device channels fed from in and in2">> channels = std::vector<gr::Size_t>{0U};
-    // The seven settings below are read by start() alone; withDeviceArgs states why.
     gr::Annotated<std::string, "wire_format", gr::Doc<"'sc16' or 'sc8'">>                                             wire_format  = std::string("sc16");
     gr::Annotated<std::string, "clock_source", gr::Doc<"reference the device is disciplined by">>                     clock_source;
     gr::Annotated<std::string, "time_source", gr::Doc<"source of the timing edge">>                                   time_source;
@@ -150,12 +143,10 @@ channels one send carries both, so a burst tag on either input marks the burst o
     gr::Annotated<double, "send_frame_size", gr::Unit<"B">, gr::Doc<"transport frame bytes; 0 lets UHD choose">>      send_frame_size   = 0.0;
     gr::Annotated<double, "num_send_frames", gr::Doc<"transport frames; 0 lets UHD choose">>                          num_send_frames   = 0.0;
     gr::Annotated<double, "send_buff_size", gr::Unit<"B">, gr::Doc<"socket buffer bytes; 0 lets UHD choose">>         send_buff_size    = 0.0;
-    // The two below size the transmit queue at the start.
     gr::Annotated<double, "queue_duration", gr::Unit<"s">, gr::Doc<"transmit queue length in time">>                 queue_duration  = QueueBound{}.seconds;
     gr::Annotated<double, "queue_max_bytes", gr::Unit<"B">, gr::Doc<"most bytes the transmit queue takes">>          queue_max_bytes = QueueBound{}.maxBytes;
-    /*| contract: where the drain thread runs, read by the start and the caller's to set. Unset,
-            the thread keeps what the system gives it. The scale is the source's, and a
-            placement the system refuses is a line on standard error, never a failed start.
+    /*| contract: where the drain thread runs, as on the source: priority 0 to 1 and a
+            processor.
         verified-by: controls.uhd-thread-placement-is-the-callers
     */
     gr::Annotated<double, "thread_priority", gr::Doc<"transmit thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
@@ -301,19 +292,13 @@ channels one send carries both, so a burst tag on either input marks the burst o
     Snapshot<SurfaceValues>       _surfaceValues; // what controlSurface() reads, published by publishSurfaceLocked()
     TeardownGuard<Sink>           _teardown{this}; // the last member, so its teardown runs first
 
-    // ---- the controls, control and sensors properties -----------------------------------
-
     std::optional<gr::Message> controlProperty(std::string_view name, gr::Message message) { return answerControlProperty(*this, name, std::move(message)); }
 
-    /*| contract: the control surface of the device this block holds, at the rate and the
-            frequency in force. The controls property answers with it, and the settings hook
-            reads it without _ctrlMutex. */
     std::vector<ControlDesc> controlSurface() {
         const SurfaceValues v = _surfaceValues.read();
         return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0}, v.filterHz, v.clockHz, v.wireFormat, v.channelCount);
     }
 
-    // Hand the values controlSurface() reads to the snapshot. The caller holds _ctrlMutex.
     void publishSurfaceLocked() { _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz, .wireFormat = _wireFormat, .channelCount = _channels.size()}); }
 
     /*| contract: the value one control holds, in the unit its descriptor states: the filter the
@@ -461,12 +446,12 @@ channels one send carries both, so a burst tag on either input marks the burst o
     }
 
     /*| contract: the most samples one send carries: 10 ms at rateHz, rounded down to whole
-            frames of maxSendSamples and never below one frame. One frame where the rate is not
-            a positive number.
+            frames of maxSendSamples, at least one frame. One frame where rateHz is at or below
+            zero, or NaN.
         why: the drain hands the streamer the whole contiguous span the queue holds, and UHD
-            cuts it into frames itself. The block's own work then happens once per send rather
-            than once per frame. The cap bounds how long one send keeps the drain from a pause
-            or a stop, and whole frames leave at most one short packet per send.
+            cuts it into frames. The block's own work runs once per send. The cap bounds how
+            long one send keeps the drain from a pause or a stop. Whole frames leave at most
+            one short packet per send.
         verified-by: sink.uhd-a-send-takes-the-span-up-to-the-cap
     */
     static std::size_t sendCapSamples(double rateHz, std::size_t maxSendSamples) {
@@ -479,14 +464,14 @@ channels one send carries both, so a burst tag on either input marks the burst o
         return std::max(frame, samples / frame * frame);
     }
 
-    /*| contract: the bytes the open device can hold between the host and the air: the send
-            buffer the open address states, and kDeviceHeldBytes where it states none or one
-            that is not a positive number.
-        frame: UHD states no device transmit buffer in its property tree or on a tx_streamer.
-            The address's send_buff_size is the one figure the open carries. An N-series takes
-            it as the window its flow control lets the host run ahead of the transmit DSP, the
-            unit's SRAM when the address states none. A network device's host socket holds that
-            many bytes ahead of the device.
+    /*| contract: the bytes the open device can hold between the host and the air: the
+            send_buff_size the open address states, and kDeviceHeldBytes where the address
+            states none or a value that fails to parse, is below one or is infinite.
+        frame: send_buff_size in the open address is the one figure for the device's transmit
+            buffer that UHD gives the host. An N-series takes it as the window its flow control
+            lets the host run ahead of the transmit DSP. With none stated, that window is the
+            unit's SRAM. A network device's host socket holds that many bytes ahead of the
+            device.
         verified-by: sink.uhd-the-stop-bound-reads-the-stated-buffer
     */
     static std::size_t deviceHeldBytesFor(const ::uhd::device_addr_t& address) {
@@ -525,9 +510,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
     bool deviceUp() const { return _deviceUp.load(std::memory_order_acquire); }
 
     /*| contract: always zero for this family.
-        why: a USRP keys down and transmits nothing at all for a gap, and reports it as an event
-            carrying no length, so there is no silence to count. underrunEvents() is the honest
-            number here.
+        why: a USRP keys down for a gap and reports it as an event with no length.
+            underrunEvents() counts the gaps.
         verified-by: uhd.tx-underrun
     */
     std::uint64_t underrunSamples() const { return _counters.underrunSamples.load(std::memory_order_relaxed); }
@@ -542,23 +526,21 @@ channels one send carries both, so a burst tag on either input marks the burst o
 
     /*| contract: packets the device reported lost on the link from the host since the run
             started, one per message carrying a sequence error in or out of a burst.
-        why: counted apart from the underruns, as the source keeps a lost packet apart from an
-            overflow. A host that stopped feeding the radio and a link that dropped a packet
-            have different answers, and an N210's Ethernet link moves this count.
+        why: a host that stopped feeding the radio and a link that dropped a packet have
+            different answers. An N210's Ethernet link moves this count.
         verified-by: sink.uhd-counts-transmit-events-by-bit
     */
     std::uint64_t sequenceErrors() const { return _sequenceErrors.load(std::memory_order_relaxed); }
 
     /*| contract: packets the device reported as arriving after the time they carried, since the
-            run started. Every send here is untimed, so a nonzero count names a device that
-            reported a late packet on its own.
+            run started. A send carries a time only from a tx_time tag.
         verified-by: sink.uhd-counts-transmit-events-by-bit
     */
     std::uint64_t latePackets() const { return _latePackets.load(std::memory_order_relaxed); }
 
     /*| contract: always zero for this family.
-        why: a pause here ends the burst and keeps the queue, so the samples already handed over
-            go out when the block resumes rather than being thrown away.
+        why: a pause ends the burst and keeps the queue, and the samples it holds go out when
+            the block resumes.
     */
     std::uint64_t discardedAtHoldSamples() const { return _counters.discardedAtHold.load(std::memory_order_relaxed); }
 
@@ -910,9 +892,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
                     readTruthInto(*_usrp, _openTruth, _channels.front());
                 }
             } catch (const std::exception& e) {
-                /*| invariant: caught here rather than left to escape, so the device is released
-                        and the record cleared before the start throws. A block whose start
-                        threw is never given stop().
+                /*| invariant: the device is released and the record cleared before the start
+                        throws.
                 */
                 failure    = std::format("uhd read the transmit surface of {}: {}", device_parameter.value, e.what());
                 _openTruth = {};
@@ -1108,16 +1089,11 @@ channels one send carries both, so a burst tag on either input marks the burst o
     // Ends the drain's wait, for a caller that has just changed what the drain waits on.
     void wakeDrain() noexcept { _drainBell.ring(); }
 
-    /*| contract: idempotent and serialized. It returns true to exactly one caller per open
-            device — the one that released it.
-        why: also run by _teardown's destructor when stop() never fired. Serialized because two
-            threads can request a stop at once, and unserialized they would double-join one
-            thread.
-        trap: what the work calls already handed over goes out before the streamer is released,
-            and the wait for it is bounded by how long the queue takes to play out. A device
-            that has stopped draining would otherwise hold the stop for as long as it stays
-            attached. A stop made while the carrier is held waits for nothing: the drain is
-            parked and the queue it holds is counted as unsent.
+    /*| contract: ends the transmit and releases the device. It runs once per open device and
+            is safe to call twice: it returns true to the caller that released the device and
+            false after. The samples that work() staged go out before the streamer is
+            released, within the time the queue takes to play out. A stop made while the
+            carrier is held waits for nothing, and the queue it holds counts as unsent.
     */
     bool hardwareTeardown() {
         std::lock_guard teardown(_teardownMutex);

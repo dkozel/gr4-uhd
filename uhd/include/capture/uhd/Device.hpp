@@ -368,38 +368,24 @@ inline std::string validWireFormat(const std::string& wanted) { return std::rang
 */
 inline double tunedFrequencyFrom(double heldHz, double ppm) { return heldHz * capture::referenceScale(ppm); }
 
-/*| contract: the frequency to hand the tuner for a request, when the coverage the device
-        states holds it, and nothing when no range does. The correction is folded in first,
-        because the scaled value is the one the tuner has to reach. loOffsetHz moves the RF
-        frontend away from the center, and zero moves it nowhere.
-    why: refused rather than clamped. UHD coerces a request past an edge to the nearest
-        frequency it can reach and reports success, so a 40 MHz request on a radio whose
-        coverage starts at 49 MHz tunes 49 MHz, and every frequency axis downstream is out by
-        nine megahertz with nothing to say so. A burst goes out on a frequency the caller never
-        asked for in the same way.
-    frame: a USRP's coverage moves with the analog filter, UHD widening the tuner's range by
-        half the filter at each end within the digital converter's reach, and a block's filter
-        follows its rate, so the ranges given here are the ones read at the rate and the filter
-        in force.
-    trap: the vendor header states the opposite — that the stated range "does not include
-        the baseband bandwidth" and a caller should assume half the rate more at each end. On
-        a model that behaves that way, this refusal costs up to half a rate of band at each
-        edge.
-    measured: both radios here follow the range they state. An N210 at 6.25 MS/s states a
-        bottom of 48.75 MHz, and a direct open asked for 47.75 MHz lands back on 48.75 MHz; a
-        B205mini at 8 MS/s states 34 MHz and does the same. On a model that does reach past
-        its stated range, the range to test against is the stated one widened by half the
-        rate.
-    measured: on a B205mini at 2 MS/s the stated coverage is 49 to 6001 MHz; the same radio
-        states 42 to 6008 MHz at 16 MS/s.
-    frame: the correction is exact for the center and for the center alone. The same
-        reference sets the converter's clock, so a stream stated at a nominal rate runs at that
-        rate times one plus the fraction. A receive caller reading its axis from the nominal
-        rate places a component of true offset b at b divided by one plus the fraction, short
-        by b times the fraction: 100 Hz at an offset of 1 MHz and 100 ppm, where the center
-        itself is on the request. A component a transmit caller placed at b leaves at b times
-        one plus the fraction. Neither block scales the rate it states: a consumer's frequency
-        axis is its own.
+/*| contract: the frequency to hand the tuner for a request, where the coverage the device
+        states holds it, and nothing where no range does. The correction is folded in first,
+        because the tuner has to reach the scaled value. loOffsetHz moves the RF frontend away
+        from the center, and zero moves it nowhere.
+    why: refused and not clamped. UHD coerces a request past an edge to the nearest frequency
+        it reaches and reports success: a 40 MHz request on a radio whose coverage starts at
+        49 MHz tunes 49 MHz.
+    frame: the ranges are the ones read at the rate and the filter in force. A USRP's coverage
+        widens by half the analog filter at each end, within the digital converter's reach.
+    trap: the correction is exact for the center alone. The same reference sets the converter
+        clock. A stream stated at a nominal rate therefore runs at that rate times one plus the
+        fraction. A receive caller reading its axis from the nominal rate places a component of
+        true offset b at b divided by one plus the fraction: 100 Hz short at 1 MHz and 100 ppm.
+        A component a transmit caller placed at b leaves at b times one plus the fraction.
+        Neither block scales the rate it states.
+    measured: an N210 at 6.25 MS/s states a bottom of 48.75 MHz, and a direct open asked for
+        47.75 MHz lands on 48.75 MHz. A B205mini at 8 MS/s states 34 MHz and does the same.
+    measured: a B205mini states 49 to 6001 MHz at 2 MS/s and 42 to 6008 MHz at 16 MS/s.
     verified-by: controls.uhd-frequency-out-of-range-refused
 */
 inline std::optional<double> tuneFrequencyFor(double requestHz, double ppm, std::span<const std::pair<double, double>> ranges, double loOffsetHz = 0.0) {
@@ -407,11 +393,8 @@ inline std::optional<double> tuneFrequencyFor(double requestHz, double ppm, std:
     if (!center.has_value() || loOffsetHz == 0.0) {
         return center;
     }
-    /*| trap: an LO offset moves the RF frontend to the center plus the offset and leaves the
-            rest to the digital mixer, so the synthesizer has to reach the frontend frequency
-            rather than the center. UHD coerces a frontend frequency past the end of the stated
-            coverage without refusing it, which is the silent clamp this whole path exists to
-            refuse.
+    /*| trap: with an LO offset the synthesizer has to reach the center plus the offset, and
+            that frequency is tested as well.
     */
     return frequencyInRange(*center + loOffsetHz, ranges).has_value() ? center : std::nullopt;
 }
@@ -819,22 +802,22 @@ inline DeviceTruth ladderTruthFor(DeviceTruth truth, double clockInForceHz) {
 
 /*| contract: the rates to offer a caller for the radio a probe described, ascending. Empty only
         where the probe described nothing.
-    frame: where the master clock is programmable the rate set the device states is the ladder
-        of the clock in force and moves with the rate, so the picks above are the ladder and the
-        clock range bounds them: the top is the fastest clock, offered itself where no pick
-        reaches it, and the bottom is the slowest clock over the deepest decimation. A link
-        ceiling UHD states in the wire format named lowers the top to that ceiling, offered
-        itself in the same way: 13.312 MS/s in sc16 for a B2xx on USB 2.
+    frame: with a programmable master clock, the device states the ladder of the clock in
+        force, and that ladder moves with the rate. The offer is the static picks from the
+        slowest clock over the deepest decimation up to the fastest clock. The fastest clock is
+        offered itself where no pick reaches it.
+    frame: a link ceiling UHD states for the wire format named lowers the top to that ceiling,
+        offered itself in the same way: 13.312 MS/s in sc16 for a B2xx on USB 2.
     trap: the picks stop at 61.44 MS/s, the top of a B2xx's or an E3xx's converter. A radio
-        whose clock runs faster reaches its fastest clock at decimation 1, and an offer cut at
-        the last pick would hide every rate above 61.44 MS/s. The top and every separate clock
-        the radio states up to it are offered as well.
-    frame: where the master clock is fixed the radio reaches every even decimation of it, which
-        on a 100 MHz clock is 191 entries between 195 kS/s and 25 MS/s, and the ones below about
-        1 MS/s sit less than a percent apart. A list drawn over all of them cannot be aimed by
-        hand, so what is offered is the static picks for the kind that lie on that ladder, plus
-        the ladder's own top. A rate a caller states outright is still snapped to the nearest
-        entry of the whole ladder.
+        whose clock runs faster reaches its fastest clock at decimation 1. An offer cut at the
+        last pick hides every rate above 61.44 MS/s. The offer adds the top and every separate
+        clock the radio states up to it.
+    frame: with a fixed master clock, the radio reaches every even decimation of it. On a
+        100 MHz clock that is 191 entries between 195 kS/s and 25 MS/s, the ones below about
+        1 MS/s less than a percent apart. The offer is the static picks for the kind that lie
+        on that ladder, and the ladder's top. A rate a caller states outright snaps to the
+        nearest entry of the whole ladder.
+    why: the whole fixed-clock ladder is too dense to pick a rate from by hand.
     measured: a B205mini states 256 single points, 31.25 kHz to 16 MHz at a 16 MHz master clock
         and 120 kHz to 61.44 MHz at a 61.44 MHz one, against a master clock range of 220 kHz to
         61.44 MHz. Taking the stated set would cap that radio at whichever clock the probe
@@ -1129,19 +1112,17 @@ inline std::vector<double> masterClockPicksMHz() { return {5.0, 10.0, 16.0, 20.0
         the N300, N310 and N320, and usrp_x4xx.dox for the X410 and X440. The NI-2974 takes
         the X3xx set: x300_mboard_type.cpp classes it as an X310 motherboard, which the same
         driver and device arguments run. The N3xx sets match magnesium.py and rhodium.py,
-        which check the clock at the open. The X410 sets are the manual's. The X410 clock
-        policy of MPM also takes 122.88 and 125 MHz and a 200 MHz legacy clock, which the
-        table leaves out.
-    why: UHD 4.9 states the clock range of these radios as the clock in force alone, so the
+        which check the clock at the open. The X410 clock policy of MPM also takes 122.88 and
+        125 MHz and a 200 MHz legacy clock. The table leaves those out.
+    why: UHD 4.9 states the clock range of these radios as the clock in force alone. The
         device cannot be asked which other clocks it takes. An X3xx and an X4xx keep the clock
-        they were opened at for the whole session. An N3xx can change its clock while open,
-        and the block still takes a clock only at the open, where the rates it offers are
-        read.
-    trap: the table is a copy of UHD's facts, and it drifts where a later UHD changes them. A
-        clock the table offers and the UHD in use refuses fails the next open.
-    trap: UHD 4.9.0.1 refuses a 120 MHz X3xx clock at the open although its clock driver has a
-        mode for one: the device arguments take 184.32 to 200 MHz, and the daughterboard clock
-        is derived only inside that span.
+        they were opened at for the whole session. An N3xx can change its clock while open.
+        The block sets a clock only at the open, where it reads the rates it offers.
+    trap: the table copies UHD's facts and drifts where a later UHD changes them. A clock the
+        table offers and the UHD in use refuses fails the next open.
+    trap: the X3xx clock driver has a 120 MHz mode, and UHD 4.9.0.1 refuses that clock at the
+        open. The device arguments take 184.32 to 200 MHz, and the daughterboard clock is
+        derived only inside that span.
 */
 struct ProductClocks {
     std::string_view                 product;
@@ -1380,23 +1361,23 @@ void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir, std::size_t ch
 
 /*| role: the USRP handles this process has let go of and whose release has not finished.
     contract: releaseLater() takes the caller's references and drops them on a thread of its
-        own, so the caller returns at once. awaitReleases() returns once every release handed
-        off before the call has ended, one that another caller is joining included. Every
-        open in this process calls awaitReleases() first, because a unit is exclusive and a
-        selector need not name a unit the way another block's did. A block's destructor does not
-        wait, so a caller that destroys the block at every stop gets the stop back as fast as a
-        caller that keeps it.
+        own. The caller returns at once. awaitReleases() returns once every release handed off
+        before the call has ended, one that another caller is joining included.
+    contract: every open in this process calls awaitReleases() first. A unit is exclusive, and
+        two selectors can name one unit in different ways. A block's destructor returns
+        without waiting. A caller that destroys the block at every stop gets the stop back as
+        fast as a caller that keeps it.
     frame: a device is released when its last reference goes. A source and a sink sharing one
         unit through the vendor's own cache each hand their references here, and the unit is
         released once, by whichever thread drops the last one.
     measured: the release alone costs 1147 ms on an N210 and 16 ms on a B205mini, three runs
         each of the bench's open-time scenario.
-    trap: the registry joins what is left when the process ends, so no release thread is
-        destroyed while it runs. The join is registered with std::atexit at every hand-off, so
-        it runs before the destructors of the vendor library's own static objects, which the
-        open behind the hand-off constructed after this registry. The registry's own
-        destructor runs after theirs, so a join left to it alone would run a release against a
-        library that has already been torn down.
+    trap: the registry joins what is left when the process ends, and no release thread is
+        destroyed while it runs. Every hand-off registers that join with std::atexit. The join
+        then runs before the destructors of the vendor library's static objects, which the open
+        behind the hand-off constructed after this registry. The registry's own destructor runs
+        after theirs. A join left to it alone would run a release against a library already
+        torn down.
     verified-by: sink.uhd-the-release-ends-before-the-library-at-exit
     verified-by: sink.uhd-a-second-wait-waits-for-the-release-in-flight
 */

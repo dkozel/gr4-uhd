@@ -12,13 +12,7 @@
 
 /*| role: one reading of what an environment switch means, so that every switch this library
         reads answers the same way.
-    why: setting a switch to zero turns it off, exactly as leaving it unset does. A presence
-        check reads a debug switch set to 0 as a request to enable the debug output, which is the
-        opposite of what anyone typing it means, and the mistake is invisible: the run succeeds
-        and quietly does the other thing.
-    origin: this library's own copy. The first commit here states that the environment and
-        thread-naming utilities its sources lean on are copies; the same reader exists,
-        renamespaced, as gqrx4's kit/env, and no translation unit sees both.
+    why: a switch set to zero is off, as an unset one is. A presence check would read 0 as on.
 */
 
 namespace capture {

@@ -2077,31 +2077,21 @@ int main(int argc, char** argv) {
     });
 
     cases("uhd.sensor-sweep-beside-a-stream", [] {
-        /*| frame: a receiver streams and reads the sensors on a thread of its own, the whole
-                set every few seconds and the brief set every second. One stream carries six
-                arms of equal length: first the property asked every second for the whole set
-                every fourth time, as a receiver's poller asks from a start, then the whole sweep
-                every 4.7 s and the brief sweep every second, each called on a thread of the
-                case's own and each asked through the sensors property, and no sweep. Each arm
-                states the overflow events, the dropped samples and the sequence errors the
-                source counted, the wall time of each sweep or answer, and the delivery gaps the
-                consumer saw, with the number that overlap a sweep. A closing arm stalls the
-                consumer for two seconds, and its gap and loss counts show that the watch sees a
-                stall.
-            frame: the scheduler answers a property message on the worker that runs the block,
-                between two of the block's work calls. The source answers from its sensor
-                cache there and sweeps the device on a thread of its own.
-            contract: the arm without a sweep loses nothing, and every arm that asks through
-                the property loses nothing and keeps its longest delivery gap under the gap
+        /*| role: shows that sensor reads leave a running stream whole. One stream runs the six
+                arms below for kArm each, then a closing arm that stalls the consumer for
+                kStallMs.
+            contract: the arm without a sweep loses nothing. Every arm that asks through the
+                sensors property loses nothing and keeps its longest delivery gap under the gap
                 watch's threshold. A whole answer states the whole set pending until a whole
-                sweep has landed, and the every-fourth arm receives the whole set. The arms that
-                call the sweep directly are measured and printed, because what a sweep costs a
-                stream from another thread is a property of the unit.
-            why: the rate is the ladder's entry at or below 10 MS/s, which the rate ladder
-                streams without loss, so a loss in a sweeping arm belongs to the sweep.
+                sweep has landed, and the arm asking for the whole set every fourth time
+                receives it. The arms that call the sweep directly are printed and not judged:
+                what a sweep costs a stream from another thread is a property of the unit. The
+                stall arm shows that the watch sees a stall.
+            why: the rate is the ladder's fastest at or below 10 MS/s, which streams without
+                loss. A loss in a sweeping arm therefore belongs to the sweep.
             why: the gap bound is the gap watch's threshold. The stall it guards against lasts
                 a tenth of a second or more, and a bound a few milliseconds wide fails on a busy
-                host while the cache works.
+                host.
         */
         using Sweep = capture::uhd::Source::SensorSweep;
         struct Arm {
@@ -2338,17 +2328,15 @@ int main(int argc, char** argv) {
     });
 
     cases("uhd.overflow-under-a-stalled-consumer", [] {
-        /*| frame: the stall runs at the top of the radio's own ladder, and it has to be
-                long enough that the samples arriving during it exceed whatever the device
-                and the transport hold for the host. The assumption stated: the buffer on
-                the host side is at most the kernel's own socket receive limit, 50 MB on
-                this box, which at four bytes a sample is 12.5 M samples, so a stall of one
-                second at any rate above 12.5 MS/s fills it. The stall lasts a second at
-                every rate, and the case prints the counts it read.
-        trap: the expected count comes from the rate the device is running at, not from the
-                rate asked for. A fixed-clock radio lands on its own divisor, and judging a
-                7.692 MS/s stream against an 8 MS/s request reads as a 3.7 percent loss that
-                never happened.
+        /*| frame: the stall runs at the top of the radio's own ladder for kStallMs, long
+                enough that the samples arriving during it exceed what the device and the
+                transport hold for the host. The case takes that hold to be at most the
+                kernel's socket receive limit, and prints the counts it read.
+            measured: the socket receive limit is 50 MB on the bench host, 12.5 M samples at
+                four bytes a sample, which a one-second stall above 12.5 MS/s fills.
+            trap: the expected count comes from the rate the device runs at. A fixed-clock
+                radio lands on its own divisor, and a 7.692 MS/s stream judged against an
+                8 MS/s request reads as a 3.7 percent loss.
         */
         const auto&      truth = benchTruth();
         const auto       ladder = capture::uhd::Source::sampleRatesFor(truth);

@@ -25,31 +25,17 @@
 #endif
 
 /*| role: where a thread runs, and how hard it pushes.
-    invariant: every thread this program creates decides one of two things, and code adding a
-        new one decides it deliberately rather than inheriting it by accident. A thread is
-        either on the path somebody is waiting on — samples arriving, sound leaving, a picture
-        being drawn — in which case it leaves this alone and keeps what the process gives it; or
-        it is background work, in which case it calls runInBackground on entry and says so.
-        Doing neither is a choice too, and it is the wrong one on a machine whose cores differ
-        in speed: what a thread inherits is the fast set, which is exactly what background work
-        should not be occupying.
-    why: the shape of the policy is inheritance, deliberately. The process narrows itself to the
-        fast cores once, before anything else starts, so every thread — including the ones this
-        library never sees, a sound server's writer and the graph framework's own pools —
-        begins there without being reached individually, and threads that should not be there
-        widen themselves back. Reaching a thread you do not create is otherwise not possible at
-        all, and the sample path runs through exactly such a thread.
-    frame: "the machine" means the processors the process was given: the base set is whatever
-        sched_getaffinity reports at startup and not the machine's whole CPU list. A process
-        inside a cpuset, a container or a taskset has been told which processors it may use, and
-        widening past that would be this program overriding an instruction from outside it, so
-        narrowing happens inside that set or not at all.
-    trap: on a machine with one kind of core this does nothing at all — no mask is set, and
-        every thread keeps what it would have had. CAPTURE_CPU_POLICY=off turns it off
-        everywhere for a run.
-    origin: this library's own copy. The first commit here states that the environment and
-        thread-naming utilities its sources lean on are copies; the same policy exists,
-        renamespaced, as gqrx4's kit/threading, and the two are maintained separately.
+    contract: a thread on the path somebody waits on, for samples arriving, sound leaving or a
+        picture drawn, keeps what the process gives it. A thread doing background work calls
+        runInBackground on entry.
+    frame: the process narrows itself to the fast cores once, before any other thread starts.
+        Every thread begins there, the ones this library does not create included, and a
+        background thread widens itself back.
+    frame: the processors the process was given are the set sched_getaffinity reports at
+        startup, and the narrowing stays inside that set.
+    trap: a background thread that does not call runInBackground stays on the fast cores.
+    trap: on a machine with one kind of core this sets no mask. CAPTURE_CPU_POLICY=off turns
+        it off for a run.
 */
 
 namespace capture::threading {
@@ -239,11 +225,10 @@ inline Topology topology() {
         kernel that will not say, or a refused mask all leave every thread where it would have
         been.
     trap: one copy of this policy per process. The base set is the affinity the process holds
-        when the first call runs, so a second copy of this code in the same program — the same
-        policy lives, renamespaced, in a consumer's own kit — reads an affinity the first copy
-        has already narrowed, finds every processor in it quick and takes the "all of one kind"
-        exit. Its useAllCores() is then a no-op for the life of the process and a background
-        thread demoted through it keeps the quick cores.
+        when the first call runs. A second copy of this code in the same program reads an
+        affinity the first copy has already narrowed, finds every processor in it quick and
+        takes the "all of one kind" exit. Its useAllCores() is then a no-op for the life of the
+        process and a background thread demoted through it keeps the quick cores.
     verified-by: threading.the-policy-settles-once
 */
 inline std::string adoptFastCoresForProcess() {
@@ -352,14 +337,10 @@ inline void useAllCores() {
 #endif
 }
 
-/*| role: name the calling thread and change nothing else about it, for a thread that should
-        keep exactly what it inherited — either because somebody is waiting on it, or because
-        its urgency belongs to whoever started it.
-    why: the name still matters: without one these carry the executable's, and a measurement
-        cannot tell them apart.
-    trap: deliberately not lowerOwnPriority(name, 0). That asks for nice zero, which on a thread
-        that inherited nineteen is a request to be promoted — refused without privilege, granted
-        with it, and wrong either way.
+/*| role: name the calling thread and change nothing else about it, for a thread that keeps
+        what it inherited.
+    trap: lowerOwnPriority(name, 0) asks for nice zero, which promotes a thread that inherited
+        nineteen.
 */
 inline void nameOwnThread(std::string_view name) { detail::applyName(name); }
 

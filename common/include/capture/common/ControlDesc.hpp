@@ -21,9 +21,8 @@
 /*| role: what a device block says its controls are, and the two readings a caller needs to
         drive them: the value a key carries in a device string, and whether a frequency is
         inside the coverage the device stated.
-    why: a header of plain values with no dependency of its own. A consumer that draws a
-        control surface takes this one alone; capture/common/Device.hpp includes it, so a block
-        that needs the threading and lifecycle parts as well gets both from there.
+    frame: a header of plain values with no dependency of its own, for a caller that draws a
+        control surface. capture/common/Device.hpp includes it.
 */
 namespace capture {
 
@@ -102,15 +101,13 @@ inline std::optional<double> frequencyInRange(double requestHz, std::span<const 
 }
 
 /*| role: when a write of one control takes effect.
-    contract: Runtime, the write reaches the running stream. Start, the device takes the write
-        at the next start of its stream, because it reads that setting only then. setControl
-        refuses a write to a stopped block. A family either keeps a Start write made while the
-        device is up for the next start, or takes only the value in force and refuses any
-        other, as its README states; the USRP source refuses. A caller that builds a new block
-        for the next start passes the value as the open-time setting the family's README names
-        for the control.
-    why: a caller draws the controls a running device takes apart from the ones that wait for
-        a restart, and a write whose effect waits for one reads as a write that did nothing.
+    contract: Runtime, the write reaches the running stream. Start, the device reads the
+        setting only at the next start of its stream. setControl refuses a write to a stopped
+        block. A family either keeps a Start write made while the device is up for the next
+        start, or refuses every value but the one in force; its README says which. A caller
+        that builds a new block for the next start passes the value as the open-time setting
+        the README names.
+    why: a caller draws the controls that wait for a restart apart from the live ones.
 */
 enum class AppliesAt : std::uint8_t { Runtime, Start };
 
@@ -122,13 +119,10 @@ enum class AppliesAt : std::uint8_t { Runtime, Start };
     frame: anyInRange marks a list whose device also takes every value between min and max.
         min and max then state that range, and a caller lets a person enter a value inside it.
         A list without it takes its entries alone.
-    why: each device block describes its real control surface — discrete steps, toggles, enums,
-        non-uniform ladders — rather than a flat continuous slider, so a caller can lay the
-        controls out without knowing the device.
-    invariant: isGain controls persist through a consumer's input/gains configuration and are
-        disabled by hardware AGC; the rest persist per driver under input/controls unless they
-        are sessionOnly or rate-derived. inoperativeAboveHz marks a control the hardware ignores
-        above a tuner frequency.
+    why: a caller lays the controls out from the descriptors alone, with the steps, toggles,
+        options and ladders the device really has.
+    frame: isGain marks a gain, which the hardware's automatic gain mode overrides.
+        inoperativeAboveHz marks a control the hardware ignores above a tuner frequency.
 */
 struct ControlSeed {
     const char*        id;      // stable id; for gains this is the legacy config key
@@ -145,9 +139,9 @@ struct ControlSeed {
     int                nListValues;
     bool               isGain;
     double             inoperativeAboveHz; // 0 = always operative
-    // Always comes up at defValue, never persisted. For controls that act on the world
-    // rather than on reception — a bias tee feeds DC up the coax into whatever is
-    // connected now, not what was connected when the setting was saved.
+    /*| frame: sessionOnly comes up at defValue and is never stored, for a control such as a
+            bias tee that acts on whatever is connected now.
+    */
     bool               sessionOnly = false;
     AppliesAt          appliesAt   = AppliesAt::Runtime;
     bool               anyInRange  = false;
@@ -162,16 +156,12 @@ struct ControlSeed {
         carries brief false: a drill-down reads it and a glance row leaves it out.
     frame: label is a short noun phrase for a person. value is display-ready, unit included
         where the label does not name what is counted.
-    invariant: a device's readings exist only while the source is streaming: sensors are read
-        from an open device and there is no probe-while-stopped form, opening an
-        exclusive-access SDR just to read a sensor being a fight with the very thing that is
-        streaming. The stream state, which a block states from its own state, is the one
-        reading of a block whose device is down.
-    trap: good carries the meaning of a two-state sensor — a lock that is not locked reads false
-        — and is true for a reading with no pass/fail sense, so it is not a validity flag. brief
-        is false for a reading whose value is a multi-field record, an NMEA sentence or a GPSDO
-        servo status line, which does not fit a one-line glance row and belongs in a drill-down
-        that parses it.
+    invariant: a device's readings exist only while the source is streaming, read from the
+        open device. The stream state is the one reading of a block whose device is down.
+    trap: good carries the meaning of a two-state sensor: a lock that is not locked reads
+        false. A reading with no pass or fail sense reads true. The field good is therefore no
+        validity flag.
+        brief is false for a multi-field record, an NMEA sentence or a GPSDO servo status line.
 */
 struct SensorReading {
     std::string id;    // the device's own sensor name, e.g. "ref_locked"
@@ -182,9 +172,7 @@ struct SensorReading {
 };
 
 /*| role: the caller state a control surface may depend on.
-    why: passed to describeControls() so that context-dependent truth — per-band ladders,
-        rate-derived defaults — is computed by the device family itself, and a consumer applies
-        no per-device overlays.
+    contract: describeControls() computes per-band ladders and rate-derived defaults from it.
     frame: gainMode is the automatic gain mode the caller holds, which becomes the GAIN_MODE
         descriptor's default. wireFormat is the link packing the caller holds, where the family
         has one; empty stands for the family's default packing.
@@ -197,15 +185,13 @@ struct TruthContext {
     std::string wireFormat = {};
 };
 
-/*| role: an owning control descriptor, the one type that crosses the seam out of this
-        library. Both directions answer with it, a sink's transmit gain and a source's tuner
-        filter being one kind of thing to a caller drawing a surface.
+/*| role: an owning control descriptor, the type a source and a sink both answer a caller
+        with.
     frame: built by each family's describeControls(const TruthContext&) from its constexpr
         ControlSeed table, or from a device probe. The field meanings match ControlSeed;
         defValue is the value shown when a caller holds no stored override.
-    invariant: rateDerived marks a control whose default re-derives from the sample rate. A
-        caller drops stored overrides for these on every rate change, so the fresh default is
-        not shadowed.
+    frame: rateDerived marks a control whose default re-derives from the sample rate. A caller
+        drops a stored value of one at every rate change.
     frame: ranges holds the spans a range control covers, each as [min, max] and in ascending
         order, where it covers more than one. min and max are then the outer ends, and a value
         between two spans is outside the control. Empty where [min, max] is the one span.
