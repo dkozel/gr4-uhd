@@ -3425,9 +3425,11 @@ int main(int argc, char** argv) {
                 fails its start with a message naming the setting, the value asked, the value
                 in force and the other block as the cause, and the first block streams on. The
                 second block is started outside a graph, so its failure is read where it is
-                raised. In each live row both blocks run, and a write of a fixed setting to one
-                of them is refused. The sink transmits on channel 0 into side A's terminated
-                TX/RX at 0 dB and 915 MHz.
+                raised. In the clock and time source rows the first block asks for the selection
+                the radio runs and the second for another one the radio offers; a radio that
+                offers no other one skips the row. In each live row both blocks run, and a write
+                of a fixed setting to one of them is refused. The sink transmits on channel 0
+                into side A's terminated TX/RX at 0 dB and 915 MHz.
         */
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         constexpr double kRate = 2.0e6;
@@ -3448,16 +3450,34 @@ int main(int argc, char** argv) {
         };
         struct Conflict {
             std::string      name;
-            gr::property_map rx;
-            gr::property_map tx;
             std::string      setting;
+            gr::property_map rxSourceFirst, txSourceFirst, rxSinkFirst, txSinkFirst;
         };
-        const std::vector<Conflict> conflicts{
-            {"clock_source", rxWith({{"clock_source", std::string("internal")}}), txWith({{"clock_source", std::string("gpsdo")}}), "clock_source asked"},
-            {"time_source", rxWith({{"time_source", std::string("internal")}}), txWith({{"time_source", std::string("gpsdo")}}), "time_source asked"},
-            {"master_clock_rate", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 32.0e6}}), "master_clock_rate asked"},
-            {"a rate needing another clock", rxWith({{"sample_rate", 2.5e6}}), txWith({{"sample_rate", 7.68e6}}), "sample_rate asked"},
+        const auto fixedRow = [](std::string name, gr::property_map rx, gr::property_map tx, std::string setting) {
+            return Conflict{std::move(name), std::move(setting), rx, tx, rx, tx};
         };
+        // The block started first asks for the selection the radio runs; the block started
+        // second asks for another one the radio offers, in either start order.
+        const auto selectionRow = [&](const std::string& key, const std::vector<std::string>& offered, const std::string& running) -> std::optional<Conflict> {
+            const auto other = std::ranges::find_if(offered, [&](const std::string& s) { return s != running; });
+            if (other == offered.end()) {
+                std::printf("row: %s: the radio offers no source other than \"%s\"; the row does not run\n", key.c_str(), running.c_str());
+                return std::nullopt;
+            }
+            gr::property_map held, asked;
+            held.insert_or_assign(std::pmr::string(key), running);
+            asked.insert_or_assign(std::pmr::string(key), *other);
+            return Conflict{key, key + " asked", rxWith(held), txWith(asked), rxWith(asked), txWith(held)};
+        };
+        const auto&           truth = benchTruth();
+        std::vector<Conflict> conflicts;
+        for (auto row : {selectionRow("clock_source", truth.clockSources, truth.clockSource), selectionRow("time_source", truth.timeSources, truth.timeSource)}) {
+            if (row) {
+                conflicts.push_back(std::move(*row));
+            }
+        }
+        conflicts.push_back(fixedRow("master_clock_rate", rxWith({{"master_clock_rate", 16.0e6}}), txWith({{"master_clock_rate", 32.0e6}}), "master_clock_rate asked"));
+        conflicts.push_back(fixedRow("a rate needing another clock", rxWith({{"sample_rate", 2.5e6}}), txWith({{"sample_rate", 7.68e6}}), "sample_rate asked"));
         /*| frame: in the rate row, 2.5 MS/s and 7.68 MS/s have a least common multiple that
                 fits UHD's 32 bits and no clock UHD picks, so the block started second fails
                 before its rate is written. The pair whose multiple does not fit is
@@ -3473,15 +3493,15 @@ int main(int argc, char** argv) {
                 std::string failure;
                 bool        firstStreams = false, firstRan = false;
                 if (!sinkFirst) {
-                    firstRan = withGraph(row.rx, [&](capture::uhd::Source&, auto&) {
+                    firstRan = withGraph(row.rxSourceFirst, [&](capture::uhd::Source&, auto&) {
                         expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
-                        failure      = startAlone<capture::uhd::Sink>(row.tx);
+                        failure      = startAlone<capture::uhd::Sink>(row.txSourceFirst);
                         firstStreams = streams();
                     });
                 } else {
-                    firstRan = withTxGraph(row.tx, [&](capture::uhd::Sink& sink, auto&) {
+                    firstRan = withTxGraph(row.txSinkFirst, [&](capture::uhd::Sink& sink, auto&) {
                         expect(waitForDeviceUp(sink, std::chrono::seconds(10))) << "the sink starts";
-                        failure      = startAlone<capture::uhd::Source>(row.rx);
+                        failure      = startAlone<capture::uhd::Source>(row.rxSinkFirst);
                         firstStreams = sink.deviceUp();
                     });
                 }
@@ -3499,6 +3519,11 @@ int main(int argc, char** argv) {
         double txRate = 0.0, txSetting = 0.0, clockAfter = 0.0;
         bool   clockTaken = true, sourceTaken = true;
         std::string referenceAfter;
+        const auto  otherClock = std::ranges::find_if(truth.clockSources, [&](const std::string& s) { return s != truth.clockSource; });
+        const std::string otherName = otherClock == truth.clockSources.end() ? std::string{} : *otherClock;
+        if (otherName.empty()) {
+            std::printf("live: the radio offers no clock source other than \"%s\"; no reference write is tried\n", truth.clockSource.c_str());
+        }
         const bool ran = withGraph(rxWith({}), [&](capture::uhd::Source& src, auto&) {
             expect(waitForSamples(std::chrono::milliseconds(6000))) << "the receive stream starts";
             const bool sinkRan = withTxGraph(txWith({}), [&](capture::uhd::Sink& sink, auto&) {
@@ -3506,13 +3531,13 @@ int main(int argc, char** argv) {
                 const double clockBefore = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_master_clock_rate(0); });
                 std::ignore = sink.settings().setStaged({{"sample_rate", 7.68e6}});
                 clockTaken  = src.setControl("MASTER_CLOCK", clockBefore / 1e6 * 0.96);
-                double gpsdoAt = -1.0;
+                double otherAt = -1.0;
                 for (const auto& c : src.controlSurface()) {
-                    for (std::size_t i = 0UZ; c.id == "CLOCK_SOURCE" && i < c.options.size(); ++i) {
-                        gpsdoAt = c.options[i] == "gpsdo" ? static_cast<double>(i) : gpsdoAt;
+                    for (std::size_t i = 0UZ; c.id == "CLOCK_SOURCE" && !otherName.empty() && i < c.options.size(); ++i) {
+                        otherAt = c.options[i] == otherName ? static_cast<double>(i) : otherAt;
                     }
                 }
-                sourceTaken = gpsdoAt >= 0.0 && src.setControl("CLOCK_SOURCE", gpsdoAt);
+                sourceTaken = otherAt >= 0.0 && src.setControl("CLOCK_SOURCE", otherAt);
                 settle(1500);
                 txRate         = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_tx_rate(0); });
                 txSetting      = sink.sample_rate.value;
@@ -3522,12 +3547,12 @@ int main(int argc, char** argv) {
             expect(sinkRan) << "the sink's graph ran";
         });
         capture::uhd::awaitReleases();
-        std::printf("live: the running sink given 7680000 S/s states %.0f and the device sends %.0f S/s; the source's MASTER_CLOCK answered %d and the clock moved %.0f Hz; its CLOCK_SOURCE gpsdo answered %d and the device runs %s\n",
-                    txSetting, txRate, clockTaken ? 1 : 0, clockAfter, sourceTaken ? 1 : 0, referenceAfter.c_str());
+        std::printf("live: the running sink given 7680000 S/s states %.0f and the device sends %.0f S/s; the source's MASTER_CLOCK answered %d and the clock moved %.0f Hz; its CLOCK_SOURCE %s answered %d and the device runs %s\n",
+                    txSetting, txRate, clockTaken ? 1 : 0, clockAfter, otherName.c_str(), sourceTaken ? 1 : 0, referenceAfter.c_str());
         expect(ran) << "the source's graph ran";
         expect(std::abs(txSetting - kRate) < 1.0 && std::abs(txRate - kRate) < 1.0) << "a rate written to the running sink is refused";
         expect(!clockTaken && clockAfter == 0.0) << "a master clock written to the running source is refused";
-        expect(!sourceTaken && referenceAfter != "gpsdo") << "and so is a reference";
+        expect(!sourceTaken && referenceAfter == truth.clockSource) << "and so is a reference";
     });
 
     cases("uhd.a-rate-pair-past-the-automatic-clock-fails-the-start", [] {
