@@ -3,12 +3,11 @@
 #
 # The files the last import from libcapture placed in this tree, one path per line.
 # extract/copy.py writes this file and reads it at the next import.
-# This copy is of libcapture as of 2026-10-20, at "uhd: the two-block case asks for a clock and time source the radio offers", its last change to these files.
+# This copy is of libcapture as of 2026-10-22, at "Comment cleanup: the knowledge files move to knowledge/", its last change to these files.
 uhd/CMakeLists.txt
 uhd/README.md
 uhd/include/capture/uhd/Device.hpp
 uhd/include/capture/uhd/Discovery.hpp
-uhd/include/capture/uhd/KNOWLEDGE.md
 uhd/include/capture/uhd/Sink.hpp
 uhd/include/capture/uhd/Source.hpp
 uhd/include/gnuradio-4.0/capture/uhd/UhdBlocks.hpp
@@ -29,7 +28,6 @@ common/include/capture/common/Device.hpp
 common/include/capture/common/Discovery.hpp
 common/include/capture/common/DiscoveryLibrary.hpp
 common/include/capture/common/Env.hpp
-common/include/capture/common/KNOWLEDGE.md
 common/include/capture/common/Properties.hpp
 common/include/capture/common/Ring.hpp
 common/include/capture/common/Sink.hpp
@@ -42,3 +40,5 @@ common/test/support/Labels.hpp
 common/test/support/Readings.hpp
 common/test/support/ScheduledGraph.hpp
 common/test/support/Surface.hpp
+knowledge/common.md
+knowledge/uhd.md

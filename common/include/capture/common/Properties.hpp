@@ -27,7 +27,7 @@
 
 /*| role: the four message properties every device block answers, and the property maps
         a control descriptor, a sensor reading and a device listing travel in.
-    frame: the keys of every map here are stated once, in this directory's knowledge file, and
+    frame: the keys of every map here are stated once, in knowledge/common.md, and
         the conversions below are their one spelling.
     contract: controls answers Get with the surface the block states for the device it holds,
         and Subscribe with the same surface; a subscriber then receives it again, as a

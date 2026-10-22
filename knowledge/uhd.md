@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Jeff Long; SPDX-License-Identifier: MIT -->
 # capture/uhd — the USRP source and sink
 
-The family contracts are in `capture/common/KNOWLEDGE.md`. This file holds the USRP's own facts.
+The family contracts are in `knowledge/common.md`. This file holds the USRP's own facts.
 
 **purpose**
 `capture::uhd::Source` and `capture::uhd::Sink` drive a USRP through UHD 4's `multi_usrp`

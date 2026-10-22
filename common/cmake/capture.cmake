@@ -50,16 +50,13 @@ find_package(Threads REQUIRED)
 # diagnostics.
 set(CAPTURE_WARNINGS -Wall -Wextra)
 
-# The include directories and the language level of all three tiers. In the build tree the
-# include directories are include/ where the tree has the recording formats, common/include/
-# and every device's include/. Installed, the include directory is CAPTURE_INSTALL_INCLUDEDIR
-# under the prefix, and the headers sit under its capture/.
+# The include directories and the language level of both tiers. In the build tree the
+# include directories are common/include/ and every device's include/. Installed, the
+# include directory is CAPTURE_INSTALL_INCLUDEDIR under the prefix, and the headers sit
+# under its capture/.
 add_library(capture-interface INTERFACE)
 add_library(capture::headers ALIAS capture-interface)
 set_target_properties(capture-interface PROPERTIES EXPORT_NAME headers)
-if(IS_DIRECTORY ${CAPTURE_ROOT}/include)
-  target_include_directories(capture-interface INTERFACE $<BUILD_INTERFACE:${CAPTURE_ROOT}/include>)
-endif()
 target_include_directories(capture-interface INTERFACE $<BUILD_INTERFACE:${CAPTURE_ROOT}/common/include>)
 foreach(device IN LISTS CAPTURE_DEVICES)
   target_include_directories(capture-interface INTERFACE $<BUILD_INTERFACE:${CAPTURE_ROOT}/${device}/include>)
@@ -192,6 +189,7 @@ option(CAPTURE_ENABLE_HEADER_PARSE "Compile one translation unit per device head
 # directory adds its own vendor directory through capture_device() below.
 add_library(capture-device-headers INTERFACE)
 add_library(capture::device-headers ALIAS capture-device-headers)
+target_link_libraries(capture-device-headers INTERFACE capture-interface)
 
 # The discovery library's option, stated ahead of the device directories because
 # capture_device() reads it. capture_finish() builds the library.
@@ -395,8 +393,7 @@ if(CAPTURE_TESTS)
   # DIR names the directory the case file sits in, relative to the calling directory: test
   # for a device's own cases. The binary keeps its name whichever directory its source came
   # from, because the bench scripts and the verified-by lines name it. SOURCES names further
-  # files of this tree compiled into the binary. The binary links the recording formats'
-  # library where the top builds one, and the interface targets alone elsewhere.
+  # files of this tree compiled into the binary.
   function(capture_test name)
     cmake_parse_arguments(T "" "DIR" "CASES;SOURCES;LIBS;INCLUDES;DEFINITIONS" ${ARGN})
     set(source ${name}.cpp)
@@ -404,12 +401,7 @@ if(CAPTURE_TESTS)
       set(source ${T_DIR}/${name}.cpp)
     endif()
     add_executable(${name} ${source} ${T_SOURCES})
-    if(TARGET capture)
-      target_link_libraries(${name} PRIVATE capture)
-    else()
-      target_link_libraries(${name} PRIVATE capture-interface)
-    endif()
-    target_link_libraries(${name} PRIVATE capture-ut ${T_LIBS})
+    target_link_libraries(${name} PRIVATE capture-interface capture-ut ${T_LIBS})
     target_compile_options(${name} PRIVATE ${CAPTURE_WARNINGS})
     target_compile_definitions(${name} PRIVATE ${T_DEFINITIONS})
     foreach(dir ${T_INCLUDES})
@@ -417,8 +409,8 @@ if(CAPTURE_TESTS)
     endforeach()
     foreach(case ${T_CASES})
       add_test(NAME ${case} COMMAND ${name} ${case})
-      # Every case here is arithmetic or a few thousand samples; the longest is the
-      # two-and-a-third-century date sweep. The ceiling is a stuck test, not a slow one.
+      # Every case here is arithmetic or a few thousand samples. The ceiling is a stuck
+      # test, not a slow one.
       set_tests_properties(${case} PROPERTIES TIMEOUT 15 LABELS ${CAPTURE_TEST_LABEL})
     endforeach()
   endfunction()

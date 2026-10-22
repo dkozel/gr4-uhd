@@ -1,7 +1,8 @@
 <!-- Copyright 2026 Jeff Long; SPDX-License-Identifier: MIT -->
 # capture/common — the two device block families
 
-The files here are device-neutral and their names stay in the namespace `capture`.
+The files in `common/include/capture/common/` are device-neutral and their names stay in the namespace `capture`.
+`Env.hpp` and `Threading.hpp` are the two utilities the device tiers lean on.
 `Ring.hpp` holds the drop-newest ring both directions stage samples in, every helper that
 reads or replaces one, the allocator its storage takes and the doorbell a consumer waits on;
 it depends on nothing. `Device.hpp` holds the parts a block needs
