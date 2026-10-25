@@ -28,6 +28,7 @@
 #include <uhd/types/metadata.hpp>
 #include <uhd/types/sensors.hpp>
 #include <uhd/types/time_spec.hpp>
+#include <uhd/version.hpp>
 #include <uhd/usrp/mboard_eeprom.hpp>
 
 #include <algorithm>
@@ -168,6 +169,12 @@ struct StreamStandIn : ::uhd::tx_streamer {
         return false;
     }
     void post_output_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+#if UHD_VERSION >= 4110000
+    /*| frame: a transmit streamer under UHD 4.11 has a pure virtual get_stream_info(), which
+            an earlier UHD does not declare. Each stand-in here answers it with no keys.
+    */
+    ::uhd::device_addr_t get_stream_info(const std::size_t) const override { return {}; }
+#endif
 };
 
 
@@ -202,6 +209,9 @@ struct RecordingStream : ::uhd::tx_streamer {
     }
     bool recv_async_msg(::uhd::async_metadata_t&, double) override { return false; }
     void post_output_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+#if UHD_VERSION >= 4110000
+    ::uhd::device_addr_t get_stream_info(const std::size_t) const override { return {}; }
+#endif
 };
 
 /*| role: a stand-in for a transmit streamer that places what it is handed and counts the data
@@ -223,6 +233,9 @@ struct CountingStream : ::uhd::tx_streamer {
     }
     bool recv_async_msg(::uhd::async_metadata_t&, double) override { return false; }
     void post_output_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+#if UHD_VERSION >= 4110000
+    ::uhd::device_addr_t get_stream_info(const std::size_t) const override { return {}; }
+#endif
 };
 
 /*| role: the two ends a graph gives a device block under test, a feed of zeros and a drain.
@@ -350,6 +363,9 @@ struct BurstStream : ::uhd::tx_streamer {
     }
     bool recv_async_msg(::uhd::async_metadata_t&, double) override { return false; }
     void post_output_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+#if UHD_VERSION >= 4110000
+    ::uhd::device_addr_t get_stream_info(const std::size_t) const override { return {}; }
+#endif
 
     std::vector<Send> sends() const {
         std::lock_guard lock(mutex);

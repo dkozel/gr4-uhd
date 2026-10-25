@@ -23,6 +23,7 @@
 #include <uhd/types/metadata.hpp>
 #include <uhd/types/ranges.hpp>
 #include <uhd/types/time_spec.hpp>
+#include <uhd/version.hpp>
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -241,6 +242,12 @@ struct StampedStream : ::uhd::rx_streamer {
     }
     void issue_stream_cmd(const ::uhd::stream_cmd_t&) override {}
     void post_input_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+#if UHD_VERSION >= 4110000
+    /*| frame: UHD 4.11 declares get_stream_info() on both streamers as pure virtual, and an
+            earlier UHD lacks it. Every stand-in in this file answers it with no keys.
+    */
+    ::uhd::device_addr_t get_stream_info(const std::size_t) const override { return {}; }
+#endif
 };
 
 /*| role: what one run of the source's consumer loop over a stamped stand-in counted: the
@@ -315,6 +322,9 @@ struct TwoChannelStream : ::uhd::rx_streamer {
     }
     void issue_stream_cmd(const ::uhd::stream_cmd_t&) override {}
     void post_input_action(const std::shared_ptr<::uhd::rfnoc::action_info>&, const std::size_t) override {}
+#if UHD_VERSION >= 4110000
+    ::uhd::device_addr_t get_stream_info(const std::size_t) const override { return {}; }
+#endif
 };
 
 /*| role: the source with its lifecycle state set to RUNNING by hand, so its consumer loop
