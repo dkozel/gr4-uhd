@@ -125,6 +125,8 @@ struct TruthStandIn {
     std::string                           get_tx_antenna(std::size_t channel) const { return channel == 1UZ ? "RX2" : "TX/RX"; }
     ::uhd::freq_range_t                   get_rx_freq_range(std::size_t) const { return ::uhd::freq_range_t(48.75e6, 2201.25e6, 0.0); }
     ::uhd::freq_range_t                   get_tx_freq_range(std::size_t) const { return ::uhd::freq_range_t(48.75e6, 2201.25e6, 0.0); }
+    ::uhd::freq_range_t                   get_fe_rx_freq_range(std::size_t) const { return ::uhd::freq_range_t(50.0e6, 2200.0e6, 0.0); }
+    ::uhd::freq_range_t                   get_fe_tx_freq_range(std::size_t) const { return ::uhd::freq_range_t(50.0e6, 2200.0e6, 0.0); }
     ::uhd::meta_range_t                   get_rx_bandwidth_range(std::size_t) const { return ::uhd::meta_range_t(0.2e6, 56.0e6, 0.0); }
     ::uhd::meta_range_t                   get_tx_bandwidth_range(std::size_t) const { return ::uhd::meta_range_t(0.2e6, 56.0e6, 0.0); }
     double                                get_rx_bandwidth(std::size_t) const { return bandwidth(); }
@@ -379,6 +381,14 @@ std::string stderrOf(Calls&& calls) {
     }
     std::fclose(capture);
     return text;
+}
+
+/*| role: a handle that stands for an open device and is never called. A case that holds it
+        reaches the paths a null handle ends, and drops it before the block goes.
+*/
+::uhd::usrp::multi_usrp::sptr placeholderHandle() {
+    auto device = std::make_shared<int>(0);
+    return ::uhd::usrp::multi_usrp::sptr(device, reinterpret_cast<::uhd::usrp::multi_usrp*>(device.get()));
 }
 
 } // namespace
@@ -2677,6 +2687,222 @@ int main(int argc, char** argv) {
         expect(source.rx_antennae->front() == "TX/RX") << "and stages nothing, the last connector included";
         source._deviceUp.store(false);
         expect(!source.setControl("ANTENNA", 0.0)) << "a block that is down stages nothing";
+    });
+
+    cases("controls.uhd-the-lo-offset-control-writes-through-its-setting", [] {
+        /*| frame: a source at 2 MS/s whose device is up with no handle behind it, as for the
+                overall gain. A tune that asks the device for a write finds no handle and is
+                refused.
+        */
+        constexpr double     kRate = 2.0e6;
+        capture::uhd::Source source{};
+        source._rateActualHz = kRate;
+        source._deviceUp.store(true);
+        expect(source.setControl("LO_OFFSET", kRate / 4.0 / 1e6)) << "a block with no center yet takes the offset";
+        std::ignore = source.settings().applyStagedParameters();
+        expect(source.lo_offset.value == kRate / 4.0) << "and lo_offset carries it in hertz";
+        expect(source.setControl("LO_OFFSET", 10.0 * kRate / 1e6));
+        std::ignore = source.settings().applyStagedParameters();
+        expect(source.lo_offset.value == kRate / 2.0) << "an offset past half the rate is written at that bound";
+
+        // A center the tuner holds under a quarter of the rate, with the coverage's top edge
+        // at the center plus that offset.
+        expect(source.setControl("LO_OFFSET", kRate / 4.0 / 1e6));
+        std::ignore               = source.settings().applyStagedParameters();
+        source._requestedFreqHz   = 6000.0e6;
+        source._freqRanges        = {{49.0e6, source._requestedFreqHz + kRate / 4.0}};
+        source._freqWrittenHz     = source._requestedFreqHz;
+        source._loOffsetWrittenHz = kRate / 4.0;
+        expect(source.setControl("LO_OFFSET", kRate / 4.0 / 1e6)) << "the offset in force is a tune the tuner holds";
+        expect(!source.setControl("LO_OFFSET", kRate / 2.0 / 1e6)) << "an offset that takes the frontend past the coverage is refused";
+        std::ignore = source.settings().applyStagedParameters();
+        expect(source.lo_offset.value == kRate / 4.0) << "and stages nothing";
+        expect(source.controlValue("LO_OFFSET") == std::optional<double>{kRate / 4.0 / 1e6}) << "while the control states the offset in force";
+        source._deviceUp.store(false);
+        expect(!source.setControl("LO_OFFSET", 0.0)) << "a block that is down stages nothing";
+    });
+
+    cases("controls.uhd-a-changed-lo-offset-retunes", [] {
+        /*| frame: a source that reads as streaming and holds no device. Its control thread is
+                not started, and a retune a settings pass posts stays queued. The tune a retune
+                makes is called directly, where a tune that asks the device for a write finds
+                no handle and is refused.
+        */
+        using capture::uhd::Source;
+        using Outcome = Source::TuneOutcome;
+        const std::vector<std::pair<double, double>> coverage{{49.0e6, 6001.0e6}};
+
+        Source src{};
+        src._deviceUp.store(true, std::memory_order_release);
+        gr::property_map changed{{"lo_offset", 3.0e6}};
+        gr::property_map forward{{"lo_offset", 3.0e6}};
+        src.settingsChanged({}, changed, forward);
+        expect(src._tuneRequests == 1U) << "a changed offset asks for a retune";
+        gr::property_map other{{"emit_timing_tags", false}};
+        gr::property_map otherForward{{"emit_timing_tags", false}};
+        src.settingsChanged({}, other, otherForward);
+        expect(src._tuneRequests == 1U) << "and a setting no tune reads asks for none";
+        src._deviceUp.store(false, std::memory_order_release);
+
+        // The synthesizer has to reach the center plus the offset.
+        constexpr double kRate = 8.0e6;
+        Source           edge{};
+        edge._freqRanges   = coverage;
+        edge._rateActualHz = kRate;
+        {
+            std::lock_guard lock(edge._ctrlMutex);
+            expect(edge.tuneWithOffsetLocked(6001.0e6 - kRate / 8.0, 0.0, kRate / 4.0, false) == Outcome::Refused) << "a center whose offset leaves the coverage is refused";
+        }
+        expect(edge._freqWrittenHz == std::nullopt && edge._loOffsetHz == 0.0) << "and the offset in force stays where it was";
+
+        // A tuner that holds a center under a quarter of the rate.
+        Source held{};
+        held._freqRanges        = coverage;
+        held._rateActualHz      = kRate;
+        held._freqWrittenHz     = 2440.0e6;
+        held._loOffsetWrittenHz = kRate / 4.0;
+        held._loOffsetHz        = kRate / 4.0;
+        std::lock_guard lock(held._ctrlMutex);
+        expect(held.tuneWithOffsetLocked(2440.0e6, 0.0, kRate / 4.0, false) == Outcome::Held) << "the center and the offset in force write nothing";
+        expect(held.tuneWithOffsetLocked(2440.0e6, 0.0, kRate / 8.0, false) == Outcome::Refused) << "a changed offset is a write of its own, which no handle takes";
+        expect(held._loOffsetHz == kRate / 4.0) << "and the offset in force stays";
+
+        // The bound follows the rate in force: one setting, two rates.
+        expect(held.tuneWithOffsetLocked(2440.0e6, 0.0, 10.0 * kRate, false) == Outcome::Refused) << "an offset past half the rate asks for a write at half the rate";
+        held._rateActualHz = kRate / 2.0;
+        expect(held.tuneWithOffsetLocked(2440.0e6, 0.0, 10.0 * kRate, false) == Outcome::Held) << "and at half that rate it is bounded onto the offset in force";
+    });
+
+    cases("controls.uhd-a-start-fails-on-a-refused-tune", [] {
+        /*| frame: the frequency applier of a start, on a source holding a placeholder handle.
+                A tune the coverage refuses calls no device, and neither does a tune the tuner
+                already holds.
+        */
+        constexpr double                             kRate = 8.0e6;
+        const std::vector<std::pair<double, double>> coverage{{49.0e6, 6001.0e6}};
+        const double                                 top = coverage.front().second;
+
+        capture::uhd::Source refused{};
+        refused._usrp         = placeholderHandle();
+        refused._freqRanges   = coverage;
+        refused._rateActualHz = kRate;
+        refused.frequency     = std::vector<double>{top - kRate / 8.0};
+        refused.lo_offset     = kRate / 4.0;
+        expect(refused.applyFrequency() == "uhd: the center frequency was refused") << "a center whose offset leaves the coverage fails the start";
+        expect(refused.frequency.value == std::vector<double>{top - kRate / 8.0}) << "and frequency keeps the request for the next start";
+        refused._usrp.reset();
+
+        capture::uhd::Source held{};
+        held._usrp              = placeholderHandle();
+        held._freqRanges        = coverage;
+        held._rateActualHz      = kRate;
+        held._freqWrittenHz     = 2440.0e6;
+        held._loOffsetWrittenHz = kRate / 4.0;
+        held._appliedFreqHz     = 2440.0e6;
+        held.frequency          = std::vector<double>{2440.0e6};
+        held.lo_offset          = kRate / 4.0;
+        expect(held.applyFrequency().empty()) << "a tune the tuner holds starts";
+        expect(held._requestedFreqHz == 2440.0e6) << "and becomes the request a control path retunes from";
+        held._usrp.reset();
+    });
+
+    cases("controls.uhd-a-refused-retune-keeps-the-held-request", [] {
+        /*| frame: a source holding a placeholder handle, a center and no offset. A retune the
+                coverage refuses calls no device. The LO_OFFSET write after it runs with the
+                handle dropped, where a tune that asks for a write is refused.
+        */
+        constexpr double                             kRate = 8.0e6;
+        const std::vector<std::pair<double, double>> coverage{{49.0e6, 6001.0e6}};
+        const double                                 heldHz = 2440.0e6;
+        const double                                 refusedHz = coverage.front().second - kRate / 8.0;
+
+        capture::uhd::Source src{};
+        src._usrp              = placeholderHandle();
+        src._deviceUp.store(true);
+        src._freqRanges        = coverage;
+        src._rateActualHz      = kRate;
+        src._requestedFreqHz   = heldHz;
+        src._freqWrittenHz     = heldHz;
+        src._loOffsetWrittenHz = 0.0;
+        src._appliedFreqHz     = heldHz;
+        src.retune(1U, refusedHz, 0.0, kRate / 4.0);
+        expect(src._requestedFreqHz == heldHz) << "a retune the coverage refuses leaves the request on the held center";
+        expect(src._loOffsetHz == 0.0) << "and the offset in force where it was";
+
+        src._usrp.reset();
+        expect(src.setControl("LO_OFFSET", 0.0)) << "an offset write then tunes the held center, which needs no write";
+        expect(src._freqWrittenHz == std::optional<double>{heldHz}) << "and the tuner stays on it";
+        src._deviceUp.store(false);
+    });
+
+    cases("controls.uhd-the-lo-offset-default-is-the-offset-in-force", [] {
+        constexpr double            kRate = 2.0e6;
+        capture::uhd::DeviceTruth   t;
+        const capture::TruthContext ctx{.deviceParams = {}, .sampleRate = kRate, .centerFreq = 0.0};
+        const auto defaultAt = [&t, &ctx](double offsetHz) {
+            for (const auto& c : capture::uhd::Source::describeControls(t, ctx, 0.0, std::nullopt, {}, 1UZ, offsetHz)) {
+                if (c.id == "LO_OFFSET") {
+                    return std::optional<double>{c.defValue};
+                }
+            }
+            return std::optional<double>{};
+        };
+        expect(defaultAt(0.0) == std::optional<double>{0.0}) << "no offset defaults to zero";
+        expect(defaultAt(kRate / 4.0) == std::optional<double>{kRate / 4.0 / 1e6}) << "an offset in force is the default, in MHz";
+        expect(defaultAt(-kRate) == std::optional<double>{-kRate / 2.0 / 1e6}) << "inside the descriptor's own bound";
+
+        // A running block publishes the offset its control took.
+        capture::uhd::Source source{};
+        source._rateActualHz = kRate;
+        source.publishSurfaceLocked();
+        source._deviceUp.store(true);
+        expect(source.setControl("LO_OFFSET", kRate / 4.0 / 1e6)) << "a block with no center yet takes the offset";
+        double shown = 0.0;
+        for (const auto& c : source.controlSurface()) {
+            if (c.id == "LO_OFFSET") {
+                shown = c.defValue;
+            }
+        }
+        expect(shown == kRate / 4.0 / 1e6) << "and its surface defaults LO_OFFSET to it";
+        source._deviceUp.store(false);
+    });
+
+    cases("controls.uhd-an-offset-past-the-frontend-is-refused", [] {
+        /*| frame: an overall coverage that reaches 16 MHz past the frontend's own at each end,
+                as a B205mini's does on a wide filter.
+        */
+        using capture::uhd::tuneFrequencyFor;
+        const std::vector<std::pair<double, double>> overall{{34.0e6, 6016.0e6}};
+        const std::vector<std::pair<double, double>> frontend{{50.0e6, 6000.0e6}};
+        constexpr double                             kOffset = 1.0e6;
+        const double                                 center  = frontend.front().second - kOffset / 2.0;
+
+        expect(!tuneFrequencyFor(center, 0.0, overall, kOffset, frontend).has_value()) << "a frontend past its own top is refused";
+        expect(tuneFrequencyFor(center, 0.0, overall, -kOffset, frontend) == std::optional<double>{center}) << "the same center with the frontend below it tunes";
+        expect(tuneFrequencyFor(center, 0.0, overall, kOffset) == std::optional<double>{center}) << "and with no frontend coverage stated the overall one decides";
+        expect(tuneFrequencyFor(frontend.front().second + kOffset, 0.0, overall, 0.0, frontend).has_value()) << "a center with no offset is UHD's to place";
+
+        // The source tests its tunes against the frontend coverage its record states. Its
+        // marks say the tuner took that center and that offset, which UHD reports for a
+        // frontend it held at its end.
+        capture::uhd::Source src{};
+        src._freqRanges               = overall;
+        src._openTruth.frontendRanges = frontend;
+        src._rateActualHz             = 2.0 * kOffset;
+        src._freqWrittenHz            = center;
+        src._loOffsetWrittenHz        = kOffset;
+        std::lock_guard lock(src._ctrlMutex);
+        expect(src.tuneWithOffsetLocked(center, 0.0, kOffset, false) == capture::uhd::Source::TuneOutcome::Refused) << "the source refuses the offset";
+        expect(src._loOffsetHz == 0.0) << "and keeps the offset in force";
+    });
+
+    cases("controls.uhd-the-filter-widens-by-the-lo-offset", [] {
+        using capture::uhd::offsetBandwidthFor;
+        constexpr double kRate = 2.0e6, kMin = 0.2e6, kMax = 56.0e6;
+        expect(offsetBandwidthFor(kRate, 0.0, kMin, kMax) == capture::uhd::bandwidthFor(kRate, kMin, kMax)) << "no offset asks for the rate";
+        expect(offsetBandwidthFor(kRate, kRate / 2.0, kMin, kMax) == 2.0 * kRate) << "an offset of half the rate asks for twice the rate";
+        expect(offsetBandwidthFor(kRate, -kRate / 2.0, kMin, kMax) == 2.0 * kRate) << "on either side";
+        expect(offsetBandwidthFor(kMax, kMax / 2.0, kMin, kMax) == kMax) << "inside the range the device states";
     });
 
     cases("controls.uhd-refuses-an-antenna-the-unit-does-not-offer", [] {

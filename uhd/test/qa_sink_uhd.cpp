@@ -599,6 +599,14 @@ void expectBurstSends(std::string_view scenario, const std::vector<BurstStream::
     }
 }
 
+/*| role: a non-null device handle that no call goes through. It lets a case pass the
+        checks for a missing device. The case resets it before the sink is destroyed.
+*/
+::uhd::usrp::multi_usrp::sptr placeholderHandle() {
+    auto device = std::make_shared<int>(0);
+    return ::uhd::usrp::multi_usrp::sptr(device, reinterpret_cast<::uhd::usrp::multi_usrp*>(device.get()));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1101,6 +1109,70 @@ int main(int argc, char** argv) {
             }
         }
         expect(insideRange) << "nothing reaches the device outside the range it states, over the whole span";
+    });
+
+    cases("sink.uhd-tunes-with-the-lo-offset", [] {
+        using capture::uhd::Sink;
+        const std::vector<std::pair<double, double>> coverage{{49.0e6, 6001.0e6}};
+
+        expect(capture::uhd::boundedLoOffsetHz(10.0e6, 8.0e6) == 4.0e6) << "an offset past half the rate is held at the band edge";
+        expect(capture::uhd::boundedLoOffsetHz(-3.0e6, 8.0e6) == -3.0e6) << "an offset inside the band stands as it is";
+
+        // The synthesizer has to reach the center plus the offset, and a center inside the
+        // coverage whose offset takes the synthesizer past its edge is refused.
+        Sink edge{};
+        edge._freqRanges   = coverage;
+        edge._rateActualHz = 8.0e6;
+        edge.frequency     = std::vector<double>{6000.0e6};
+        edge.lo_offset     = 2.0e6;
+        expect(!edge.applyFrequencyLocked()) << "a center whose offset leaves the coverage is refused";
+        expect(edge._freqWrittenHz == std::nullopt) << "and nothing is written for it";
+
+        // A replay of the center and the offset in force writes nothing, and a new offset with
+        // the same center asks for a write: with no device to take it, the tune is refused.
+        Sink replayed{};
+        replayed._freqRanges        = coverage;
+        replayed._rateActualHz      = 8.0e6;
+        replayed.frequency          = std::vector<double>{2440.0e6};
+        replayed.lo_offset          = 2.0e6;
+        replayed._freqWrittenHz     = 2440.0e6;
+        replayed._loOffsetWrittenHz = 2.0e6;
+        replayed._appliedRequestHz  = 2440.0e6;
+        expect(replayed.applyFrequencyLocked()) << "the center and the offset in force write nothing";
+        replayed.lo_offset = 3.0e6;
+        expect(!replayed.applyFrequencyLocked()) << "a changed offset is a write of its own";
+
+        // A frontend never given an offset holds none: zero against nothing written is a replay.
+        Sink none{};
+        none._freqRanges       = coverage;
+        none._rateActualHz     = 8.0e6;
+        none.frequency         = std::vector<double>{2440.0e6};
+        none._freqWrittenHz    = 2440.0e6;
+        none._appliedRequestHz = 2440.0e6;
+        expect(none.applyFrequencyLocked()) << "an offset of zero asks for no write of its own";
+
+        // A running sink's settings hook takes lo_offset as a tune input. The sink holds a
+        // placeholder handle, and a staged center sits 1 MHz below the center in force. The
+        // offset takes the frontend past the coverage's top edge, and the refused tune writes
+        // the center in force back into frequency.
+        Sink running{};
+        running._usrp = placeholderHandle();
+        running._deviceUp.store(true);
+        running._freqRanges       = coverage;
+        running._rateActualHz     = 8.0e6;
+        running._appliedRequestHz = coverage.front().second - 1.0e6;
+        running.frequency         = std::vector<double>{running._appliedRequestHz - 1.0e6};
+        running.lo_offset         = 3.0e6;
+        gr::property_map other{{"thread_priority", 0.0}};
+        gr::property_map otherForward{{"thread_priority", 0.0}};
+        running.settingsChanged({}, other, otherForward);
+        expect(running.frequency.value == std::vector<double>{running._appliedRequestHz - 1.0e6}) << "a setting no tune reads leaves frequency alone";
+        gr::property_map changed{{"lo_offset", 3.0e6}};
+        gr::property_map forward{{"lo_offset", 3.0e6}};
+        running.settingsChanged({}, changed, forward);
+        expect(running.frequency.value == std::vector<double>{running._appliedRequestHz}) << "a changed offset tunes, and the refused tune writes the center in force back";
+        running._usrp.reset();
+        running._deviceUp.store(false);
     });
 
     cases("sink.uhd-states-the-frequency-the-caller-asked-for", [] {

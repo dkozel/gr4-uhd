@@ -85,6 +85,11 @@ struct DeviceTruth {
     std::vector<std::string>               antennas;
     std::string                            antenna; // current selection at probe time
     std::vector<std::pair<double, double>> freqRanges;
+    /*| frame: the coverage of the RF frontend alone, without the reach of the digital
+            converter that freqRanges adds. A tune under an LO offset is tested against it.
+        measured: a B205mini states 50 MHz to 6 GHz.
+    */
+    std::vector<std::pair<double, double>> frontendRanges;
     /*| frame: the analog filter range and the width in force. Equal ends are a fixed filter,
             which takes no write: the width the device came up with is the width it keeps.
         measured: 200 kHz to 56 MHz on a B205mini; 40 MHz to 40 MHz on a WBX.
@@ -228,8 +233,9 @@ struct DeviceTruth {
 };
 
 /*| frame: what a running block's control surface is computed from: the record of the open
-        device, the rate in force and the width the analog filter holds. A block publishes
-        these through a Snapshot, and its controlSurface() reads them from there.
+        device, the rate in force, the width the analog filter holds and the LO offset in
+        force. A block publishes these through a Snapshot, and its controlSurface() reads
+        them from there.
 */
 struct SurfaceValues {
     DeviceTruth truth;
@@ -238,6 +244,7 @@ struct SurfaceValues {
     double      clockHz    = 0.0; // the master clock in force, zero where UHD chooses
     std::string wireFormat = "sc16";
     std::size_t channelCount = 1UZ; // the channels one streamer carries
+    double      loOffsetHz   = 0.0; // the LO offset in force
 };
 
 /*| contract: a value may be put into a device string only where it carries neither the
@@ -368,10 +375,26 @@ inline std::string validWireFormat(const std::string& wanted) { return std::rang
 */
 inline double tunedFrequencyFrom(double heldHz, double ppm) { return heldHz * capture::referenceScale(ppm); }
 
+/*| contract: an LO offset bounded to half the rate either side, the band the host sees. A
+        rate that is not a positive number leaves no bound to apply, and an offset that is
+        not a number answers zero.
+    why: ControlDesc states the bound as the family's as well as the caller's, and a caller
+        holding a block directly applies none.
+    verified-by: controls.uhd-bounds-the-lo-offset
+*/
+inline double boundedLoOffsetHz(double offsetHz, double rateHz) {
+    if (offsetHz != offsetHz || !(rateHz > 0.0)) { // a value that is not a number fails the first test
+        return offsetHz == offsetHz ? offsetHz : 0.0;
+    }
+    const double edge = rateHz / 2.0;
+    return std::clamp(offsetHz, -edge, edge);
+}
+
 /*| contract: the frequency to hand the tuner for a request, where the coverage the device
         states holds it, and nothing where no range does. The correction is folded in first,
         because the tuner has to reach the scaled value. loOffsetHz moves the RF frontend away
-        from the center, and zero moves it nowhere.
+        from the center, and zero moves it nowhere. The frontend under an offset is tested
+        against frontendRanges, or against ranges where those are empty.
     why: refused and not clamped. UHD coerces a request past an edge to the nearest frequency
         it reaches and reports success: a 40 MHz request on a radio whose coverage starts at
         49 MHz tunes 49 MHz.
@@ -388,15 +411,21 @@ inline double tunedFrequencyFrom(double heldHz, double ppm) { return heldHz * ca
     measured: a B205mini states 49 to 6001 MHz at 2 MS/s and 42 to 6008 MHz at 16 MS/s.
     verified-by: controls.uhd-frequency-out-of-range-refused
 */
-inline std::optional<double> tuneFrequencyFor(double requestHz, double ppm, std::span<const std::pair<double, double>> ranges, double loOffsetHz = 0.0) {
+inline std::optional<double> tuneFrequencyFor(double requestHz, double ppm, std::span<const std::pair<double, double>> ranges, double loOffsetHz = 0.0,
+                                              std::span<const std::pair<double, double>> frontendRanges = {}) {
     const auto center = frequencyInRange(capture::correctedTuneHz(requestHz, ppm), ranges);
     if (!center.has_value() || loOffsetHz == 0.0) {
         return center;
     }
-    /*| trap: with an LO offset the synthesizer has to reach the center plus the offset, and
-            that frequency is tested as well.
+    /*| trap: with an LO offset the synthesizer has to reach the center plus the offset. The
+            overall coverage reaches past the frontend's own. UHD holds a frontend asked past
+            its end at that end and lets the digital converter cover the rest, which shrinks the
+            offset in force.
+        measured: a B205mini at 2 MS/s asked for 5999.5 MHz under a 1 MHz offset lands the
+            center with its frontend at 6 GHz, an offset of 0.5 MHz.
+        verified-by: controls.uhd-an-offset-past-the-frontend-is-refused
     */
-    return frequencyInRange(*center + loOffsetHz, ranges).has_value() ? center : std::nullopt;
+    return frequencyInRange(*center + loOffsetHz, frontendRanges.empty() ? ranges : frontendRanges).has_value() ? center : std::nullopt;
 }
 
 /*| contract: the device address to open with: the caller's own selector, plus the master clock
@@ -1313,6 +1342,11 @@ void readTruthInto(Usrp& usrp, DeviceTruth& truth, Direction dir, std::size_t ch
         }
     });
     readOptional([&] {
+        for (const auto& r : rx ? usrp.get_fe_rx_freq_range(channel) : usrp.get_fe_tx_freq_range(channel)) {
+            truth.frontendRanges.emplace_back(r.start(), r.stop());
+        }
+    });
+    readOptional([&] {
         const auto bw = rx ? usrp.get_rx_bandwidth_range(channel) : usrp.get_tx_bandwidth_range(channel);
         truth.bwMinHz = bw.start();
         truth.bwMaxHz = bw.stop();
@@ -2145,6 +2179,20 @@ inline std::vector<ControlDesc> gainElementControls(const DeviceTruth& t) {
     verified-by: sink.uhd-antenna-and-bandwidth
 */
 inline double bandwidthFor(double rateHz, double minHz, double maxHz) { return maxHz > minHz ? std::clamp(rateHz, minHz, maxHz) : rateHz; }
+
+/*| contract: the analog filter width to ask for at a rate under an LO offset: the rate plus
+        twice the offset's size, inside the range the device states. An offset of zero asks
+        for the rate.
+    why: the filter is centered on the RF frontend, and the band the host streams sits the
+        offset away from it.
+    measured: a B205mini at 2 MS/s and 915 MHz, on its terminated port at 70 dB, with a 2 MHz
+        filter. Under a 1 MHz offset the noise floor of the half band away from the frontend
+        fell 2.6 to 9.3 dB against no offset. With a 4 MHz filter it sat within 1.2 dB of the
+        floor with no offset, outside the two bins beside the center, where the run with no
+        offset carries the DC spur.
+    verified-by: controls.uhd-the-filter-widens-by-the-lo-offset
+*/
+inline double offsetBandwidthFor(double rateHz, double loOffsetHz, double minHz, double maxHz) { return bandwidthFor(rateHz + 2.0 * std::abs(loOffsetHz), minHz, maxHz); }
 
 /*| contract: the BANDWIDTH control for the analog filter truth states, in MHz, or nothing for
         a fixed filter. heldBandwidthHz above zero carries the width the filter holds on a

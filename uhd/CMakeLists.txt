@@ -97,6 +97,10 @@ if(CAPTURE_UHD_FOUND)
           controls.uhd-an-unstarted-source-states-the-ladder-of-its-staged-format
           controls.uhd-a-wait-for-room-ends-at-the-consume-or-the-bound
           controls.uhd-states-the-antennas-the-unit-names controls.uhd-the-antenna-writes-through-its-setting
+          controls.uhd-the-lo-offset-control-writes-through-its-setting controls.uhd-a-changed-lo-offset-retunes
+          controls.uhd-a-start-fails-on-a-refused-tune controls.uhd-a-refused-retune-keeps-the-held-request
+          controls.uhd-the-lo-offset-default-is-the-offset-in-force controls.uhd-an-offset-past-the-frontend-is-refused
+          controls.uhd-the-filter-widens-by-the-lo-offset
           controls.uhd-refuses-an-antenna-the-unit-does-not-offer
     LIBS ${CAPTURE_GR4} ${CAPTURE_UHD_LIB}
     INCLUDES ${CAPTURE_UHD_INCLUDE})
@@ -114,6 +118,7 @@ if(CAPTURE_UHD_FOUND)
           sink.uhd-listing-pairs-are-the-sources
           sink.uhd-refuses-a-rate-that-is-not-a-positive-number
           sink.uhd-bounds-the-transmit-gain-at-the-device
+          sink.uhd-tunes-with-the-lo-offset
           sink.uhd-states-the-frequency-the-caller-asked-for
           sink.uhd-every-control-it-describes-it-writes
           sink.uhd-the-buffers-outlive-the-threads
@@ -194,7 +199,10 @@ if(CAPTURE_HW_UHD AND CAPTURE_UHD_FOUND)
       uhd.sensor-sweep-beside-a-stream
       uhd.overflow-under-a-stalled-consumer uhd.teardown-and-restart uhd.corrections
       uhd.correction-defaults uhd.device-string-keys uhd.clock-and-time-source
-      uhd.reference-lock-wait uhd.lo-offset uhd.device-time uhd.device-time-source uhd.device-time-from-gps
+      uhd.reference-lock-wait uhd.lo-offset uhd.lo-offset-setting-moves-the-receive-frontend
+      uhd.tx-lo-offset-setting-moves-the-transmit-frontend uhd.lo-offset-control-survives-a-retune-and-a-restart
+      uhd.lo-offset-past-the-frontend-fails-the-start
+      uhd.device-time uhd.device-time-source uhd.device-time-from-gps
       uhd.device-time-set-midstream uhd.tag-time-after-a-stall uhd.property-tree-link-rate
       uhd.rate-change-midstream uhd.a-drain-at-the-top-rate-ends-by-duration uhd.accessors-after-a-stop uhd.stop-latency
       uhd.coverage-past-the-stated-range uhd.vendor-agc-claim

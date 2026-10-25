@@ -263,6 +263,30 @@ reading then states the frame alone.
   34 MHz on the 56 MHz filter it comes up with. Both blocks test a tune against the coverage read
   at the rate and the filter in force, read it again after a filter write, and state it in the
   truth record; the probe writes the rate and the filter the block will write before it reads.
+- Each block's `lo_offset` setting, in hertz, tunes the RF frontend that far from the center
+  with `tune_request_t(f, offset)`, and the digital converter shifts the band back. A positive
+  offset puts the frontend above the center. An offset of zero tunes with `tune_request_t(f)`,
+  and UHD places the frontend. Every tune bounds the offset to half the rate in force either
+  side, through `boundedLoOffsetHz()` in `Device.hpp`. It tests the center against the coverage
+  and the center plus the bounded offset against the frontend's own coverage, which the truth
+  record reads from `get_fe_rx_freq_range` or `get_fe_tx_freq_range`. The overall coverage
+  reaches past the frontend's, and UHD holds a frontend asked past its end at that end: a
+  B205mini at 2 MS/s asked for 5999.5 MHz under a 1 MHz offset holds its frontend at 6 GHz.
+- The analog filter a start sets from the rate is the rate plus twice the bounded `lo_offset`
+  (`offsetBandwidthFor()` in `Device.hpp`), inside the stated range. A tune that moves the
+  offset writes the filter for the new offset, until a `BANDWIDTH` write takes the filter over
+  for the rest of the run. The filter is centered on the frontend: on a B205mini at 2 MS/s
+  under a 1 MHz offset, a 2 MHz filter takes up to 9 dB off the half band away from the
+  frontend, and a 4 MHz filter holds it within 1.2 dB outside the two bins beside the center.
+- A running block refuses a rate write, and its start bounds the offset after the rate write.
+  A start whose tune the coverage or the device refuses fails, on either block. A change of
+  `lo_offset` retunes a running block: the sink in its settings hook, the source on its control
+  thread. Each source retune carries the setting's offset with the center. A tune the coverage
+  or the device refuses leaves the offset in force where it was, and a refused source retune
+  leaves the request the control paths retune from where it was. The source's `LO_OFFSET`
+  descriptor defaults to the offset in force. The `LO_OFFSET` control, in MHz, retunes at once
+  and answers false for a refused tune. It writes the offset it took into `lo_offset`, and a
+  later settings sweep tunes under that offset.
 - The transmit queue's floor is the larger of eight of the streamer's own maximum send and
   4096 samples. The floor binds at and below four times that floor, which is 65280 S/s for a
   B205mini's 2040 samples and 16384 S/s for a streamer whose eight sends stay under 4096; a

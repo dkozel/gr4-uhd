@@ -148,9 +148,9 @@ private:
         trigger_name where tag_interval has passed, stamped with the time the device stamped
         its first sample. The first block after a gap carries rx_overflow with the cause in
         rx_overflow_cause. The first sample a retune reaches carries the new frequency.
-    contract: frequency, frequency_correction, rx_gains, gain_mode and rx_antennae reach a
-        streaming device on the block's control thread, one write at a time in the order
-        given. sample_rate, channels, wire_format, master_clock_rate, clock_source and
+    contract: frequency, frequency_correction, lo_offset, rx_gains, gain_mode and rx_antennae
+        reach a streaming device on the block's control thread, one write at a time in the
+        order given. sample_rate, channels, wire_format, master_clock_rate, clock_source and
         time_source are fixed while the block runs, and a write of one is refused. subdev, the
         three transport sizes and the thread placement are read by start() alone, and a write
         applies at the next start. The three tag settings apply from the next block.
@@ -201,6 +201,19 @@ environment.)">;
     gr::Annotated<std::vector<double>, "rx_gains", gr::Unit<"dB">, gr::Visible, gr::Doc<"overall RX gain">>       rx_gains  = std::vector<double>{35.0};
     gr::Annotated<bool, "gain_mode", gr::Doc<"hardware AGC on/off">>                             gain_mode = false;
     gr::Annotated<double, "frequency_correction", gr::Unit<"ppm">, gr::Doc<"applied as a scaled tune">>           frequency_correction = 0.0;
+    /*| contract: the RF frontend tunes this far from the center, and the digital converter
+            shifts the band back. A positive offset puts the frontend above the center. The LO
+            spur then sits off the center by the offset. Zero lets UHD place the frontend. Each
+            tune bounds the offset to half the rate in force either side. The analog filter the
+            start sets from the rate widens by twice the offset in force. A change retunes the
+            running stream. A start whose tune the coverage refuses fails. A later tune the
+            coverage refuses keeps the earlier offset in force, and the setting keeps the
+            request. The LO_OFFSET control writes this setting.
+        verified-by: controls.uhd-a-changed-lo-offset-retunes
+        verified-by: controls.uhd-the-lo-offset-control-writes-through-its-setting
+        verified-by: uhd.lo-offset-setting-moves-the-receive-frontend
+    */
+    gr::Annotated<double, "lo_offset", gr::Unit<"Hz">, gr::Doc<"RF frontend offset from the center">> lo_offset = 0.0;
     gr::Annotated<std::vector<std::string>, "rx_antennae", gr::Doc<"receive connector per listed channel, or one for all">> rx_antennae;
     gr::Annotated<bool, "emit_timing_tags", gr::Doc<"emit wall-clock timing tags">>                               emit_timing_tags = true;
     gr::Annotated<float, "tag_interval", gr::Unit<"s">, gr::Doc<"minimum interval between timing tags">>          tag_interval     = 1.0f;
@@ -246,7 +259,7 @@ environment.)">;
     gr::Annotated<double, "thread_priority", gr::Doc<"receive thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
     gr::Annotated<double, "cpu", gr::Doc<"receive thread's processor; -1 keeps the system's choice">>             cpu               = -1.0;
 
-    GR_MAKE_REFLECTABLE(Source, out, out2, device, device_parameter, sample_rate, frequency, rx_gains, gain_mode, frequency_correction, rx_antennae, emit_timing_tags, tag_interval, trigger_name, subdev, channels, wire_format, clock_source, time_source, master_clock_rate, recv_frame_size, num_recv_frames, recv_buff_size, thread_priority, cpu);
+    GR_MAKE_REFLECTABLE(Source, out, out2, device, device_parameter, sample_rate, frequency, rx_gains, gain_mode, frequency_correction, lo_offset, rx_antennae, emit_timing_tags, tag_interval, trigger_name, subdev, channels, wire_format, clock_source, time_source, master_clock_rate, recv_frame_size, num_recv_frames, recv_buff_size, thread_priority, cpu);
 
     ::uhd::usrp::multi_usrp::sptr _usrp;
     ::uhd::rx_streamer::sptr      _stream;
@@ -341,12 +354,14 @@ environment.)">;
     std::atomic<std::uint64_t>  _dropped{0}; // samples the radio shed, from the stream's own stamps
     /*| frame: what the open device said about itself, read once by start(). The same record a
             caller probes while stopped, so the block's own answers and a probe's agree.
-        invariant: guarded by _ctrlMutex. Every write of it, of _rateActualHz and of _bwCurHz
-            is followed by publishSurfaceLocked() under the same lock.
+        invariant: guarded by _ctrlMutex. Every write of it, of _rateActualHz and of _bwCurHz,
+            and every change of the offset in force, is followed by publishSurfaceLocked() under
+            the same lock.
     */
     DeviceTruth              _openTruth;
     double                      _bwMinHz = 0.0, _bwMaxHz = 0.0; // analog filter range (read at start)
     double                      _bwCurHz = 0.0;                 // what the filter holds, read at start and after every write
+    bool                        _filterFollowsRate = false;     // the start set the filter from the rate and no BANDWIDTH write moved it, guarded by _ctrlMutex
     std::vector<std::pair<double, double>> _freqRanges;         // tuner coverage at the rate in force
     double                      _appliedFreqHz = 0.0;           // the frequency the tuner holds, in the frame a caller asks in
     /*| frame: the request and the correction the frequency applier last worked from, guarded
@@ -426,11 +441,14 @@ environment.)">;
 
     std::vector<ControlDesc> controlSurface() {
         const SurfaceValues v = _surfaceValues.read();
-        return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0, .gainMode = _surfaceAgc.load(std::memory_order_acquire)}, v.filterHz, v.clockHz, v.wireFormat, v.channelCount);
+        return describeControls(v.truth, {.deviceParams = {}, .sampleRate = v.rateHz, .centerFreq = 0.0, .gainMode = _surfaceAgc.load(std::memory_order_acquire)}, v.filterHz, v.clockHz, v.wireFormat, v.channelCount,
+                                v.loOffsetHz);
     }
 
     /*| contract: called with _ctrlMutex held, or by start() before the device is up. */
-    void publishSurfaceLocked() { _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz.value_or(0.0), .wireFormat = _wireFormat, .channelCount = _channels.size()}); }
+    void publishSurfaceLocked() {
+        _surfaceValues.publish({.truth = _openTruth, .rateHz = _rateActualHz, .filterHz = _bwCurHz, .clockHz = _clockInForceHz.value_or(0.0), .wireFormat = _wireFormat, .channelCount = _channels.size(), .loOffsetHz = _loOffsetHz});
+    }
 
     /*| contract: the value one non-gain control holds, in the unit its descriptor states: the
             filter the device settled on, the LO offset tuned with, the device-clock tagging,
@@ -735,22 +753,8 @@ environment.)">;
     // The rates to offer a caller for the radio a probe described, ascending.
     static std::vector<double> sampleRatesFor(const DeviceTruth& t, std::string_view wireFormat = "sc16", std::size_t channelCount = 1UZ) { return capture::uhd::sampleRatesFor(t, wireFormat, channelCount); }
 
-    /*| contract: the LO offset to apply, in Hz, bounded by half the rate in force at each
-            end, which is the bound the descriptor states. A rate of zero or a value that is
-            not a number leaves no bound to apply and answers zero.
-        why: ControlDesc states that the bound is the family's as well as the caller's, and a
-            caller holding the block directly applies none. An offset past half the rate puts
-            the LO spur outside the band the host receives, and the spur it was moved out of
-            the way of comes back.
-        verified-by: controls.uhd-bounds-the-lo-offset
-    */
-    static double boundedLoOffsetHz(double offsetHz, double rateHz) {
-        if (offsetHz != offsetHz || !(rateHz > 0.0)) { // a value that is not a number fails the first test
-            return offsetHz == offsetHz ? offsetHz : 0.0;
-        }
-        const double edge = rateHz / 2.0;
-        return std::clamp(offsetHz, -edge, edge);
-    }
+    // The LO offset bounded by half the rate either side, the bound the descriptor states.
+    static double boundedLoOffsetHz(double offsetHz, double rateHz) { return capture::uhd::boundedLoOffsetHz(offsetHz, rateHz); }
 
     /*| contract: when the first sample of a block was taken, in nanoseconds. A device
             timestamp names that sample directly; without one the wall clock is read once the
@@ -917,9 +921,10 @@ environment.)">;
         frame: wireFormat is the packing the ladder is cut for and the WIRE_FORMAT default,
             the format a running block holds. Empty takes ctx.wireFormat, the format an
             unstarted block holds staged or set, and a format the family does not name is sc16.
+        frame: loOffsetHz is the LO offset a running block holds, and the LO_OFFSET default.
     */
     static std::vector<ControlDesc> describeControls(const DeviceTruth& t, const TruthContext& ctx, double heldBandwidthHz = 0.0, std::optional<double> clockInForceHz = std::nullopt,
-                                                     std::string_view wireFormat = {}, std::size_t channelCount = 1UZ) {
+                                                     std::string_view wireFormat = {}, std::size_t channelCount = 1UZ, double loOffsetHz = 0.0) {
         const std::string        format = validWireFormat(std::string(wireFormat.empty() ? std::string_view(ctx.wireFormat) : wireFormat));
         std::vector<ControlDesc> out    = gainElementControls(t);
         /*| frame: the receive connector, as an index into the unit's own list, defaulting to
@@ -1004,11 +1009,12 @@ environment.)">;
         addEnum("CLOCK_SOURCE", "Clock source (next start)", t.clockSources, t.clockSource);
         addEnum("TIME_SOURCE", "Time source (next start)", t.timeSources, t.timeSource);
         /*| frame: the LO offset the tuner carries, in MHz, bounded by half the rate in force
-                at each end because an offset past that puts the LO spur outside the band the
-                host receives and the spur it was moved out of the way of comes back.
+                at each end. The default is the offset in force, as ANTENNA's is the connector
+                in force.
             measured: a B205mini at 915 MHz with a 1 MHz offset answers 915 MHz from
                 get_rx_freq while its RF frontend sits at 916 MHz, and the DC bin falls from
                 -58 to -95 dBFS.
+            verified-by: controls.uhd-the-lo-offset-default-is-the-offset-in-force
         */
         if (ctx.sampleRate > 0.0) {
             ControlDesc c;
@@ -1019,7 +1025,7 @@ environment.)">;
             c.max         = ctx.sampleRate / 2.0 / 1e6;
             c.min         = -c.max;
             c.step        = 0.1;
-            c.defValue    = 0.0;
+            c.defValue    = std::clamp(loOffsetHz / 1e6, c.min, c.max);
             c.isGain      = false;
             c.rateDerived = true;
             out.push_back(std::move(c));
@@ -1255,6 +1261,43 @@ environment.)">;
         return true;
     }
 
+    /*| contract: write LO_OFFSET, in MHz, bounded by the surface of the open device. A block
+            with a center retunes under the new offset at once. The tune answers the call:
+            false where the coverage or the device refuses it, which leaves the offset in force
+            and stages nothing. A block with no center yet takes the offset for its first tune.
+            The offset taken is staged through lo_offset, in hertz.
+        why: LO_OFFSET and lo_offset name one thing, as the overall gain and rx_gains do. A
+            write of the offset alone leaves the setting where it was, and the next tune from
+            the settings, the replay after a start among them, puts the setting's offset back.
+        trap: staged with the control mutex free, for the reason setElementGain states.
+        verified-by: controls.uhd-the-lo-offset-control-writes-through-its-setting
+    */
+    bool writeLoOffsetControl(double value) {
+        double offset = 0.0;
+        {
+            CtrlGuard guard(_ctrlMutex, _deviceUp);
+            if (!guard) {
+                return false;
+            }
+            const TruthContext ctx{.deviceParams = {}, .sampleRate = _rateActualHz, .centerFreq = 0.0};
+            const auto         bounded = boundedControlValue(describeControls(_openTruth, ctx, _bwCurHz), "LO_OFFSET", value, "uhd::Source");
+            if (!bounded.has_value()) {
+                return false; // the surface states no offset without a rate in force
+            }
+            if (_requestedFreqHz > 0.0) {
+                if (tuneWithOffsetLocked(_requestedFreqHz, _ppmApplied, *bounded * 1e6, false) == TuneOutcome::Refused) {
+                    return false;
+                }
+            } else {
+                _loOffsetHz = boundedLoOffsetHz(*bounded * 1e6, _rateActualHz);
+                publishSurfaceLocked();
+            }
+            offset = _loOffsetHz;
+        }
+        std::ignore = this->settings().setStaged(gr::property_map{{"lo_offset", offset}});
+        return true;
+    }
+
     /*| contract: apply one non-gain control by id: ANTENNA, an index into the unit's own
             connector list, staged through rx_antennae as stageAntennaControl states; BANDWIDTH
             in MHz, the analog frontend filter; DC_CORR and IQ_CORR, the frontend's automatic
@@ -1274,6 +1317,9 @@ environment.)">;
         if (id == "ANTENNA") {
             return stageAntennaControl(value);
         }
+        if (id == "LO_OFFSET") {
+            return writeLoOffsetControl(value);
+        }
         CtrlGuard guard(_ctrlMutex, _deviceUp);
         if (!guard) {
             return false;
@@ -1291,6 +1337,7 @@ environment.)">;
                 }
                 applyBandwidthLocked(want * 1e6);
                 refreshFreqRanges(); // the coverage moves with the filter
+                _filterFollowsRate = false;
                 return true;
             }
             if (id == "DC_CORR") {
@@ -1329,21 +1376,6 @@ environment.)">;
                     return false;
                 }
                 return keptForRun(clock ? "clock_source" : "time_source", names[*at], clock ? _openTruth.clockSource : _openTruth.timeSource);
-            }
-            if (id == "LO_OFFSET") {
-                const double offset  = boundedLoOffsetHz(want * 1e6, _rateActualHz);
-                const double previous = _loOffsetHz;
-                _loOffsetHz           = offset;
-                if (_requestedFreqHz > 0.0) {
-                    tuneLocked(_requestedFreqHz, _ppmApplied, false);
-                    // A refused tune leaves the tuner where it was, so the offset it was
-                    // refused for is not the offset in force either.
-                    if (_loOffsetWrittenHz.value_or(previous) != offset) {
-                        _loOffsetHz = previous;
-                        return false;
-                    }
-                }
-                return true;
             }
             if (id == "DEVICE_TIME") {
                 const bool on = want >= 0.5;
@@ -1528,7 +1560,9 @@ environment.)">;
         _heldGains.clear();
         _rateActualHz         = 0.0;
         _bwCurHz              = 0.0;
+        _filterFollowsRate    = false;
         _tunedRfHz            = 0.0;
+        _loOffsetHz           = 0.0;
         _refLockWaitMs        = 0.0;
         _maxRecvSamples       = 0UZ;
         _agcUnavailableLogged = false;
@@ -1638,7 +1672,10 @@ environment.)">;
             failStartOnOpenDevice(refusal);
         }
         applyAntenna();
-        applyFrequency();
+        if (const std::string refusal = applyFrequency(); !refusal.empty()) {
+            sample_rate = askedRateHz; // the next start asks for the request again
+            failStartOnOpenDevice(refusal);
+        }
         applyAgc(); // before gains: manual gain writes are skipped while AGC holds them
         applyGain();
         _refLockWaitMs = capture::uhd::waitForReference(*_usrp, "uhd::Source").waitedMs;
@@ -1835,11 +1872,11 @@ environment.)">;
         if (_heldForRun.has_value()) {
             refuseRunningWrites(*this, *_heldForRun, newSettings, forwardSettings, "uhd::Source");
         }
-        if (newSettings.contains("frequency") || newSettings.contains("frequency_correction")) {
+        if (newSettings.contains("frequency") || newSettings.contains("frequency_correction") || newSettings.contains("lo_offset")) {
             forwardSettings.erase(std::pmr::string("frequency"));
             if (!frequency->empty()) {
                 const std::uint64_t request = ++_tuneRequests;
-                _control.post(kControlFrequency, [this, request, want = frequency->front(), ppm = frequency_correction.value] { retune(request, want, ppm); });
+                _control.post(kControlFrequency, [this, request, want = frequency->front(), ppm = frequency_correction.value, offset = lo_offset.value] { retune(request, want, ppm, offset); });
             }
         }
         if (newSettings.contains("rx_gains") && !rx_gains->empty()) {
@@ -1864,26 +1901,36 @@ environment.)">;
 
     // ---- device-specific appliers (log-and-continue: see class comment) --------------
 
-    void applyFrequency() {
+    /*| contract: tune where the frequency, frequency_correction and lo_offset settings say,
+            and answer why the start fails, or an empty string. A tune the coverage or the
+            device refuses fails the start, as the sink's does, and leaves frequency on the
+            request. Called by start() alone, before the consumer thread drains any setting.
+        why: the settings are read here before the drain runs. A retune while streaming takes
+            the values the drain copied out, and every control path reads the mirrors.
+        verified-by: controls.uhd-a-start-fails-on-a-refused-tune
+    */
+    std::string applyFrequency() {
         if (frequency->empty()) {
-            return;
+            return {};
         }
         std::lock_guard lock(_ctrlMutex);
         if (_usrp == nullptr) {
-            return; // teardown resets the handle under this mutex
+            return {}; // teardown resets the handle under this mutex
         }
-        // Called by start() alone, before the consumer thread drains any setting; a retune
-        // while streaming takes the values the drain copied out, and every control path reads
-        // the mirrors.
-        _requestedFreqHz = frequency->front();
+        const double request = frequency->front();
+        if (tuneWithOffsetLocked(request, frequency_correction, lo_offset, true) == TuneOutcome::Refused) {
+            frequency = std::vector<double>{request}; // the next start asks for the request again
+            return "uhd: the center frequency was refused";
+        }
+        _requestedFreqHz = request;
         _ppmApplied      = frequency_correction;
-        tuneLocked(_requestedFreqHz, _ppmApplied, true);
+        return {};
     }
 
     /*| contract: tune to the request given, under the correction given and the LO offset in
             force, and answer true where the tuner took the write. With forwardSetting the
             frequency the tuner holds goes into the frequency setting. Called with _ctrlMutex
-            held and a live device.
+            held. A block holding no handle writes nothing.
         why: forwardSetting is true only on the thread that drains the settings, which owns
             the setting. A control written from a caller's thread and a retune on the control
             thread pass false, and pass the request and the correction as copies.
@@ -1894,7 +1941,7 @@ environment.)">;
             moves with the frontend and the net center lands on the request.
     */
     bool tuneLocked(double requested, double ppm, bool forwardSetting) {
-        const auto f = tuneFrequencyFor(requested, ppm, _freqRanges, _loOffsetHz);
+        const auto f = tuneFrequencyFor(requested, ppm, _freqRanges, _loOffsetHz, _openTruth.frontendRanges);
         if (!f) {
             std::fprintf(stderr, "[uhd::Source] %.0f Hz with an LO offset of %.0f Hz puts the tuner outside this radio's coverage; it stays where it is\n", requested, _loOffsetHz);
             if (forwardSetting) {
@@ -1904,6 +1951,9 @@ environment.)">;
         }
         bool moved = false;
         if (writeNeeded(_freqWrittenHz, *f) || writeNeeded(_loOffsetWrittenHz, _loOffsetHz)) {
+            if (_usrp == nullptr) {
+                return false; // teardown resets the handle under this mutex
+            }
             try {
                 const auto request = _loOffsetHz == 0.0 ? ::uhd::tune_request_t(*f) : ::uhd::tune_request_t(*f, _loOffsetHz);
                 ::uhd::tune_result_t result;
@@ -1928,16 +1978,65 @@ environment.)">;
         return moved;
     }
 
-    /*| contract: tune on the control thread to the request given, under the correction given,
-            and hand the consumer thread the frequency the tuner holds afterwards and the device
-            clock read once the tune returned. request numbers the frequency request, so the
-            consumer thread writes the setting back from the newest one alone.
+    // What a tune under an LO offset did: refused it, found it in force, or moved the tuner.
+    enum class TuneOutcome { Refused, Held, Moved };
+
+    /*| contract: tune to the request given under the LO offset given, bounded by the rate in
+            force, and say what the tune did. The tuner holds the request where the write moved
+            it, or where it already holds that frequency and that offset. Any other tune is
+            refused and leaves the previous offset in force: the coverage refused the frontend
+            the offset moves, or the device refused the write or holds no handle to take it.
+            A tune that moved the tuner sets the filter for the offset, as
+            filterFollowsOffsetLocked states. forwardSetting is as tuneLocked states. Called
+            with _ctrlMutex held.
+        verified-by: controls.uhd-a-changed-lo-offset-retunes
+    */
+    TuneOutcome tuneWithOffsetLocked(double requested, double ppm, double offsetHz, bool forwardSetting) {
+        const double previous = _loOffsetHz;
+        _loOffsetHz           = boundedLoOffsetHz(offsetHz, _rateActualHz);
+        if (tuneLocked(requested, ppm, forwardSetting)) {
+            filterFollowsOffsetLocked();
+            publishSurfaceLocked();
+            return TuneOutcome::Moved;
+        }
+        const auto f = tuneFrequencyFor(requested, ppm, _freqRanges, _loOffsetHz, _openTruth.frontendRanges);
+        if (f.has_value() && _freqWrittenHz == f && _loOffsetWrittenHz == _loOffsetHz) {
+            return TuneOutcome::Held;
+        }
+        _loOffsetHz = previous;
+        return TuneOutcome::Refused;
+    }
+
+    /*| contract: write the analog filter offsetBandwidthFor states for the rate and the LO
+            offset in force, where the start set the filter from the rate and no BANDWIDTH
+            write has moved it since. A filter already that wide takes no write, and a write
+            reads the coverage again. Called with _ctrlMutex held and a live device.
+        verified-by: uhd.lo-offset-setting-moves-the-receive-frontend
+    */
+    void filterFollowsOffsetLocked() {
+        if (!_filterFollowsRate) {
+            return;
+        }
+        const auto before = _bwWrittenHz;
+        applyBandwidthLocked(offsetBandwidthFor(_rateActualHz, _loOffsetHz, _bwMinHz, _bwMaxHz));
+        if (_bwWrittenHz != before) {
+            refreshFreqRanges(); // the coverage moves with the filter
+        }
+    }
+
+    /*| contract: tune on the control thread to the request given, under the correction given
+            and the lo_offset setting given, and hand the consumer thread the frequency the
+            tuner holds afterwards and the device clock read once the tune returned. request
+            numbers the frequency request. The consumer thread writes the setting back from the
+            newest one alone. The request and the correction a control path retunes from move
+            only where the tune was not refused.
         frame: a request the coverage refuses moves nothing and hands back the frequency in
             force, which the setting returns to. A tune made while a device-clock set is in
             flight carries no clock reading, because the stamps that follow may belong to
             either clock, and its tag goes on the next block.
+        verified-by: controls.uhd-a-refused-retune-keeps-the-held-request
     */
-    void retune(std::uint64_t request, double want, double ppm) {
+    void retune(std::uint64_t request, double want, double ppm, double offsetHz) {
         _retunesOpen.fetch_add(1, std::memory_order_acq_rel);
         TuneResult result;
         result.request = request;
@@ -1947,9 +2046,12 @@ environment.)">;
                 _retunesOpen.fetch_sub(1, std::memory_order_acq_rel);
                 return; // teardown resets the handle under this mutex
             }
-            _requestedFreqHz = want;
-            _ppmApplied      = ppm;
-            const bool moved = tuneLocked(want, ppm, false);
+            const TuneOutcome outcome = tuneWithOffsetLocked(want, ppm, offsetHz, false);
+            if (outcome != TuneOutcome::Refused) {
+                _requestedFreqHz = want;
+                _ppmApplied      = ppm;
+            }
+            const bool moved = outcome == TuneOutcome::Moved;
             result.heldHz    = _appliedFreqHz;
             if (moved && !_clockSetPending.load(std::memory_order_acquire)) {
                 try {
@@ -2421,12 +2523,14 @@ environment.)">;
         }
         /*| invariant: the analog filter tracks the rate: UHD coerces a bandwidth to the nearest
                 valid value, so this asks for fs itself, clamped into the range the frontend
-                states.
+                states. The lo_offset setting bounded by the rate widens it, as
+                offsetBandwidthFor states.
             trap: a manual BANDWIDTH write survives only until the next start, whose rate write
                 re-derives it.
         */
         if (filterFollowsRate(written, _bwMinHz, _bwMaxHz)) {
-            applyBandwidthLocked(bandwidthFor(_rateActualHz, _bwMinHz, _bwMaxHz));
+            applyBandwidthLocked(offsetBandwidthFor(_rateActualHz, boundedLoOffsetHz(lo_offset, _rateActualHz), _bwMinHz, _bwMaxHz));
+            _filterFollowsRate = true;
         }
         refreshFreqRanges();
     }

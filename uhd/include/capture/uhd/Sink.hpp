@@ -54,7 +54,8 @@ namespace capture::uhd {
         work call stages samples in a queue, and the block's drain thread hands them to the
         streamer at the rate. The Description states the burst tags.
     contract: the settings carry the source's names, with tx_ where a transmitter has the
-        thing. frequency, frequency_correction, tx_gains and tx_antennae reach the device live.
+        thing. frequency, frequency_correction, lo_offset, tx_gains and tx_antennae reach the
+        device live.
         The settings the source holds fixed while it runs are fixed here as well. subdev, the
         transport sizes, the queue sizes and the thread placement are read by start() alone.
     contract: a second thread reads the device's asynchronous channel and counts what it
@@ -113,6 +114,18 @@ channels one send carries both, so a burst tag on either input marks the burst o
     gr::Annotated<std::vector<double>, "frequency", gr::Unit<"Hz">, gr::Visible, gr::Doc<"center frequency">>         frequency = std::vector<double>{kDefaultFrequencyHz};
     gr::Annotated<std::vector<double>, "tx_gains", gr::Unit<"dB">, gr::Visible, gr::Doc<"overall transmit gain">>     tx_gains  = std::vector<double>{0.0};
     gr::Annotated<double, "frequency_correction", gr::Unit<"ppm">, gr::Doc<"reference error in parts per million">>   frequency_correction = 0.0;
+    /*| contract: the distance of the RF frontend from the center. The digital converter
+            moves the band back onto the center, and the LO leakage leaves the device that far
+            off it. A positive offset puts the frontend above the center. Zero lets UHD place
+            the frontend. Each tune bounds the offset to half the rate in force either side.
+            The analog filter the start sets from the rate widens by twice the offset in force.
+            A change retunes the running stream. A start whose tune the coverage refuses fails.
+            A later tune the coverage refuses keeps the earlier offset in force, and the
+            setting keeps the request.
+        verified-by: sink.uhd-tunes-with-the-lo-offset
+        verified-by: uhd.tx-lo-offset-setting-moves-the-transmit-frontend
+    */
+    gr::Annotated<double, "lo_offset", gr::Unit<"Hz">, gr::Doc<"RF frontend offset from the center">> lo_offset = 0.0;
     gr::Annotated<std::vector<std::string>, "tx_antennae", gr::Doc<"transmit connector per listed channel, or one for all">> tx_antennae;
     /*| contract: start() writes it before it reads the transmit surface and builds the
             streamer.
@@ -152,7 +165,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
     gr::Annotated<double, "thread_priority", gr::Doc<"transmit thread real-time priority, 0 to 1; 0 keeps the system's">> thread_priority = 0.0;
     gr::Annotated<double, "cpu", gr::Doc<"transmit thread's processor; -1 keeps the system's choice">>                cpu             = -1.0;
 
-    GR_MAKE_REFLECTABLE(Sink, in, in2, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, tx_antennae, subdev, channels, wire_format, clock_source, time_source, master_clock_rate,
+    GR_MAKE_REFLECTABLE(Sink, in, in2, device, device_parameter, sample_rate, frequency, tx_gains, frequency_correction, lo_offset, tx_antennae, subdev, channels, wire_format, clock_source, time_source, master_clock_rate,
                         send_frame_size, num_send_frames, send_buff_size, queue_duration, queue_max_bytes, thread_priority, cpu);
 
     // The longest one send may block. It is longer than any chunk the drain hands over, so a
@@ -230,6 +243,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
     double                                 _appliedRequestHz = 0.0;
     double                                 _actualGainDb     = 0.0;
     double                                 _bwCurHz = 0.0, _bwMinHz = 0.0, _bwMaxHz = 0.0;
+    bool                                   _filterFollowsRate = false; // the start set the filter from the rate and no BANDWIDTH write moved it
     std::string                            _actualAntenna;
     std::string                            _wireFormat = "sc16";
     std::vector<std::pair<double, double>> _freqRanges;
@@ -241,7 +255,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
     std::vector<std::size_t>               _channels{0UZ};          // the device channels in and in2 feed, written by start() before the device opens
     std::atomic<std::size_t>               _channelCount{1UZ};      // their count, for a reader on another thread
     std::atomic<double>                    _refLockWaitMs{0.0};
-    std::optional<double>                  _freqWrittenHz, _rateWrittenHz, _gainWrittenDb, _bwWrittenHz;
+    std::optional<double>                  _freqWrittenHz, _loOffsetWrittenHz, _rateWrittenHz, _gainWrittenDb, _bwWrittenHz;
     std::optional<std::vector<std::string>> _antennaWritten;
 
     /*| invariant: the ring is declared before the threads that index it. Members are
@@ -830,6 +844,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
             std::lock_guard lock(_ctrlMutex);
             // A fresh multi_usrp holds none of the previous device's state.
             _freqWrittenHz.reset();
+            _loOffsetWrittenHz.reset();
             _rateWrittenHz.reset();
             _gainWrittenDb.reset();
             _bwWrittenHz.reset();
@@ -840,6 +855,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
             _appliedRequestHz = 0.0;
             _actualGainDb     = 0.0;
             _bwCurHz          = 0.0;
+            _filterFollowsRate = false;
             _maxSendSamples   = 0UZ;
             _actualAntenna.clear();
             _freqRanges.clear();
@@ -1418,7 +1434,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
         return take;
     }
 
-    /*| contract: frequency, gain and connector reach the device live. A write of a setting the
+    /*| contract: frequency, LO offset, gain and connector reach the device live. A write of a setting the
             run holds fixed is refused, as refuseRunningWrites states.
     */
     void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings, gr::property_map& forwardSettings) {
@@ -1433,7 +1449,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
         if (_usrp == nullptr) {
             return; // teardown resets the handle under this mutex
         }
-        if (newSettings.contains("frequency") || newSettings.contains("frequency_correction")) {
+        if (newSettings.contains("frequency") || newSettings.contains("frequency_correction") || newSettings.contains("lo_offset")) {
             std::ignore = applyFrequencyLocked();
         }
         if (newSettings.contains("tx_gains")) {
@@ -1545,7 +1561,8 @@ channels one send carries both, so a burst tag on either input marks the burst o
                 whatever the device came up with.
         */
         if (filterFollowsRate(written, _bwMinHz, _bwMaxHz)) {
-            applyBandwidthLocked(bandwidthFor(_rateActualHz, _bwMinHz, _bwMaxHz));
+            applyBandwidthLocked(offsetBandwidthFor(_rateActualHz, boundedLoOffsetHz(lo_offset, _rateActualHz), _bwMinHz, _bwMaxHz));
+            _filterFollowsRate = true;
         }
         refreshFreqRangesLocked();
         return written.landed;
@@ -1613,9 +1630,29 @@ channels one send carries both, so a burst tag on either input marks the burst o
         }
     }
 
-    /*| contract: tune the synthesizer where the settings and the correction in force say. False
-            where the request is outside the coverage the device states or the device refused
-            the write, which leaves the tuner where it is.
+    /*| contract: set the transmit filter to the width offsetBandwidthFor gives for the rate
+            and the LO offset written. It acts while the filter follows the rate: the start
+            set it from the rate, and no BANDWIDTH write has come since. A filter of that width
+            is left alone. A changed width refreshes the coverage. The caller holds _ctrlMutex.
+        verified-by: uhd.tx-lo-offset-setting-moves-the-transmit-frontend
+    */
+    void filterFollowsOffsetLocked() {
+        if (!_filterFollowsRate) {
+            return;
+        }
+        const auto before = _bwWrittenHz;
+        applyBandwidthLocked(offsetBandwidthFor(_rateActualHz, _loOffsetWrittenHz.value_or(0.0), _bwMinHz, _bwMaxHz));
+        if (_bwWrittenHz != before) {
+            refreshFreqRangesLocked(); // the coverage moves with the filter
+        }
+    }
+
+    /*| contract: tune the synthesizer where the settings and the correction in force say,
+            under lo_offset bounded by the rate in force. False where the request is outside
+            the coverage the device states, the frontend the offset moves is outside the
+            frontend's own coverage, or the device refused the write, which leaves the tuner
+            where it is. A write sets the filter for the offset, as filterFollowsOffsetLocked
+            states.
         invariant: the request this block states is written once, from the read-back carried out
             of the correction, and a replay of a value already in force leaves it where the
             write that put it there left it. Written from the raw request as well, the settings
@@ -1625,30 +1662,37 @@ channels one send carries both, so a burst tag on either input marks the burst o
         contract: the center the tuner reached goes back into the frequency setting, so a
             refused request does not leave the setting naming a center the radio is not on.
         verified-by: sink.uhd-states-the-frequency-the-caller-asked-for
+        verified-by: sink.uhd-tunes-with-the-lo-offset
     */
     bool applyFrequencyLocked() {
         if (frequency->empty()) {
             return false;
         }
         const double request = frequency->front();
-        const auto   f       = tuneFrequencyFor(request, frequency_correction, _freqRanges);
+        const double offset  = boundedLoOffsetHz(lo_offset, _rateActualHz);
+        const auto   f       = tuneFrequencyFor(request, frequency_correction, _freqRanges, offset, _openTruth.frontendRanges);
         if (!f) {
-            std::fprintf(stderr, "[uhd::Sink] %.0f Hz is outside this radio's transmit coverage; the tuner stays where it is\n", request);
+            std::fprintf(stderr, "[uhd::Sink] %.0f Hz with an LO offset of %.0f Hz is outside this radio's transmit coverage; the tuner stays where it is\n", request, offset);
             forwardTunedFrequencyLocked();
             return false;
         }
-        if (writeNeeded(_freqWrittenHz, *f)) {
+        // A frontend never given an offset holds none. An offset of zero then asks for no write of its own.
+        if (writeNeeded(_freqWrittenHz, *f) || _loOffsetWrittenHz.value_or(0.0) != offset) {
             if (_usrp == nullptr) {
                 return false;
             }
             try {
+                // An offset of zero tunes without one, and UHD places the frontend.
+                const auto tune = offset == 0.0 ? ::uhd::tune_request_t(*f) : ::uhd::tune_request_t(*f, offset);
                 for (const std::size_t ch : _channels) {
-                    _usrp->set_tx_freq(::uhd::tune_request_t(*f), ch);
+                    _usrp->set_tx_freq(tune, ch);
                 }
-                _freqWrittenHz = *f;
+                _freqWrittenHz     = *f;
+                _loOffsetWrittenHz = offset;
                 // The read-back carried back into the frame the caller asks in.
                 _appliedFreqHz    = _usrp->get_tx_freq(_channels.front());
                 _appliedRequestHz = tunedFrequencyFrom(_appliedFreqHz, frequency_correction);
+                filterFollowsOffsetLocked();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[uhd::Sink] set_tx_freq(%.0f) failed: %s (continuing)\n", *f, e.what());
                 return false;
@@ -1844,6 +1888,7 @@ channels one send carries both, so a burst tag on either input marks the burst o
                 if (id == "BANDWIDTH") {
                     applyBandwidthLocked(want * 1e6); // the descriptor states MHz
                     refreshFreqRangesLocked();        // the coverage moves with the filter
+                    _filterFollowsRate = false;
                     return _bwCurHz > 0.0;
                 }
                 return setElementGainLocked(id, want);

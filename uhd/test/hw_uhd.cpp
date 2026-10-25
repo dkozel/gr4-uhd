@@ -1024,6 +1024,43 @@ long long droppedOf(const Src& s) {
     }
 }
 
+/*| contract: the frequency the RF frontend of channel 0 holds in one direction, read from the
+        device's property tree at the frontend the subdevice spec names, or nothing where the
+        tree states none.
+    why: get_rx_freq and get_tx_freq state the center, which the digital converter moves back
+        onto the request. The frontend alone shows where an LO offset put the synthesizer.
+*/
+std::optional<double> frontendFreqHz(uhd::usrp::multi_usrp& u, capture::uhd::Direction dir) {
+    const bool rx   = dir == capture::uhd::Direction::Receive;
+    const auto spec = rx ? u.get_rx_subdev_spec(0) : u.get_tx_subdev_spec(0);
+    if (spec.empty()) {
+        return std::nullopt;
+    }
+    const std::string path = std::format("/mboards/0/dboards/{}/{}/{}/freq/value", spec.front().db_name, rx ? "rx_frontends" : "tx_frontends", spec.front().sd_name);
+    auto              tree = u.get_device()->get_tree();
+    if (!tree->exists(path)) {
+        return std::nullopt;
+    }
+    return tree->access<double>(path).get();
+}
+
+/*| contract: the top of the RF frontend's own receive coverage, read through a direct open
+        while nothing holds the radio, or nothing where the device states none.
+*/
+std::optional<double> frontendTopHz() {
+    try {
+        auto   usrp = uhd::usrp::multi_usrp::make(uhd::device_addr_t(deviceArgs()));
+        double top  = 0.0;
+        for (const auto& r : usrp->get_fe_rx_freq_range(0)) {
+            top = std::max(top, r.stop());
+        }
+        return top > 0.0 ? std::optional<double>{top} : std::nullopt;
+    } catch (const std::exception& e) {
+        std::printf("the frontend coverage did not read: %s\n", e.what());
+        return std::nullopt;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2934,6 +2971,176 @@ int main(int argc, char** argv) {
         expect(std::abs((rfBounded - rfNoOffset) - kRate / 2.0) < stepHz) << "and the frontend moves by half the rate, which is that bound";
         expect(offsetRefused) << "an offset that would carry the frontend past the stated coverage is refused rather than coerced";
         expect(std::abs(rfAfterRefusal - rfAtTop) < 1.0) << "and the tuner stays where it was, as a refused frequency leaves it";
+    });
+
+    cases("uhd.lo-offset-setting-moves-the-receive-frontend", [] {
+        /*| frame: the lo_offset setting on a running source near 2450 MHz, written as a caller
+                writes a setting: none, then +3 MHz, then -2 MHz. The rate is the ladder's
+                nearest to 8 MS/s, whose bound of half the rate holds both offsets. The frontend
+                is read from the property tree, the center from get_rx_freq and the analog
+                filter from get_rx_bandwidth.
+        */
+        const auto&                 truth   = benchTruth();
+        const double                kRate   = capture::uhd::snapToLadder(8.0e6, capture::uhd::Source::sampleRatesFor(truth));
+        const double                kCenter = insideOrElse(2450.0e6);
+        const std::array<double, 3> offsets{0.0, 3.0e6, -2.0e6};
+        std::array<double, 3>       frontend{}, center{}, filter{};
+
+        const bool ran = withGraph(sourceSettings(kRate, kCenter, truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
+            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts";
+            for (std::size_t i = 0UZ; i < offsets.size(); ++i) {
+                if (i > 0UZ) {
+                    std::ignore = src.settings().setStaged({{"lo_offset", offsets[i]}});
+                }
+                settle(500);
+                frontend[i] = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return frontendFreqHz(u, capture::uhd::Direction::Receive).value_or(0.0); });
+                center[i]   = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_freq(0); });
+                filter[i]   = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_bandwidth(0); });
+            }
+        });
+        expect(ran) << "the graph ran";
+
+        // The tolerance is the synthesizer step uhd.lo-offset states.
+        constexpr double stepHz = 10.0e3;
+        for (std::size_t i = 0UZ; i < offsets.size(); ++i) {
+            const double offset = capture::uhd::boundedLoOffsetHz(offsets[i], kRate);
+            const double wantBw = truth.bwMaxHz > truth.bwMinHz ? std::clamp(kRate + 2.0 * std::abs(offset), truth.bwMinHz, truth.bwMaxHz) : filter[i];
+            std::printf("lo offset setting: at %.0f S/s and %.0f Hz, lo_offset %+.0f Hz puts the receive frontend at %.3f Hz, get_rx_freq %.3f Hz, the filter %.0f Hz against %.0f Hz\n", kRate, kCenter,
+                        offset, frontend[i], center[i], filter[i], wantBw);
+            expect(std::abs(frontend[i] - (kCenter + offset)) < stepHz) << std::format("the receive frontend sits {} Hz from the center", offset);
+            expect(std::abs(center[i] - kCenter) < 1.0) << "while the center stays the one asked for";
+            expect(std::abs(filter[i] - wantBw) < 1.0) << "and the filter is the rate plus twice the offset";
+        }
+    });
+
+    cases("uhd.tx-lo-offset-setting-moves-the-transmit-frontend", [] {
+        /*| frame: the same offsets on the sink, near 2450 MHz into the terminated transmit port
+                at 0 dB. The sink starts with +3 MHz in force, and -2 MHz and none follow as
+                settings writes. Nothing here raises the transmit gain.
+        */
+        const auto&                 truth   = transmitTruth();
+        const double                kRate   = capture::uhd::snapToLadder(8.0e6, capture::uhd::Source::sampleRatesFor(benchTruth()));
+        const double                kCenter = insideOrElse(2450.0e6);
+        const std::array<double, 3> offsets{3.0e6, -2.0e6, 0.0};
+        std::array<double, 3>       frontend{}, center{}, filter{};
+        bool                        up = false;
+
+        gr::property_map settings = sinkSettings(kRate, kCenter, {});
+        settings.insert_or_assign("lo_offset", offsets[0]);
+        const bool ran = withTxGraph(std::move(settings), [&](capture::uhd::Sink& sink, auto&) {
+            up = waitForDeviceUp(sink, std::chrono::seconds(10));
+            for (std::size_t i = 0UZ; i < offsets.size(); ++i) {
+                if (i > 0UZ) {
+                    std::ignore = sink.settings().setStaged({{"lo_offset", offsets[i]}});
+                }
+                settle(500);
+                frontend[i] = sinkRead(sink, 0.0, [](uhd::usrp::multi_usrp& u) { return frontendFreqHz(u, capture::uhd::Direction::Transmit).value_or(0.0); });
+                center[i]   = sinkRead(sink, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_tx_freq(0); });
+                filter[i]   = sinkRead(sink, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_tx_bandwidth(0); });
+            }
+        });
+        expect(ran) << "the transmit graph ran";
+        expect(up) << "the sink came up";
+
+        constexpr double stepHz = 10.0e3;
+        for (std::size_t i = 0UZ; i < offsets.size(); ++i) {
+            const double offset = capture::uhd::boundedLoOffsetHz(offsets[i], kRate);
+            const double wantBw = truth.bwMaxHz > truth.bwMinHz ? std::clamp(kRate + 2.0 * std::abs(offset), truth.bwMinHz, truth.bwMaxHz) : filter[i];
+            std::printf("lo offset setting: at %.0f S/s and %.0f Hz, lo_offset %+.0f Hz puts the transmit frontend at %.3f Hz, get_tx_freq %.3f Hz, the filter %.0f Hz against %.0f Hz\n", kRate,
+                        kCenter, offset, frontend[i], center[i], filter[i], wantBw);
+            expect(std::abs(frontend[i] - (kCenter + offset)) < stepHz) << std::format("the transmit frontend sits {} Hz from the center", offset);
+            expect(std::abs(center[i] - kCenter) < 1.0) << "while the center stays the one asked for";
+            expect(std::abs(filter[i] - wantBw) < 1.0) << "and the filter is the rate plus twice the offset";
+        }
+    });
+
+    cases("uhd.lo-offset-control-survives-a-retune-and-a-restart", [] {
+        /*| frame: an LO_OFFSET write on a running source, then a frequency write, then a stop
+                and a start of the same block. The graph's scheduler stops the block, and the
+                case drives the block's own lifecycle back to running, as a scheduler does at a
+                restart.
+        */
+        const auto&      truth   = benchTruth();
+        const double     kRate   = capture::uhd::snapToLadder(8.0e6, capture::uhd::Source::sampleRatesFor(truth));
+        const double     kCenter = insideOrElse(2450.0e6);
+        const double     kMoved  = insideOrElse(2460.0e6);
+        const double     kOffset = capture::uhd::boundedLoOffsetHz(3.0e6, kRate);
+        bool             taken = false, restarted = false;
+        double           rfTaken = 0.0, rfMoved = 0.0, centerMoved = 0.0, settingMoved = 0.0;
+        double           rfRestarted = 0.0, centerRestarted = 0.0;
+
+        const bool ran = withGraph(sourceSettings(kRate, kCenter, truth.gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto& scheduled) {
+            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts";
+            taken = src.setControl("LO_OFFSET", kOffset / 1e6);
+            settle(500);
+            rfTaken     = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return frontendFreqHz(u, capture::uhd::Direction::Receive).value_or(0.0); });
+            std::ignore = src.settings().setStaged({{"frequency", std::vector<double>{kMoved}}});
+            settle(500);
+            rfMoved      = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return frontendFreqHz(u, capture::uhd::Direction::Receive).value_or(0.0); });
+            centerMoved  = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_freq(0); });
+            settingMoved = src.lo_offset.value;
+
+            scheduled.stop();
+            std::ignore = src.changeStateTo(gr::lifecycle::State::INITIALISED);
+            restarted   = src.changeStateTo(gr::lifecycle::State::RUNNING).has_value() && src.deviceUp();
+            settle(300);
+            rfRestarted     = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return frontendFreqHz(u, capture::uhd::Direction::Receive).value_or(0.0); });
+            centerRestarted = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_freq(0); });
+            std::ignore     = src.changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
+            std::ignore     = src.changeStateTo(gr::lifecycle::State::STOPPED);
+        });
+        expect(ran) << "the graph ran";
+
+        constexpr double stepHz = 10.0e3;
+        std::printf("lo offset control: LO_OFFSET %.3f MHz %s, the frontend at %.3f Hz; after a frequency write of %.0f Hz the frontend at %.3f Hz, get_rx_freq %.3f Hz, lo_offset %.0f Hz\n",
+                    kOffset / 1e6, taken ? "taken" : "refused", rfTaken, kMoved, rfMoved, centerMoved, settingMoved);
+        std::printf("lo offset control: after a stop and a start the block %s, the frontend at %.3f Hz, get_rx_freq %.3f Hz\n", restarted ? "runs" : "did not start", rfRestarted, centerRestarted);
+        expect(taken) << "the control takes the offset";
+        expect(std::abs(rfTaken - (kCenter + kOffset)) < stepHz) << "and the frontend moves by it";
+        expect(settingMoved == kOffset) << "lo_offset carries the offset the control took";
+        expect(std::abs(rfMoved - (kMoved + kOffset)) < stepHz && std::abs(centerMoved - kMoved) < 1.0) << "a frequency write keeps the offset";
+        expect(restarted) << "the block starts again";
+        expect(std::abs(rfRestarted - (kMoved + kOffset)) < stepHz && std::abs(centerRestarted - kMoved) < 1.0) << "and the start tunes under the offset";
+    });
+
+    cases("uhd.lo-offset-past-the-frontend-fails-the-start", [] {
+        /*| frame: a center half the offset below the top of the frontend's own coverage, at 2 MS/s
+                with an offset of 1 MHz, which takes the frontend past that top. The overall
+                coverage reaches past it. A running source is asked for the offset as a setting,
+                and a second source starts with it.
+        */
+        const auto  top = frontendTopHz();
+        expect(top.has_value()) << "the device states its frontend's coverage";
+        if (!top.has_value()) {
+            return;
+        }
+        constexpr double kRate   = 2.0e6;
+        constexpr double kOffset = kRate / 2.0;
+        const double     kCenter = *top - kOffset / 2.0;
+        double           rfBefore = 0.0, rfAfter = 0.0, tunedBefore = 0.0, tunedAfter = 0.0, centerAfter = 0.0;
+
+        const bool ran = withGraph(sourceSettings(kRate, kCenter, benchTruth().gainMinDb, sourcePort()), [&](capture::uhd::Source& src, auto&) {
+            expect(waitForSamples(std::chrono::milliseconds(6000))) << "the stream starts";
+            rfBefore    = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return frontendFreqHz(u, capture::uhd::Direction::Receive).value_or(0.0); });
+            tunedBefore = src.tunedRfHz();
+            std::ignore = src.settings().setStaged({{"lo_offset", kOffset}});
+            settle(500);
+            rfAfter     = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return frontendFreqHz(u, capture::uhd::Direction::Receive).value_or(0.0); });
+            centerAfter = deviceRead(src, 0.0, [](uhd::usrp::multi_usrp& u) { return u.get_rx_freq(0); });
+            tunedAfter  = src.tunedRfHz();
+        });
+        expect(ran) << "the graph ran";
+
+        gr::property_map withOffset = sourceSettings(kRate, kCenter, benchTruth().gainMinDb, sourcePort());
+        withOffset.insert_or_assign("lo_offset", kOffset);
+        const std::string failure = startAlone<capture::uhd::Source>(std::move(withOffset));
+
+        std::printf("frontend top: the frontend's coverage ends at %.0f Hz; at %.0f Hz with no offset the frontend sat at %.3f Hz, tunedRfHz %.3f Hz\n", *top, kCenter, rfBefore, tunedBefore);
+        std::printf("frontend top: lo_offset %+.0f Hz left the frontend at %.3f Hz, tunedRfHz %.3f Hz, get_rx_freq %.3f Hz\n", kOffset, rfAfter, tunedAfter, centerAfter);
+        std::printf("frontend top: a start with the offset answered \"%s\"\n", failure.c_str());
+        expect(std::abs(rfAfter - rfBefore) < 1.0 && std::abs(tunedAfter - tunedBefore) < 1.0) << "an offset past the frontend's top is refused and the frontend stays";
+        expect(std::abs(centerAfter - kCenter) < 1.0) << "on the center asked for";
+        expect(failure.contains("the center frequency was refused")) << "a start with that offset fails: " << failure;
     });
 
     cases("uhd.device-time", [] {

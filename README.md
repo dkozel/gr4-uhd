@@ -99,6 +99,20 @@ Each block's `device_parameter` setting takes UHD device arguments:
 lets UHD take the first device it finds. The `device` string a discovery
 listing gives for a unit is a valid `device_parameter`.
 
+## The LO offset
+
+Each block's `lo_offset` setting, in hertz, tunes the RF frontend that far
+from `frequency`, and the digital converter shifts the band back. A positive
+offset puts the frontend above the center. The LO leakage of the sink, or the
+DC spur of the source, then sits off the center by the offset. Zero, the
+default, lets UHD place the frontend. Each tune bounds the offset to half the
+sample rate in force either side. The analog filter the start sets from the
+rate widens by twice the offset in force. A center whose frontend would land
+outside the frontend's own coverage is refused, and a start that meets the
+refusal fails. A later tune the coverage refuses keeps the earlier offset in
+force, and the setting keeps the request. A change reaches a running stream
+as a retune. The source's `LO_OFFSET` control writes the `lo_offset` setting.
+
 ## The controls, control and sensors properties
 
 Each block answers three properties by message while it runs. A program
