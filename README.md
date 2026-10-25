@@ -43,6 +43,10 @@ directory that holds `boost/ut.hpp`. The offline cases ask no device:
 ctest --test-dir build -LE hardware
 ```
 
+ctest sets `GNURADIO4_PLUGIN_DIRECTORIES` to `build/lib/gnuradio-4/plugins` for
+every case. A case that builds a graph loads block libraries from there and
+none from a prefix.
+
 `-DGR4UHD_ENABLE_HARDWARE_TESTS=ON` adds the cases that open a USRP, labeled
 `hardware`. `CAPTURE_HW_UHD_ARGS` in the environment selects the unit.
 

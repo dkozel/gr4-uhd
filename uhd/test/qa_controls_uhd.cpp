@@ -16,6 +16,7 @@
 #include "support/Cases.hpp"
 #include "support/Surface.hpp"
 
+#include "PlaceholderHandle.hpp"
 #include "UnparsedAddress.hpp"
 
 #include <uhd/stream.hpp>
@@ -381,14 +382,6 @@ std::string stderrOf(Calls&& calls) {
     }
     std::fclose(capture);
     return text;
-}
-
-/*| role: a handle that stands for an open device and is never called. A case that holds it
-        reaches the paths a null handle ends, and drops it before the block goes.
-*/
-::uhd::usrp::multi_usrp::sptr placeholderHandle() {
-    auto device = std::make_shared<int>(0);
-    return ::uhd::usrp::multi_usrp::sptr(device, reinterpret_cast<::uhd::usrp::multi_usrp*>(device.get()));
 }
 
 } // namespace
@@ -2774,26 +2767,24 @@ int main(int argc, char** argv) {
     });
 
     cases("controls.uhd-a-start-fails-on-a-refused-tune", [] {
-        /*| frame: the frequency applier of a start, on a source holding a placeholder handle.
-                A tune the coverage refuses calls no device, and neither does a tune the tuner
-                already holds.
+        /*| frame: the frequency applier of a start, called on a source that holds a placeholder
+                handle for that call. A tune the coverage refuses calls no device, and neither
+                does a tune the tuner already holds.
         */
         constexpr double                             kRate = 8.0e6;
         const std::vector<std::pair<double, double>> coverage{{49.0e6, 6001.0e6}};
         const double                                 top = coverage.front().second;
 
         capture::uhd::Source refused{};
-        refused._usrp         = placeholderHandle();
         refused._freqRanges   = coverage;
         refused._rateActualHz = kRate;
         refused.frequency     = std::vector<double>{top - kRate / 8.0};
         refused.lo_offset     = kRate / 4.0;
-        expect(refused.applyFrequency() == "uhd: the center frequency was refused") << "a center whose offset leaves the coverage fails the start";
+        const std::string refusal = capture::uhd::test::withPlaceholderHandle(refused, [&refused] { return refused.applyFrequency(); });
+        expect(refusal == "uhd: the center frequency was refused") << "a center whose offset leaves the coverage fails the start";
         expect(refused.frequency.value == std::vector<double>{top - kRate / 8.0}) << "and frequency keeps the request for the next start";
-        refused._usrp.reset();
 
         capture::uhd::Source held{};
-        held._usrp              = placeholderHandle();
         held._freqRanges        = coverage;
         held._rateActualHz      = kRate;
         held._freqWrittenHz     = 2440.0e6;
@@ -2801,15 +2792,14 @@ int main(int argc, char** argv) {
         held._appliedFreqHz     = 2440.0e6;
         held.frequency          = std::vector<double>{2440.0e6};
         held.lo_offset          = kRate / 4.0;
-        expect(held.applyFrequency().empty()) << "a tune the tuner holds starts";
+        expect(capture::uhd::test::withPlaceholderHandle(held, [&held] { return held.applyFrequency(); }).empty()) << "a tune the tuner holds starts";
         expect(held._requestedFreqHz == 2440.0e6) << "and becomes the request a control path retunes from";
-        held._usrp.reset();
     });
 
     cases("controls.uhd-a-refused-retune-keeps-the-held-request", [] {
-        /*| frame: a source holding a placeholder handle, a center and no offset. A retune the
-                coverage refuses calls no device. The LO_OFFSET write after it runs with the
-                handle dropped, where a tune that asks for a write is refused.
+        /*| frame: a source holding a center and no offset. A retune the coverage refuses runs
+                with a placeholder handle and calls no device. The LO_OFFSET write after it runs
+                with no handle, where a tune that asks for a write is refused.
         */
         constexpr double                             kRate = 8.0e6;
         const std::vector<std::pair<double, double>> coverage{{49.0e6, 6001.0e6}};
@@ -2817,7 +2807,6 @@ int main(int argc, char** argv) {
         const double                                 refusedHz = coverage.front().second - kRate / 8.0;
 
         capture::uhd::Source src{};
-        src._usrp              = placeholderHandle();
         src._deviceUp.store(true);
         src._freqRanges        = coverage;
         src._rateActualHz      = kRate;
@@ -2825,11 +2814,10 @@ int main(int argc, char** argv) {
         src._freqWrittenHz     = heldHz;
         src._loOffsetWrittenHz = 0.0;
         src._appliedFreqHz     = heldHz;
-        src.retune(1U, refusedHz, 0.0, kRate / 4.0);
+        capture::uhd::test::withPlaceholderHandle(src, [&src, refusedHz] { src.retune(1U, refusedHz, 0.0, kRate / 4.0); });
         expect(src._requestedFreqHz == heldHz) << "a retune the coverage refuses leaves the request on the held center";
         expect(src._loOffsetHz == 0.0) << "and the offset in force where it was";
 
-        src._usrp.reset();
         expect(src.setControl("LO_OFFSET", 0.0)) << "an offset write then tunes the held center, which needs no write";
         expect(src._freqWrittenHz == std::optional<double>{heldHz}) << "and the tuner stays on it";
         src._deviceUp.store(false);

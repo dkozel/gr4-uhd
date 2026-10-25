@@ -22,6 +22,7 @@
 #include "support/Readings.hpp"
 #include "support/ScheduledGraph.hpp"
 
+#include "PlaceholderHandle.hpp"
 #include "UnparsedAddress.hpp"
 
 #include <uhd/property_tree.hpp>
@@ -599,14 +600,6 @@ void expectBurstSends(std::string_view scenario, const std::vector<BurstStream::
     }
 }
 
-/*| role: a non-null device handle that no call goes through. It lets a case pass the
-        checks for a missing device. The case resets it before the sink is destroyed.
-*/
-::uhd::usrp::multi_usrp::sptr placeholderHandle() {
-    auto device = std::make_shared<int>(0);
-    return ::uhd::usrp::multi_usrp::sptr(device, reinterpret_cast<::uhd::usrp::multi_usrp*>(device.get()));
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1151,12 +1144,11 @@ int main(int argc, char** argv) {
         none._appliedRequestHz = 2440.0e6;
         expect(none.applyFrequencyLocked()) << "an offset of zero asks for no write of its own";
 
-        // A running sink's settings hook takes lo_offset as a tune input. The sink holds a
-        // placeholder handle, and a staged center sits 1 MHz below the center in force. The
-        // offset takes the frontend past the coverage's top edge, and the refused tune writes
-        // the center in force back into frequency.
+        // A running sink's settings hook takes lo_offset as a tune input. Each call of the hook
+        // runs with a placeholder handle, and a staged center sits 1 MHz below the center in
+        // force. The offset takes the frontend past the coverage's top edge, and the refused
+        // tune writes the center in force back into frequency.
         Sink running{};
-        running._usrp = placeholderHandle();
         running._deviceUp.store(true);
         running._freqRanges       = coverage;
         running._rateActualHz     = 8.0e6;
@@ -1165,13 +1157,12 @@ int main(int argc, char** argv) {
         running.lo_offset         = 3.0e6;
         gr::property_map other{{"thread_priority", 0.0}};
         gr::property_map otherForward{{"thread_priority", 0.0}};
-        running.settingsChanged({}, other, otherForward);
+        capture::uhd::test::withPlaceholderHandle(running, [&running, &other, &otherForward] { running.settingsChanged({}, other, otherForward); });
         expect(running.frequency.value == std::vector<double>{running._appliedRequestHz - 1.0e6}) << "a setting no tune reads leaves frequency alone";
         gr::property_map changed{{"lo_offset", 3.0e6}};
         gr::property_map forward{{"lo_offset", 3.0e6}};
-        running.settingsChanged({}, changed, forward);
+        capture::uhd::test::withPlaceholderHandle(running, [&running, &changed, &forward] { running.settingsChanged({}, changed, forward); });
         expect(running.frequency.value == std::vector<double>{running._appliedRequestHz}) << "a changed offset tunes, and the refused tune writes the center in force back";
-        running._usrp.reset();
         running._deviceUp.store(false);
     });
 

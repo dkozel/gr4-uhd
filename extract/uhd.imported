@@ -3,7 +3,7 @@
 #
 # The files the last import from libcapture placed in this tree, one path per line.
 # extract/copy.py writes this file and reads it at the next import.
-# This copy is of libcapture as of 2026-10-25, at "Add an lo_offset setting to the USRP source and sink", its last change to these files.
+# This copy is of libcapture as of 2026-10-25, at "Hold the USRP cases on any radio and any libuhd build", its last change to these files.
 uhd/CMakeLists.txt
 uhd/README.md
 uhd/include/capture/uhd/Device.hpp
@@ -11,6 +11,7 @@ uhd/include/capture/uhd/Discovery.hpp
 uhd/include/capture/uhd/Sink.hpp
 uhd/include/capture/uhd/Source.hpp
 uhd/include/gnuradio-4.0/capture/uhd/UhdBlocks.hpp
+uhd/test/PlaceholderHandle.hpp
 uhd/test/UnparsedAddress.hpp
 uhd/test/hw_uhd.cpp
 uhd/test/qa_controls_uhd.cpp
